@@ -1,15 +1,17 @@
 """Configuration for OMH.
 
+Models, providers, base URLs and keys live in ``config.toml``, not in Python.
 Precedence (lowest to highest):
 
-1. the defaults below,
-2. ``~/.omh/config.json``,
-3. ``./.omh.json`` (project config),
+1. the built-in ``config.toml`` shipped with the repo/package,
+2. ``~/.omh/config.toml``,
+3. ``./.omh.toml`` (project config),
 4. ``OMH_*`` environment variables,
 5. CLI flags.
 
-No third-party parser is involved: JSON keeps start-up in the single-digit
-milliseconds, which is the whole point of this harness.
+Only the standard library is involved: ``tomllib`` for reading and a small
+writer for ``omh --init`` / tests, so start-up stays in single-digit
+milliseconds.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -88,11 +91,13 @@ class ProviderConfig:
     requires_key: bool = True
 
     def resolved_key(self) -> str:
-        if self.api_key:
-            return self.api_key
-        if self.api_key_env:
-            return os.environ.get(self.api_key_env, "").strip()
-        return ""
+        value = self.api_key
+        if not value and self.api_key_env:
+            value = os.environ.get(self.api_key_env, "")
+        value = os.path.expandvars(value).strip()
+        if "${" in value:  # unresolved $VAR
+            return ""
+        return value
 
     def available(self) -> bool:
         if self.kind == "mock":
@@ -117,13 +122,25 @@ class ProviderConfig:
             name=name,
             kind=kind,
             label=str(raw.get("label") or name),
-            base_url=str(raw.get("base_url") or "").rstrip("/"),
+            base_url=os.path.expandvars(str(raw.get("base_url") or "")).rstrip("/"),
             api_key_env=str(raw.get("api_key_env") or ""),
             api_key=str(raw.get("api_key") or ""),
             headers={str(k): str(v) for k, v in (raw.get("headers") or {}).items()},
             timeout=float(raw.get("timeout", 120.0)),
             requires_key=bool(raw.get("requires_key", kind != "mock")),
         )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "label": self.label,
+            "base_url": self.base_url,
+            "api_key_env": self.api_key_env,
+            "api_key": self.api_key,
+            "headers": dict(self.headers),
+            "timeout": self.timeout,
+            "requires_key": self.requires_key,
+        }
 
 
 @dataclass(slots=True)
@@ -255,16 +272,8 @@ class Config:
                 "max_parallel_tools": self.router.max_parallel_tools,
             },
             "providers": {
-                name: {
-                    "kind": p.kind,
-                    "label": p.label,
-                    "base_url": p.base_url,
-                    "api_key_env": p.api_key_env,
-                    "headers": p.headers,
-                    "timeout": p.timeout,
-                    "requires_key": p.requires_key,
-                }
-                for name, p in self.providers.items()
+                name: provider.to_dict()
+                for name, provider in self.providers.items()
             },
             "models": [
                 {
@@ -280,110 +289,176 @@ class Config:
             ],
         }
 
+    def to_toml(self) -> str:
+        lines: List[str] = []
+
+        def scalar(key: str, value: Any) -> None:
+            lines.append(f"{_toml_key(key)} = {_toml_value(value)}")
+
+        for key in (
+            "model",
+            "provider",
+            "system_prompt",
+            "max_steps",
+            "temperature",
+            "max_tokens",
+            "approval_mode",
+            "tools_enabled",
+            "theme",
+            "history_limit",
+            "max_tool_output",
+        ):
+            scalar(key, getattr(self, key))
+        if self.session_dir:
+            scalar("session_dir", self.session_dir)
+        if self.history_file:
+            scalar("history_file", self.history_file)
+
+        lines.extend(["", "[router]"])
+        for key in (
+            "strategy",
+            "max_attempts",
+            "cooldown_s",
+            "hedge_delay_s",
+            "max_parallel_tools",
+        ):
+            scalar(key, getattr(self.router, key))
+
+        for name, provider in self.providers.items():
+            lines.extend(["", f"[providers.{_toml_key(name)}]"])
+            for key in (
+                "kind",
+                "label",
+                "base_url",
+                "api_key_env",
+                "api_key",
+                "timeout",
+                "requires_key",
+            ):
+                scalar(key, getattr(provider, key))
+            if provider.headers:
+                scalar("headers", provider.headers)
+
+        for model in self.models:
+            lines.extend(["", "[[models]]"])
+            for key in (
+                "id",
+                "provider",
+                "label",
+                "weight",
+                "context",
+                "input_cost",
+                "output_cost",
+            ):
+                scalar(key, getattr(model, key))
+        return "\n".join(lines) + "\n"
+
     def save(self, path: str | Path) -> Path:
         target = Path(path).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2) + "\n", encoding="utf-8")
+        if target.suffix.lower() == ".json":
+            text = json.dumps(self.to_dict(), indent=2) + "\n"
+        else:
+            text = self.to_toml()
+        tmp.write_text(text, encoding="utf-8")
         tmp.replace(target)
         return target
-
-
-def default_providers() -> Dict[str, ProviderConfig]:
-    return {
-        "openai": ProviderConfig(
-            name="openai",
-            label="OpenAI",
-            base_url="https://api.openai.com/v1",
-            api_key_env="OPENAI_API_KEY",
-        ),
-        "anthropic": ProviderConfig(
-            name="anthropic",
-            kind="anthropic",
-            label="Anthropic",
-            base_url="https://api.anthropic.com",
-            api_key_env="ANTHROPIC_API_KEY",
-        ),
-        "groq": ProviderConfig(
-            name="groq",
-            label="Groq",
-            base_url="https://api.groq.com/openai/v1",
-            api_key_env="GROQ_API_KEY",
-        ),
-        "openrouter": ProviderConfig(
-            name="openrouter",
-            label="OpenRouter",
-            base_url="https://openrouter.ai/api/v1",
-            api_key_env="OPENROUTER_API_KEY",
-            headers={
-                "HTTP-Referer": "https://github.com/rlaope/oh-my-hermes",
-                "X-Title": "omh",
-            },
-        ),
-        "deepseek": ProviderConfig(
-            name="deepseek",
-            label="DeepSeek",
-            base_url="https://api.deepseek.com/v1",
-            api_key_env="DEEPSEEK_API_KEY",
-        ),
-        "ollama": ProviderConfig(
-            name="ollama",
-            label="Ollama (local)",
-            base_url="http://localhost:11434/v1",
-            api_key_env="OLLAMA_API_KEY",
-            requires_key=False,
-        ),
-        "mock": ProviderConfig(name="mock", kind="mock", label="Offline demo"),
-    }
-
-
-def default_models() -> List[ModelProfile]:
-    return [
-        ModelProfile("gpt-4o-mini", "openai", label="gpt-4o-mini", weight=2.0,
-                     context=128_000, input_cost=0.15, output_cost=0.60),
-        ModelProfile("gpt-4o", "openai", label="gpt-4o", weight=1.0,
-                     context=128_000, input_cost=2.50, output_cost=10.0),
-        ModelProfile("claude-sonnet-4-20250514", "anthropic", label="sonnet-4",
-                     weight=1.5, context=200_000, input_cost=3.0, output_cost=15.0),
-        ModelProfile("claude-3-5-haiku-latest", "anthropic", label="haiku-3.5",
-                     weight=1.0, context=200_000, input_cost=0.80, output_cost=4.0),
-        ModelProfile("llama-3.3-70b-versatile", "groq", label="llama-3.3-70b",
-                     weight=1.0, context=128_000, input_cost=0.59, output_cost=0.79),
-        ModelProfile("deepseek-chat", "deepseek", label="deepseek-chat",
-                     weight=1.5, context=64_000, input_cost=0.27, output_cost=1.10),
-        ModelProfile("llama3.2", "ollama", label="llama3.2", weight=1.0,
-                     context=128_000),
-        ModelProfile("mock-1", "mock", label="mock", weight=1.0, context=32_000),
-    ]
 
 
 def omh_home() -> Path:
     return Path(os.environ.get("OMH_HOME", "~/.omh")).expanduser()
 
 
-def default_config() -> Config:
-    home = omh_home()
-    return Config(
-        session_dir=str(home / "sessions"),
-        history_file=str(home / "history"),
-        workspace=os.getcwd(),
-        providers=default_providers(),
-        models=default_models(),
+def builtin_config_path() -> Path:
+    """Locate the shipped ``config.toml`` (checkout first, then wheel)."""
+    here = Path(__file__).resolve()
+    root = here.parent.parent
+    checkout = root / "config.toml"
+    packaged = here.with_name("default_config.toml")
+    if checkout.is_file() and (root / "main.py").is_file():
+        return checkout
+    if packaged.is_file():
+        return packaged
+    if checkout.is_file():
+        return checkout
+    raise ConfigError(
+        "config.toml is missing",
+        hint="restore config.toml at the repo root or reinstall OMH",
     )
 
 
-def _read_json(path: Path) -> Dict[str, Any]:
+def default_config_text() -> str:
+    path = builtin_config_path()
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        return path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise ConfigError(
-            f"{path} is not valid JSON: {exc.msg} (line {exc.lineno})"
-        ) from exc
+
+
+def default_config() -> Config:
+    path = builtin_config_path()
+    config = config_from_dict(_parse_config_text(default_config_text(), path))
+    config.workspace = os.getcwd()
+    home = omh_home()
+    if not config.session_dir:
+        config.session_dir = str(home / "sessions")
+    if not config.history_file:
+        config.history_file = str(home / "history")
+    return config
+
+
+def _toml_key(key: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        return key
+    return json.dumps(key)
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, Mapping):
+        inner = ", ".join(
+            f"{_toml_key(str(key))} = {_toml_value(item)}"
+            for key, item in value.items()
+        )
+        return "{ " + inner + " }"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    return json.dumps(str(value))
+
+
+def _parse_config_text(text: str, path: Path) -> Dict[str, Any]:
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
     if not isinstance(raw, dict):
-        raise ConfigError(f"{path} must contain a JSON object")
+        raise ConfigError(f"{path} must contain a TOML table")
     return raw
+
+
+def _read_config(path: Path) -> Dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
+    if path.suffix.lower() == ".json":
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(
+                f"{path} is not valid JSON: {exc.msg} (line {exc.lineno})"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise ConfigError(f"{path} must contain a JSON object")
+        return raw
+    return _parse_config_text(text, path)
+
 
 
 def _merge(base: Dict[str, Any], extra: Mapping[str, Any]) -> Dict[str, Any]:
@@ -481,46 +556,58 @@ def config_search_paths(
         if not path.exists():
             raise ConfigError(f"config file not found: {path}")
         return [path]
+    env_path = os.environ.get("OMH_CONFIG", "").strip()
+    if env_path:
+        path = Path(env_path).expanduser()
+        if not path.exists():
+            raise ConfigError(f"OMH_CONFIG points at a missing file: {path}")
+        return [path]
     cwd = cwd or Path.cwd()
-    paths = [omh_home() / "config.json", cwd / ".omh.json"]
+    paths = [omh_home() / "config.toml", cwd / ".omh.toml"]
     return [path for path in paths if path.is_file()]
 
 
-def config_from_dict(raw: Mapping[str, Any], base: Optional[Config] = None) -> Config:
-    base = base or default_config()
-    providers = dict(base.providers)
-    for name, spec in (raw.get("providers") or {}).items():
+def config_from_dict(raw: Mapping[str, Any]) -> Config:
+    providers_raw = raw.get("providers") or {}
+    if not isinstance(providers_raw, Mapping):
+        raise ConfigError("`providers` must be a TOML table")
+    providers = {
+        str(name): ProviderConfig.from_dict(str(name), spec)
+        for name, spec in providers_raw.items()
+        if isinstance(spec, Mapping)
+    }
+    for name, spec in providers_raw.items():
         if not isinstance(spec, Mapping):
-            raise ConfigError(f"provider {name!r} must be an object")
-        providers[name] = ProviderConfig.from_dict(name, spec)
+            raise ConfigError(f"provider {name!r} must be a table")
 
-    models = list(base.models)
-    if "models" in raw:
-        entries = raw.get("models") or []
-        if not isinstance(entries, list):
-            raise ConfigError("`models` must be a list")
-        models = [ModelProfile.from_dict(entry) for entry in entries]
+    models_raw = raw.get("models") or []
+    if not isinstance(models_raw, list):
+        raise ConfigError("`models` must be an array of tables ([[models]])")
+    models = [ModelProfile.from_dict(entry) for entry in models_raw]
     for profile in models:
         if profile.provider not in providers:
             raise ConfigError(
                 f"model {profile.id!r} points at unknown provider {profile.provider!r}"
             )
 
+    defaults = Config()
     config = Config(
-        model=str(raw.get("model", base.model) or ""),
-        provider=str(raw.get("provider", base.provider) or ""),
-        system_prompt=str(raw.get("system_prompt", base.system_prompt)),
-        max_steps=max(1, int(raw.get("max_steps", base.max_steps))),
-        temperature=float(raw.get("temperature", base.temperature)),
-        max_tokens=max(1, int(raw.get("max_tokens", base.max_tokens))),
-        approval_mode=str(raw.get("approval_mode", base.approval_mode)),
-        tools_enabled=bool(raw.get("tools_enabled", base.tools_enabled)),
-        theme=str(raw.get("theme", base.theme)),
-        history_limit=max(4, int(raw.get("history_limit", base.history_limit))),
-        max_tool_output=max(500, int(raw.get("max_tool_output", base.max_tool_output))),
-        session_dir=str(raw.get("session_dir", base.session_dir)),
-        history_file=str(raw.get("history_file", base.history_file)),
-        workspace=str(raw.get("workspace", base.workspace)),
+        model=str(raw.get("model", defaults.model) or ""),
+        provider=str(raw.get("provider", defaults.provider) or ""),
+        system_prompt=str(raw.get("system_prompt", defaults.system_prompt)),
+        max_steps=max(1, int(raw.get("max_steps", defaults.max_steps))),
+        temperature=float(raw.get("temperature", defaults.temperature)),
+        max_tokens=max(1, int(raw.get("max_tokens", defaults.max_tokens))),
+        approval_mode=str(raw.get("approval_mode", defaults.approval_mode)),
+        tools_enabled=bool(raw.get("tools_enabled", defaults.tools_enabled)),
+        theme=str(raw.get("theme", defaults.theme)),
+        history_limit=max(4, int(raw.get("history_limit", defaults.history_limit))),
+        max_tool_output=max(
+            500, int(raw.get("max_tool_output", defaults.max_tool_output))
+        ),
+        session_dir=str(raw.get("session_dir", "") or ""),
+        history_file=str(raw.get("history_file", "") or ""),
+        workspace=str(raw.get("workspace", "") or ""),
         router=RouterConfig.from_dict(raw.get("router") or {}),
         providers=providers,
         models=models,
@@ -536,15 +623,19 @@ def load_config(
     offline: bool = False,
     cwd: Optional[Path] = None,
 ) -> Config:
-    """Build the effective config from files, env and flags."""
+    """Build the effective config from config.toml, env and flags."""
     cwd = (cwd or Path.cwd()).resolve()
     load_dotenv([cwd / ".env", omh_home() / ".env"])
 
-    raw: Dict[str, Any] = {}
-    for candidate in config_search_paths(path, cwd):
-        raw = _merge(raw, _read_json(candidate))
+    builtin = builtin_config_path()
+    raw = _read_config(builtin)
+    if path:
+        raw = _merge(raw, _read_config(Path(path).expanduser()))
+    else:
+        for candidate in config_search_paths(None, cwd):
+            raw = _merge(raw, _read_config(candidate))
 
-    config = config_from_dict(raw) if raw else default_config()
+    config = config_from_dict(raw)
     _apply_env(config)
     config.workspace = str(cwd)
     if not config.session_dir:

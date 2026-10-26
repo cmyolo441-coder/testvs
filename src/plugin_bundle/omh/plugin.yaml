@@ -1,0 +1,43 @@
+name: omh
+kind: standalone
+version: "4.0.2"
+requires_hermes: ">=0.21.1"
+description: "Oh My Hermes native bridge for metadata-only runtime status, HUD, role context, bounded evidence probes, evidence-boundary context, a deterministic file-backed memory provider, and one opt-in tool (omh_jev_ask) that sends typed questions to Jev with the user's own key only when the user asks for Jev."
+author: oh-my-hermes maintainers
+provides_memory_provider: omh
+provides_tools:
+  - omh_agent_board
+  - omh_capabilities
+  - omh_context
+  - omh_dag
+  - omh_decision_gate
+  - omh_delegate_route
+  - omh_document_plan
+  - omh_gather_evidence
+  - omh_hud
+  - omh_interact
+  - omh_jev_ask
+  - omh_loop
+  - omh_memory
+  - omh_probe
+  - omh_recommend
+  - omh_resume
+  - omh_role
+  - omh_route_answer
+  - omh_run_summary
+  - omh_search
+  - omh_source_trust
+  - omh_status
+  - omh_team
+  - omh_todo
+provides_hooks:
+  - on_session_end
+  - on_session_start
+  - post_tool_call
+  - pre_llm_call
+  - pre_tool_call
+  - pre_verify
+  - subagent_start
+  - subagent_stop
+  - transform_llm_output
+  - transform_tool_result

@@ -1,0 +1,2500 @@
+{
+"bm25":{
+"b":0.75,
+"k1":1.2
+},
+"hangul_stopwords":"그거 너무 도와 들어 떻게 만들 보여 세요 싶어 아서 알려 어떤 어떻 어서 어주 오늘 우리 이거 있어 저거 주세 지금 하고 하는 해서 해주",
+"schema_version":"omh_skill_shortlist_index/v1",
+"score_floor":5.0,
+"skills":[
+{
+"anchors":"belong card chat discord don fallback fit hint know oh om owned picker plain preview right role slack telegram unsur wrapper",
+"hangul":"경계 기록 상태 증거",
+"hangul_anchors":"경계 기록 상태 증거",
+"label":"omh-routing",
+"name":"oh-my-hermes",
+"situation":"Choosing among OMH skills for a request",
+"terms":{
+"1":"agent ambiguous among ask choos flagship guidanc insid install level path referenc top",
+"2":"action belong boundary card chat command contract discord don evidenc fallback fit hint know nativ next observ om owned pick plain prepar preview right role router slack telegram unsur wrapper",
+"3":"handoff picker",
+"5":"rout",
+"6":"request",
+"7":"herm oh"
+}
+},
+{
+"anchors":"catalog chain instruction meta prefix router several slash",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-meta-router",
+"name":"meta-router",
+"situation":"Message opens with /omh and a task",
+"terms":{
+"1":"guidanc lead user",
+"2":"consult imperativ instruction job live messag open prefix reason request right select several slash through",
+"3":"follow rout router",
+"4":"catalog chain command meta task"
+}
+},
+{
+"anchors":"10k engineer exhaustion feedback goal good horizon improv iterat known long met permission profil resum star stop token until yet",
+"hangul":"계속 고갈 까지 끝까 끝날 돌려 드백 때까 루프 목표 장기 토큰 피드",
+"hangul_anchors":"계속 고갈 까지 끝까 끝날 돌려 드백 때까 루프 목표 장기 토큰 피드",
+"label":"ulw-loop",
+"name":"loop",
+"situation":"Ambitious project goal needing many build cycles",
+"terms":{
+"1":"agentic ambitious build continu controller cycl direct high invocation invok lane level mean need start through user",
+"2":"10k after builder engineer exhaustion gate good horizon improv interviewer iterat known met never path permission plan planner profil real research researcher reviewer session star work yet",
+"3":"project stop",
+"4":"feedback keep long resum run token",
+"6":"goal loop until"
+}
+},
+{
+"anchors":"agree align alignment domain drift glossary inconsistent languag mean name naming term terminology ulw",
+"hangul":"",
+"hangul_anchors":"",
+"label":"ulw-context",
+"name":"context",
+"situation":"Repository vocabulary unclear or inconsistent",
+"terms":{
+"1":"block captur correct decision dependency direct frontier handoff keep lookup product read ready shar specific understand unresolv vocabulary word",
+"2":"across agree code domain drift glossary mean name naming repo repository review ulw unclear",
+"3":"align alignment befor languag plan",
+"4":"inconsistent term",
+"5":"context project",
+"6":"terminology"
+}
+},
+{
+"anchors":"ambiguous assum clarify deep don figur fuzzy guess idea interview requirement sure yet",
+"hangul":"개발 기획 드럽 럽게 모호 발자 보딩 부드 사이 온보 요청 제품 호한 획자",
+"hangul_anchors":"개발 기획 드럽 럽게 모호 발자 보딩 부드 사이 온보 요청 제품 호한 획자",
+"label":"ulw-interview",
+"name":"deep-interview",
+"situation":"Vague, underspecified request",
+"terms":{
+"1":"clarification execution materially plan time underspecifi vagu",
+"2":"ask assum build don figur fuzzy guess idea product scop shap sure yet",
+"3":"befor request requirement",
+"4":"clarify featur",
+"5":"ambiguous deep interview question"
+}
+},
+{
+"anchors":"applicabl apply blocker book cours creator gap highest hit immediat immediately jit knowledg leverag payoff podcast recommend resourc right specific target topic unblock",
+"hangul":"강의 당장 도움 되는 리에 리프 목표 브리 스트 에이 용할 이터 적용 주제 캐스 크리 팟캐 학습",
+"hangul_anchors":"강의 당장 도움 되는 리에 리프 목표 브리 에이 용할 이터 적용 주제 캐스 크리 팟캐 학습",
+"label":"omh-jit-learn",
+"name":"jit-learn",
+"situation":"Blocked on a project by a knowledge gap",
+"terms":{
+"1":"activ befor block confirm credibl direct first markdown popularity project rank research time without",
+"2":"applicabl application apply book cours creator hit immediately keep next payoff podcast prepar problem recommend resourc right select specific topic unblock week",
+"3":"back blocker gap highest knowledg leverag",
+"4":"brief immediat sourc target",
+"5":"jit",
+"9":"learn"
+}
+},
+{
+"anchors":"accept big coordinat cycl fan finish green high implement integrat lane modul multi multipl parallel part persistent process red refactor several singl split throughput ultrawork ulw until worker",
+"hangul":"",
+"hangul_anchors":"",
+"label":"ulw-work",
+"name":"ultrawork",
+"situation":"Accepted plan awaiting implementation",
+"terms":{
+"1":"acceptanc await command criteria disjoint edit independent prevent reviewabl verification",
+"2":"across agent big chang check coordinat cycl delivery doc end execution fail fan finish first green high implement integrat job keep modul multi multipl open part persistent pr prepar process ready red refactor research review run several singl team test throughput ulw until",
+"3":"file owner parallel work",
+"4":"accept coding implementation lane split worker",
+"5":"ultrawork",
+"6":"plan"
+}
+},
+{
+"anchors":"chos claud cli codex compos delegation instruction maestro ulw",
+"hangul":"넘기 드오 롬프 실행 에이 오프 외부 위임 이전 전트 준비 코딩 트에 프롬 프트 핸드 행기",
+"hangul_anchors":"넘기 드오 롬프 실행 에이 오프 외부 위임 이전 전트 코딩 트에 프롬 프트 핸드 행기",
+"label":"ulw-maestro",
+"name":"maestro",
+"situation":"Coding owner already chosen, handoff pending",
+"terms":{
+"1":"already captur check chosen execut explicit itself lane never pend permission readiness select session steer",
+"2":"claud code codex delegation executor install instruction job owner task ulw writ",
+"3":"agent chos cli handoff",
+"4":"compos hand work",
+"5":"external maestro prepar",
+"6":"coding prompt"
+}
+},
+{
+"anchors":"architectur art autoresearch built choic comparabl conflict critic deep dig dossier durabl exhaustiv goal ground literatur other paper pre prior recent referenc saturation solv spec study survey",
+"hangul":"검토 고객 구현 근거 깊게 논문 드백 딥리 런스 레퍼 리서 문들 문헌 서치 소스 심층 오픈 조사 참고 퍼런 픈소 피드",
+"hangul_anchors":"검토 고객 구현 근거 깊게 논문 드백 딥리 런스 레퍼 리서 문들 문헌 서치 소스 심층 오픈 조사 참고 퍼런 픈소 피드",
+"label":"ulw-research",
+"name":"research",
+"situation":"Deep dive before a decision",
+"terms":{
+"1":"brief consum current decid disciplin distill dive engin gather guidanc handoff live pin ref studi upstream verifi",
+"2":"architectur art autoresearch built choic citation compar comparabl conflict contest critic design dig durabl exist goal literatur other paper pre project recent review saturation solv survey web work writ",
+"3":"decision dossier exhaustiv verify",
+"4":"claim evidenc ground implementation plan prior referenc",
+"5":"deep open sourc spec study",
+"6":"befor",
+"7":"research"
+}
+},
+{
+"anchors":"best citation cite diversity documentation fresh gap guidanc internet latest library official onlin practic pric retrieval say scan still today true upstream",
+"hangul":"검색 색해 서치 웹서 인터 자료 찾아 최신 출처 터넷",
+"hangul_anchors":"검색 색해 서치 웹서 인터 자료 찾아 최신 출처 터넷",
+"label":"omh-web-research",
+"name":"web-research",
+"situation":"Current technical or business fact to cite from web",
+"terms":{
+"1":"across answer budget business date declar depend depth external ground lane lookup note pre quality question spec study technical",
+"2":"back best chang citation cited claim diversity doc documentation evidenc fact fresh gap guidanc implementation internet library onlin practic pric referenc round say scan settl still today true upstream version week",
+"3":"cite",
+"4":"check current find latest official retrieval search",
+"5":"sourc",
+"6":"research",
+"7":"web"
+}
+},
+{
+"anchors":"capability catalog documentation explain oh put stor system together",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-docs",
+"name":"product-docs",
+"situation":"Explaining OMH itself",
+"terms":{
+"1":"back first includ installation question",
+"2":"current featur file identity itself keep long pick public put sourc stor system term together",
+"3":"capability documentation explain",
+"4":"catalog herm local oh rout stat work",
+"5":"doc",
+"6":"memory model",
+"7":"product"
+}
+},
+{
+"anchors":"acquisition area arxiv benchmark collect dataset download evaluat finder gather github intak link oss paper presentation slid spec worth",
+"hangul":"공개 깃허 논문 데이 링크 문서 발표 스펙 이터 자료 장소 저장 찾아 출처 터셋 표자 허브 후보",
+"hangul_anchors":"공개 깃허 논문 데이 링크 문서 발표 스펙 이터 자료 장소 저장 찾아 출처 터셋 표자 허브 후보",
+"label":"omh-source-finder",
+"name":"source-finder",
+"situation":"Gathering candidate papers, datasets, or repos",
+"terms":{
+"1":"across choos cite cycl decision delivery department downstream fetch learn material output packag prepar ready repository request turn ultrawork ulw unknown web work",
+"2":"area befor benchmark brief collect evaluat exist find intak inventory list oss project research typed worth",
+"3":"doc gather presentation",
+"4":"acquisition arxiv download slid status",
+"5":"finder github link public repo spec",
+"6":"candidat dataset paper",
+"9":"sourc"
+}
+},
+{
+"anchors":"comparison competitiv competitor feedback landscap market pric say scan trend vendor",
+"hangul":"고객 근거 데이 드백 서치 이터 자료 조사 추세 피드",
+"hangul_anchors":"고객 근거 데이 드백 서치 이터 자료 조사 추세 피드",
+"label":"omh-research-brief",
+"name":"research-brief",
+"situation":"Business question on market, competitors, pricing",
+"terms":{
+"1":"boundary department handoff herm link multi ongo preserv raw role scop strategy structur summariz turn ulw vs",
+"2":"call compar comparison competitiv data decision feedback gather inferenc landscap question ready say scan search set trend vendor",
+"3":"back befor competitor",
+"5":"customer market pric sourc",
+"6":"business evidenc research",
+"8":"brief"
+}
+},
+{
+"anchors":"analyst briefer competitor daily department inbox incom knowledg market monitor notebooklm obsidian ops paper regular roundup scout stor storag summarizer synthesis vault weekly",
+"hangul":"경쟁 도구 리서 리핑 부서 브리 서치 수집 요약 운영 장소 쟁사 저장 조직 지식 합성",
+"hangul_anchors":"경쟁 도구 리서 리핑 부서 브리 서치 수집 운영 장소 쟁사 저장 조직 지식 합성",
+"label":"omh-research-department",
+"name":"research-department",
+"situation":"Recurring market or topic research",
+"terms":{
+"1":"befor boundary candidat claim coordinat decision execution finder herm ongo prepar readiness request start topic turn typed without work",
+"2":"agent back chang incom monitor new obsidian ops recur regular review roundup set storag summarizer team time track vault",
+"3":"knowledg operation stor tool",
+"4":"analyst briefer competitor daily inbox notebooklm paper scout status weekly",
+"5":"market synthesis",
+"6":"brief department sourc",
+"9":"research"
+}
+},
+{
+"anchors":"arxiv attach beginner breakdown detail don drop easy expert explain explainer explanation level losing moderat paper pdf simpl term understand walk walkthrough",
+"hangul":"가급 난이 내용 논문 당한 말고 명해 문가 설명 쉽게 아주 이도 이지 적당 전문 줄이 해설",
+"hangul_anchors":"가급 난이 내용 논문 당한 말고 명해 문가 설명 쉽게 아주 이도 이지 적당 전문 줄이 해설",
+"label":"omh-paper-learning",
+"name":"paper-learning",
+"situation":"Paper or paper PDF to understand",
+"terms":{
+"1":"boundary entry evidenc excerpt extract full herm instead keep ledger lossy past preserv section shrink sourc text",
+"2":"attach beginner breakdown coverag don drop easy explainer losing moderat select simpl suppli term through walk walkthrough",
+"3":"summary understand",
+"4":"detail expert explanation level research without",
+"5":"arxiv learn",
+"6":"explain pdf",
+"9":"paper"
+}
+},
+{
+"anchors":"bet big con contractor direction enterpris headcount hire leadership memo option outsourc pro quarter smb strategic strategy take tradeoff",
+"hangul":"결정 다음 더십 리더 메모 사결 옵션 의사 전략 정리 회의",
+"hangul_anchors":"결정 다음 더십 리더 메모 사결 옵션 의사 전략 정리 회의",
+"label":"omh-decide",
+"name":"strategy-brief",
+"situation":"Team or business decision between options",
+"terms":{
+"1":"act between business evidenc goal herm ready team turn",
+"2":"bet big call capacity con contractor cut demand direction enterpris first headcount leadership memo outsourc pro product quarter recommendation scop smb strategic take versus",
+"3":"note",
+"4":"decision hire next option plan tradeoff",
+"5":"strategy",
+"6":"brief"
+}
+},
+{
+"anchors":"agenda discuss discussion leadership meet rais sync templat tomorrow topic",
+"hangul":"결정 기록 논의 아젠 정할 젠다 주제 준비 질문 템플 플릿 회의",
+"hangul_anchors":"결정 기록 논의 아젠 정할 젠다 주제 질문 템플 플릿 회의",
+"label":"omh-meeting-brief",
+"name":"meeting-brief",
+"situation":"Upcoming work meeting that lacks an agenda",
+"terms":{
+"1":"herm lack point upcom work",
+"2":"discuss leadership need question rais review sync tomorrow topic",
+"3":"discussion prepar",
+"4":"prompt record templat",
+"5":"brief",
+"6":"agenda decision",
+"9":"meet"
+}
+},
+{
+"anchors":"bug cluster complain complaint feedback group payment prioritiz sort stor them trend",
+"hangul":"결제 고객 기능 드백 모아 백을 버그 분류 불만 실패 오류 요청 이슈 제보 피드",
+"hangul_anchors":"결제 고객 기능 드백 모아 백을 버그 분류 불만 실패 오류 요청 이슈 제보 피드",
+"label":"omh-feedback-triage",
+"name":"feedback-triage",
+"situation":"Unsorted customer feedback and bug reports",
+"terms":{
+"1":"ask befor choos classify coding decid handoff herm need next plan research signal unsort whether",
+"2":"app complain complaint fail failur group issu prioritiz review sort stor support them trend user",
+"3":"cluster",
+"4":"payment request",
+"5":"customer featur triag",
+"6":"bug report",
+"9":"feedback"
+}
+},
+{
+"anchors":"actual budget burn cash cfo expens explain financ forecast month quarter rate runway varianc vs",
+"hangul":"대비 마감 분석 실적 예산 월마 재무",
+"hangul_anchors":"대비 마감 분석 실적 예산 월마 재무",
+"label":"omh-finance-analysis",
+"name":"finance-analysis",
+"situation":"Company budget overrun, cash risk, or close issue",
+"terms":{
+"1":"account bound company context flow input issu ledger overrun ready revenu suppli turn",
+"2":"against brief burn cfo decision explain quarter rate review runway vs",
+"3":"expens forecast risk",
+"4":"actual cash end month",
+"5":"varianc",
+"6":"analysis budget clos financ"
+}
+},
+{
+"anchors":"debrief description fair fairly hire hiring interview onboard ops peopl recruit role scorecard structur",
+"hangul":"가표 계획 면접 보자 비교 채용 평가 후보",
+"hangul_anchors":"가표 계획 면접 보자 비교 채용 평가 후보",
+"label":"omh-people-ops",
+"name":"people-ops",
+"situation":"Company hiring or HR process to structure",
+"terms":{
+"1":"company context decision hr operation outlin rubric support team turn",
+"2":"brief compar description fairly hire job new process run writ",
+"3":"fair onboard ops recruit role",
+"4":"scorecard structur",
+"5":"candidat debrief interview peopl plan",
+"6":"hiring"
+}
+},
+{
+"anchors":"agreement claus complianc counterparty dpa gdpr indemnity lawyer legal liability nda obligation regulatory risky term vendor",
+"hangul":"검토 계약 규제 라이 분석 약서 언스 이언 컴플 플라",
+"hangul_anchors":"검토 계약 규제 라이 분석 약서 언스 이언 컴플 플라",
+"label":"omh-legal-compliance-review",
+"name":"legal-compliance-review",
+"situation":"Business contract, NDA, or policy with legal risk",
+"terms":{
+"1":"action assumption befor brief business context counsel decision issu matrix point process product risk scop suppli surfac",
+"2":"agreement analysis ask check counterparty dpa escalation gdpr indemnity languag lawyer negotiation obligation policy position preparation risky servic strategy term vendor",
+"3":"nda question regulatory",
+"4":"claus legal liability redlin",
+"6":"contract",
+"7":"review",
+"8":"complianc"
+}
+},
+{
+"anchors":"angry cannot draft email engineer escalation refund reply respons ticket urgent",
+"hangul":"고객 답변 레이 분류 스컬 에스 이션 지원 초안 컬레 티켓",
+"hangul_anchors":"고객 답변 분류 스컬 에스 이션 지원 초안 컬레 티켓",
+"label":"omh-support-operations",
+"name":"support-operations",
+"situation":"Support ticket your team must answer or escalate",
+"terms":{
+"1":"bound case classification clear contact escalat follow incident next owned ownership path rout set severity step team turn urgency",
+"2":"angry cannot email engineer log refund request triag urgent",
+"3":"answer draft escalation operation respons",
+"5":"customer reply ticket",
+"9":"support"
+}
+},
+{
+"anchors":"assessment cours curriculum hire lesson objectiv program quizz six syllabus train weekly workshop",
+"hangul":"계획 리큘 목표 설계 커리 큘럼 평가 학습",
+"hangul_anchors":"계획 리큘 목표 설계 커리 큘럼 평가 학습",
+"label":"omh-curriculum-design",
+"name":"curriculum-design",
+"situation":"Team training or course that needs a syllabus",
+"terms":{
+"1":"assumption criteria differentiation educator enablement goal learner modul outcom owner ready scop teachabl team turn",
+"2":"hire new objectiv path program quizz sequenc six week weekly workshop",
+"3":"cours lesson syllabus train",
+"5":"learn plan",
+"6":"assessment curriculum",
+"8":"design"
+}
+},
+{
+"anchors":"checklist consistency copy fit glossary i18n japanes korean localization market string translation",
+"hangul":"검토 번역 어집 용어 지화 현지",
+"hangul_anchors":"검토 번역 어집 용어 지화 현지",
+"label":"omh-localization-review",
+"name":"localization-review",
+"situation":"Translated product or content release",
+"terms":{
+"1":"beyond content context document multipl quality ready sensitiv surfac translat",
+"2":"befor checklist copy cultural guidanc i18n japanes korean launch product releas terminology",
+"3":"consistency market string",
+"4":"fit glossary",
+"5":"localization qa translation",
+"6":"local",
+"8":"review"
+}
+},
+{
+"anchors":"account approach bant buyer company development discovery enterpris lead meddic messag outbound prospect qualification qualify sale win",
+"hangul":"객사 계획 고객 메시 바운 발굴 시지 아웃 영업 운드 웃바",
+"hangul_anchors":"객사 계획 고객 메시 바운 발굴 시지 아웃 영업 운드 웃바",
+"label":"omh-sales-development",
+"name":"sales-development",
+"situation":"Prospect or account worth pursuing",
+"terms":{
+"1":"brief business context execut focus hypothes market narrativ non opportunity outreach owner partner pursu seller sequenc turn valu worth",
+"2":"approach ask bant call company enterpris lead meddic messag next prepar qualify step win",
+"3":"buyer prospect question",
+"4":"account development outbound qualification",
+"5":"discovery plan sale"
+}
+},
+{
+"anchors":"backlog option prd prioritiz prioritization quarter requirement rice roadmap scor spec tradeoff",
+"hangul":"구사 기획 드맵 로드 문서 사항 선순 순위 요구 우선 제품 획서",
+"hangul_anchors":"구사 기획 드맵 로드 문서 사항 선순 순위 요구 우선 제품 획서",
+"label":"omh-product-brief",
+"name":"product-brief",
+"situation":"PRD or roadmap priorities to decide",
+"terms":{
+"1":"acceptanc befor decid definition delivery dependency evidenc outcom owner plan priority problem ready record shap turn user",
+"2":"backlog build chang decision document featur fram next prioritiz quarter rice scor spec tradeoff writ",
+"3":"option",
+"4":"brief prd prioritization requirement",
+"6":"roadmap",
+"9":"product"
+}
+},
+{
+"anchors":"blocker leadership operat ops priority queu weekly",
+"hangul":"로커 리뷰 리스 리즈 릴리 블로 상태 선순 순위 스크 우선 운영 주간",
+"hangul_anchors":"로커 리스 리즈 릴리 블로 상태 선순 순위 스크 우선 운영 주간",
+"label":"omh-ops-review",
+"name":"ops-review",
+"situation":"Recurring operating status and blockers",
+"terms":{
+"1":"action herm observ ups work",
+"2":"across block follow leadership operation owner queu recur support team updat week",
+"3":"summariz",
+"4":"operat priority releas weekly",
+"5":"ops review",
+"6":"blocker risk status"
+}
+},
+{
+"anchors":"history item meet minut operat organiz retro retrospectiv rhythm scrum sprint standup",
+"hangul":"결정 관리 기록 리듬 린트 스크 스토 스프 아이 액션 운영 의록 이템 크럼 토리 프린 회고 회의 히스",
+"hangul_anchors":"결정 관리 기록 리듬 린트 스크 스토 스프 아이 액션 운영 의록 이템 크럼 토리 프린 회고 회의 히스",
+"label":"omh-operating-rhythm",
+"name":"operating-rhythm",
+"situation":"Team minutes, retros, and decision history to keep",
+"terms":{
+"1":"herm maintain prepar recur ups",
+"2":"across follow note organiz review run standup track writ",
+"3":"keep minut plan retrospectiv team",
+"4":"action item log record scrum",
+"5":"history retro rhythm",
+"6":"decision meet operat sprint"
+}
+},
+{
+"anchors":"board deck exec executiv leadership month monthly outlin ppt presentation quarterly slid upload weekly",
+"hangul":"경영 고서 더십 라이 로드 리더 발표 보고 슬라 업로 영진 월간 이드 자료 주간 키지 패키 표자 피티 피피",
+"hangul_anchors":"경영 고서 더십 라이 로드 리더 발표 보고 슬라 업로 영진 월간 이드 자료 주간 키지 패키 표자 피티 피피",
+"label":"omh-report-package",
+"name":"report-package",
+"situation":"Periodic report for executives",
+"terms":{
+"1":"claim delivery herm input periodic suppli without",
+"2":"board business deck leadership month note quarterly ready review summary updat",
+"3":"presentation turn weekly",
+"4":"brief exec ppt slid status upload",
+"5":"monthly",
+"6":"executiv outlin",
+"7":"packag",
+"9":"report"
+}
+},
+{
+"anchors":"agency attach binary clean convert creat csv deck differenc docx excel export extract hwp item keynot korean layout material monthly outlin pdf powerpoint ppt pptx proposal pull render sheet spreadsheet tabl word xlsx",
+"hangul":"고서 노트 드시 디에 레드 렌더 리프 문서 보고 부한 분석 브리 비교 생성 셀을 스프 시트 안서 에프 엑셀 워드 월간 자료 제안 처리 첨부 추출 키노 키지 파일 패키 표를 프레 피디 한글",
+"hangul_anchors":"고서 노트 드시 디에 레드 렌더 리프 문서 보고 부한 분석 브리 비교 생성 셀을 스프 시트 안서 에프 엑셀 워드 월간 자료 제안 처리 첨부 추출 키노 키지 파일 패키 표를 프레 피디 한글",
+"label":"omh-materials-package",
+"name":"materials-package",
+"situation":"PPT, PDF, Excel, or HWP output to produce",
+"terms":{
+"1":"claim comparison extraction generation herm input offic output plan produc sourc summary turn without",
+"2":"action agency analysis attach brief clean convert creat csv differenc doc extract handoff item keynot layout markdown monthly note outlin powerpoint pptx proposal pull qa render report sheet xlsx",
+"3":"ppt word",
+"4":"binary compar deck docx export korean spreadsheet",
+"5":"excel file packag tabl",
+"6":"document hwp material pdf"
+}
+},
+{
+"anchors":"announcement backdrop background bug card competitor conversation cron cut digest edit explain explainer explanation feedback generation imag img infographic meet multilingual news photo pictur pull remov removal shareabl sum thumbnail vertical visual",
+"hangul":"경쟁 고서 공유 그래 기능 내용 네일 노트 뉴스 데이 드로 드백 래픽 로우 록을 리뷰 리서 리아 리즈 리포 리핑 릴리 명하 미지 발표 배경 버그 보고 보기 뷰어 브리 사진 생성 서치 설명 성해 세로 소개 썸네 아지 안내 약해 어에 업데 에게 요약 용을 워크 유용 유할 의록 이미 이슈 이트 인포 일로 쟁사 제거 좋은 지로 진처 처럼 카드 크론 크플 트리 편집 포그 포트 플로 피드 하나 회의",
+"hangul_anchors":"경쟁 고서 공유 그래 기능 내용 네일 노트 뉴스 데이 드로 드백 래픽 로우 록을 리서 리아 리즈 리포 리핑 릴리 명하 미지 발표 배경 버그 보고 보기 뷰어 브리 사진 생성 서치 설명 성해 세로 소개 썸네 아지 안내 약해 어에 업데 에게 용을 워크 유용 유할 의록 이미 이슈 이트 인포 일로 쟁사 제거 좋은 지로 진처 처럼 카드 크론 크플 트리 편집 포그 포트 플로 피드 하나 회의",
+"label":"omh-image-cards",
+"name":"img-summary",
+"situation":"Infographic card for meeting notes, a report, or PR",
+"terms":{
+"1":"awar claim domain herm prepar prs sourc specific suppli transformation turn without",
+"2":"backdrop background brief bug competitor conversation cron cut digest explain explainer explanation featur feedback multilingual news page photo product pull remov removal request review sum support tool triag vertical",
+"3":"card edit generation issu note research",
+"4":"announcement pictur shareabl thumbnail",
+"5":"img infographic meet pr releas report summary visual",
+"6":"imag prompt"
+}
+},
+{
+"anchors":"3d appl feedback glass guidelin hero hig human imag inspir interfac ios ipad iphon land layout light liquid maco polish render screen studio styl swiftui ui visual",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-apple-design",
+"name":"apple-design",
+"situation":"Designing or reviewing an iOS, macOS, or Apple-style UI",
+"terms":{
+"1":"awar befor explicit handoff implementation ipado market nativ prepar remediation surfac verification",
+"2":"3d back brief direction evidenc feedback follow guidelin human imag improvement interfac ipad iphon land layout light page polish render screen studio swiftui",
+"3":"inspir ui web",
+"4":"app glass hero hig ios liquid visual",
+"6":"maco product review styl",
+"8":"design",
+"9":"appl"
+}
+},
+{
+"anchors":"direction don figur handl know orchestration ownership take",
+"hangul":"덕트 디자 로덕 맡겨 자인 전체 프로",
+"hangul_anchors":"덕트 디자 로덕 맡겨 자인 전체",
+"label":"omh-design-orchestration",
+"name":"design-orchestration",
+"situation":"Entire product design problem to delegate",
+"terms":{
+"1":"accessibility befor bound broad composition delegat entir executor exist frontend handoff herm known narrower neutral prepar qa quality visual",
+"2":"app don end figur handl know lane problem start",
+"3":"direction ownership",
+"5":"orchestration product take",
+"9":"design"
+}
+},
+{
+"anchors":"beautiful brochur cheap deck finish frontend high layout look max pdf polish ppt premium print pro professional publish ui ux validation visual websit",
+"hangul":"검증 고퀄 나게 디자 뛰어 레이 론트 리싱 블리 사이 아웃 어나 엔드 웹사 이아 이트 자인 트엔 퍼블 프론",
+"hangul_anchors":"검증 고퀄 나게 디자 뛰어 론트 리싱 블리 사이 아웃 어나 엔드 웹사 이아 이트 자인 트엔 퍼블 프론",
+"label":"omh-design-quality-gate",
+"name":"design-quality-gate",
+"situation":"Deliverable demands premium polish",
+"terms":{
+"1":"accessibility beat deliverabl demand enforc ordinary output packag poster render superior tast web",
+"2":"beautiful brochur cheap check content finish frontend high look max ppt print pro professional ready ux validation",
+"3":"deck polish publish ui",
+"4":"layout qa visual websit",
+"5":"pdf premium quality",
+"6":"gate",
+"8":"design"
+}
+},
+{
+"anchors":"awwward contender cssda daily hold innovation land priz rate ui ux wotd",
+"hangul":"가능 능한 디자 만한 받을 사이 상작 수상 수준 어워 올해 워드 을만 이트 자인 해의",
+"hangul_anchors":"가능 능한 디자 만한 받을 사이 상작 수상 수준 어워 올해 워드 을만 이트 자인 해의",
+"label":"omh-award-bar-score",
+"name":"award-bar-score",
+"situation":"Aiming for design-award quality",
+"terms":{
+"1":"aiming axe axis bind constraint external name quality threshold total weight",
+"2":"against back contender css cssda daily day judg land page priz publish rate ready surfac web wotd",
+"3":"hold innovation ui ux",
+"4":"awwward site websit win",
+"5":"design",
+"6":"bar",
+"9":"award scor"
+}
+},
+{
+"anchors":"accessibility ai animation beautiful broken brutalism component core front frontend generic land layout library lighthous market motion neobrutalism neobrutalist parallax polish premium react responsiv shadcn slop styl system terminal tooltip tui ui ux visual vital wcag",
+"hangul":"고급 근성 급스 깨짐 네오 니메 드러 드럽 디자 딩페 랙스 랜딩 러운 럴랙 럽게 레이 려하 로고 론트 루탈 리즘 마키 메이 반응 부드 브루 스러 스럽 스크 스타 스트 스플 아웃 애니 엔드 연스 오브 응형 이션 이아 이지 일링 자연 자인 접근 차트 크롤 타일 탈리 테마 텍스 트엔 패럴 페이 푸터 프론 플릿 하게 화려 화면",
+"hangul_anchors":"고급 근성 급스 깨짐 네오 니메 드러 드럽 디자 딩페 랙스 랜딩 러운 럴랙 럽게 려하 로고 론트 루탈 리즘 마키 메이 반응 부드 브루 스러 스럽 스크 스타 스플 아웃 애니 엔드 연스 오브 응형 이션 이아 이지 일링 자연 자인 접근 차트 크롤 타일 탈리 테마 텍스 트엔 패럴 페이 푸터 프론 플릿 하게 화려 화면",
+"label":"omh-frontend",
+"name":"frontend",
+"situation":"Building or polishing a web or terminal UI",
+"terms":{
+"1":"anti befor creation driven handoff herm implementation improv prepar quality redesign shap stat surfac",
+"2":"add ai animation beautiful better broken brutalism chang chart color core end feel footer front land library lighthous logo market marquee neo neobrutalism neobrutalist parallax performanc premium react registry scream set shadcn site slop smooth split text them tooltip ux vital wcag websit",
+"3":"build motion polish qa ui",
+"4":"accessibility app component dashboard design effect hero look page scroll styl system tui visual web",
+"5":"generic layout responsiv",
+"6":"frontend terminal"
+}
+},
+{
+"anchors":"800 behavior big boolean break chain clean colocation drill everywher front frontend giant larg line prop react restructur ui useeffect usestat",
+"hangul":"관리 넌트 론트 리뷰 리팩 분리 상태 엔드 정리 컴포 터링 토링 트가 트엔 팩터 팩토 포넌 프론",
+"hangul_anchors":"관리 넌트 론트 리팩 분리 상태 엔드 정리 컴포 터링 토링 트가 트엔 팩터 팩토 포넌 프론",
+"label":"omh-frontend-refactor",
+"name":"frontend-refactor",
+"situation":"Oversized or tangled UI component",
+"terms":{
+"1":"apply architectur build effect exist explicit first flag full impact naming new polish preserv rather second step tangl user verdict want work",
+"2":"800 big break cleanup code colocation everywher front giant hook larg line management order oversiz plan preview split usestat",
+"3":"boolean chain drill pass restructur review without",
+"4":"behavior chang clean react stat ui useeffect",
+"5":"frontend prop",
+"6":"component",
+"7":"refactor"
+}
+},
+{
+"anchors":"auth authentication authorization backend connection databas db deprecat deprecation endpoint flow graphql grpc handler idempotency messag migration old openapi orm pagination pool postgr queu receiver respons rest retir rule schedul schema server side sunset tabl webhook",
+"hangul":"개발 권한 그레 드포 디비 레이 마이 백엔 서버 설계 스키 엔드 이그 이션 인증 인트 체크 키마 포인 흐름",
+"hangul_anchors":"개발 권한 그레 드포 디비 마이 백엔 서버 설계 스키 엔드 이그 이션 인증 인트 체크 키마 포인 흐름",
+"label":"omh-backend",
+"name":"backend",
+"situation":"Designing an API, server, or data-layer change",
+"terms":{
+"1":"consistency executor first herm load prepar referenc stack",
+"2":"authorization back befor break call connection data databas date db deprecat deprecation disciplin end flow graphql grpc handler idempotency implementation key layer map messag old openapi orm path pool queu receiver retir rule schedul servic shap side spec sunset tabl version window",
+"3":"auth authentication",
+"4":"boundary chang contract endpoint error pagination postgr respons rest schema server webhook",
+"5":"backend design",
+"6":"api migration"
+}
+},
+{
+"anchors":"behavior bind borrow cargo checker clippy compil compiler extern ffi library lifetim lint loom maybeuninit miri ownership pointer raw reject rust rustlang satisfy sound struct trait undefin unsaf warn",
+"hangul":"검사 동작 라이 러스 미정 빌림 사기 세이 소유 스트 언세 에러 유권 이프 정의 코드 타임 프타",
+"hangul_anchors":"검사 동작 라이 러스 미정 빌림 사기 세이 소유 언세 에러 유권 이프 정의 타임 프타",
+"label":"omh-rust",
+"name":"rust",
+"situation":"Rust ownership, lifetime, or unsafe trouble",
+"terms":{
+"1":"checklist disciplin escalat escalation gate herm mandatory primitiv shap touch troubl type",
+"2":"api behavior bind block bound build chang checker compil compiler extern fix free library lint lock loom miri prepar reject rustlang satisfy sound struct trait ub undefin warn",
+"3":"maybeuninit pointer raw",
+"4":"borrow code error ownership",
+"5":"cargo clippy",
+"6":"ffi lifetim unsaf",
+"7":"rust"
+}
+},
+{
+"anchors":"11 backtrac binary breakpoint core corrupt corruption crash dap debug debugger dereferenc disassembly dump fault free freed gdb get heap lldb null pointer segfault segmentation stack startup strip watchpoint",
+"hangul":"그폴 네이 단점 덤프 디버 메모 모리 버깅 세그 셈블 손상 어셈 역어 이티 중단 코어 티브 폴트",
+"hangul_anchors":"그폴 네이 단점 덤프 디버 메모 모리 버깅 세그 셈블 손상 어셈 역어 이티 중단 코어 티브 폴트",
+"label":"omh-native-debugging",
+"name":"native-debugging",
+"situation":"Native program crashes or corrupts memory",
+"terms":{
+"1":"compet distinguish driv evidenc herm hypothes hypothesis instead instruct level low observation plan printf program",
+"2":"11 after backtrac breakpoint build core corruption dereferenc disassembly driven executor free freed get heap null pointer prepar read releas segmentation signal stack startup strip watchpoint",
+"3":"corrupt debugger fault",
+"4":"crash dap dump gdb lldb segfault",
+"6":"binary memory",
+"7":"nativ",
+"9":"debug"
+}
+},
+{
+"anchors":"400 a11y aa accessibility accessibl ada appearanc architect aria background blind color complianc contrast focus hard keyboard name navigation ratio reader reflow role screen screenreader size tab target touch trap usabl valu wcag websit zoom",
+"hangul":"감사 검사 검토 게이 근성 내비 대비 리더 린리 명도 보드 비게 순서 스크 이션 접근 커스 크기 크린 키보 타깃 터치 포커 표시",
+"hangul_anchors":"감사 검사 검토 게이 근성 내비 대비 리더 린리 명도 보드 비게 순서 스크 이션 접근 커스 크기 크린 키보 타깃 터치 포커 표시",
+"label":"omh-accessibility-audit",
+"name":"accessibility-audit",
+"situation":"Screen-reader or keyboard accessibility gaps",
+"terms":{
+"1":"claim design flow gap gate herm prepar reachability semantic surfac system",
+"2":"400 accessibl ada against app appearanc architect aria background blind color complianc evidenc hard launch name order ratio read review role screenreader tab text touch trap ui usabl user valu websit zoom",
+"3":"aa befor contrast pass",
+"4":"a11y check focus navigation reader reflow screen size target",
+"6":"audit keyboard wcag",
+"7":"accessibility"
+}
+},
+{
+"anchors":"analyz assuranc broken browser button cjk click clip consol cut dead imag interaction keyboard layout link look mobil navigation network pixel regression render responsiv right screenshot terminal tui ui viewport visual wrong",
+"hangul":"검증 글자 깨짐 레이 렌더 린샷 문제 미널 바꿈 비교 비주 스크 시각 아웃 이아 잘림 주얼 줄바 크린 터미 픽셀 한글 화면",
+"hangul_anchors":"검증 글자 깨짐 렌더 린샷 문제 미널 바꿈 비교 비주 스크 시각 아웃 이아 잘림 주얼 줄바 크린 터미 픽셀 한글 화면",
+"label":"omh-visual-qa",
+"name":"visual-qa",
+"situation":"Rendered UI needing a visual verdict",
+"terms":{
+"1":"block coverag defin document during evidenc fabricat frontend gate herm need observ oracl pass prepar review revis stat without work",
+"2":"analyz assuranc audit befor broken button cjk click clip compar consol cut dead error failur interaction keyboard link mobil navigation network page path pixel problem quality regression responsiv right surfac terminal verdict verify wrong",
+"3":"after diff imag tui viewport web",
+"4":"browser check layout look render screenshot text",
+"5":"ui",
+"7":"qa",
+"9":"visual"
+}
+},
+{
+"anchors":"brok cargo ci compil compilation dco github lint npm pipelin pytest red tsc type typecheck upgrad",
+"hangul":"고쳐 깨짐 라인 배포 빌드 스트 실패 에러 이프 입체 체크 컴파 타입 테스 파이 파일 프라",
+"hangul_anchors":"고쳐 깨짐 라인 배포 빌드 실패 에러 이프 입체 체크 컴파 타입 테스 파이 파일 프라",
+"label":"omh-build-failure-triage",
+"name":"build-failure-triage",
+"situation":"Build or CI failure to triage",
+"terms":{
+"1":"back classify evidenc herm inspect minimal prepar redesign remediation safe signal smallest system without",
+"2":"after brok cargo chang check compil compilation handoff job pipelin pr pytest red run tsc upgrad",
+"3":"fix",
+"4":"action dco error github lint npm type typecheck",
+"5":"fail",
+"6":"ci failur test triag",
+"9":"build"
+}
+},
+{
+"anchors":"config configur gap hook inventory mcp plugin repository workspac",
+"hangul":"감사 레포 벤토 설정 스킬 스페 워크 이스 인벤 크스 토리 페이",
+"hangul_anchors":"감사 레포 벤토 설정 스킬 스페 워크 이스 인벤 크스 토리 페이",
+"label":"omh-workspace-audit",
+"name":"workspace-audit",
+"situation":"Workspace setup inventory and gaps",
+"terms":{
+"1":"featur herm inspect local operat operator plan produc risk rout runtim safe",
+"2":"agent befor configur find map miss set strengthen tool",
+"3":"config list mcp repository setup",
+"4":"gap inventory surfac",
+"5":"hook plugin prompt repo",
+"7":"audit",
+"9":"workspac"
+}
+},
+{
+"anchors":"checklist live operational pre preflight prod rollback",
+"hangul":"덕션 로덕 롤백 리즈 릴리 운영 준비 출시 프로",
+"hangul_anchors":"덕션 로덕 롤백 리즈 릴리 운영 출시",
+"label":"omh-production-audit",
+"name":"production-audit",
+"situation":"Imminent production launch or release",
+"terms":{
+"1":"access befor check claim delivery doc evaluat evidenc expos herm imminent miss observability public security support without",
+"2":"checklist decision deploy live pre preflight prod review risk",
+"3":"operational",
+"4":"readiness ready ship",
+"5":"audit rollback",
+"6":"launch releas",
+"7":"production"
+}
+},
+{
+"anchors":"checklist clos definition deriv lint longer match merg prov their typecheck",
+"hangul":"검증 게이 린트 머지 빌드 스트 이트 테스 품질",
+"hangul_anchors":"검증 게이 린트 머지 빌드 이트 테스 품질",
+"label":"omh-verification-gate",
+"name":"verification-gate",
+"situation":"Proof a change is done before merge",
+"terms":{
+"1":"block ci claim completion concret defin doc herm hold proof record security turn verdict",
+"2":"artifact chang check clos definition deriv edit instead longer match prov quality readiness ready regenerat task their truth verify work",
+"3":"build checklist generat lint output pass pr releas typecheck",
+"4":"evidenc file sourc",
+"5":"befor gate merg test verification"
+}
+},
+{
+"anchors":"bake benchmark better between claud codex comparison default eval evaluation fair real tournament",
+"hangul":"덱스 로드 비교 실행 에이 이전 전트 코덱 클로 평가 행자",
+"hangul_anchors":"덱스 로드 비교 실행 에이 이전 전트 코덱 클로 평가 행자",
+"label":"omh-agent-evaluation",
+"name":"agent-evaluation",
+"situation":"Choosing between coding agents on evidence",
+"terms":{
+"1":"bound choic choos code cost design evidenc generic herm metric quality reproducibl set summariz time tool",
+"2":"bake default eval real tournament",
+"3":"between compar comparison fair",
+"4":"benchmark better coding executor task",
+"5":"claud codex evaluation",
+"8":"agent"
+}
+},
+{
+"anchors":"best comment distill distillation extract guidanc guidelin md past practic principl rule trac wrong",
+"hangul":"규칙 롬프 스킬 원칙 증류 추출 프롬 프트",
+"hangul_anchors":"규칙 롬프 스킬 원칙 증류 추출 프롬 프트",
+"label":"omh-rules-distill",
+"name":"rules-distill",
+"situation":"Turn repeated lessons into written rules",
+"terms":{
+"1":"auto befor behavior catalog chang doc herm human mutat prompt without written",
+"2":"best candidat distillation guidelin keep learn lesson md past policy practic repeat wrong",
+"3":"comment extract guidanc",
+"4":"agent failur review turn",
+"5":"distill principl",
+"6":"trac",
+"9":"rule"
+}
+},
+{
+"anchors":"codebas explain join onboard organiz orientation repository runway structur tour understand",
+"hangul":"개발 구조 드베 레포 발자 베이 보는 보딩 설명 온보 이스 처음 코드",
+"hangul_anchors":"개발 구조 드베 레포 발자 베이 보는 보딩 설명 온보 이스 처음",
+"label":"omh-codebase-onboarding",
+"name":"codebase-onboarding",
+"situation":"Unfamiliar repository needing a guided tour",
+"terms":{
+"1":"befor coding creat executor glossary guid herm implementation map need operator path plan risk",
+"2":"explain join new organiz orientation project start structur unfamiliar work",
+"3":"read runway tour understand",
+"4":"code repository",
+"5":"first onboard repo task",
+"8":"codebas"
+}
+},
+{
+"anchors":"big codegraph codemap date index intelligenc merg navigation pack rebuild refresh stal symbol",
+"hangul":"갱신 그래 덱스 드그 드맵 래프 인덱 코드",
+"hangul_anchors":"갱신 그래 덱스 드그 드맵 래프 인덱",
+"label":"omh-codegraph-refresh",
+"name":"codegraph-refresh",
+"situation":"Outdated code index or codemap",
+"terms":{
+"1":"befor execution herm implementation outdat overclaim plan prepar review scop structur task without",
+"2":"after big coding date local map merg navigation next pack pass rebuild repo summariz summary symbol updat",
+"3":"context",
+"4":"handoff intelligenc stal",
+"5":"codemap index",
+"6":"code codegraph",
+"9":"refresh"
+}
+},
+{
+"anchors":"depend imag plantuml slack teammat uml visual",
+"hangul":"각화 구조 그램 그림 다이 드베 래스 림으 베이 스를 시각 아키 어그 으로 이스 이어 조도 코드 클래 키지 키텍 텍처 패키 화해",
+"hangul_anchors":"각화 구조 그램 그림 다이 드베 래스 림으 베이 스를 시각 아키 어그 으로 이스 이어 조도 클래 키지 키텍 텍처 패키 화해",
+"label":"omh-codebase-uml",
+"name":"codebase-uml",
+"situation":"Architecture picture of a codebase",
+"terms":{
+"1":"actually area bound chat discord doc drop edge focus import index interfac level png pr pros public rather readabl refresh render repository shap singl surfac symbol tour turn unit user want",
+"2":"depend dependency imag map new teammat visual visualiz visualization",
+"3":"code plantuml slack",
+"4":"class draw",
+"5":"architectur diagram uml",
+"6":"modul packag pictur",
+"9":"codebas"
+}
+},
+{
+"anchors":"budget checkpoint compact compaction conversation get hit hygien limit long overflow reus summarization token well",
+"hangul":"스트 압축 예산 요약 인트 체크 컨텍 크포 텍스 토큰 포인",
+"hangul_anchors":"압축 예산 인트 체크 컨텍 크포 텍스 토큰 포인",
+"label":"omh-context-budget-review",
+"name":"context-budget-review",
+"situation":"Context window or token budget at risk",
+"terms":{
+"1":"break coding drift multi plan quality recovery research risk summary",
+"2":"across agent compaction conversation cost get hand hit hygien keep key limit new reus summariz task well work",
+"3":"checkpoint compact overflow run summarization window",
+"4":"befor cach long prompt session token",
+"6":"budget review",
+"9":"context"
+}
+},
+{
+"anchors":"ai automation broad certificat chain credential dangerous destructiv exposur guard injection leak permission plugin revok rm rotation safety sandbox script secret security supply",
+"hangul":"검토 괴적 노출 롬프 명령 보안 시크 안전 에이 이전 인젝 전트 젝션 크릿 파괴 프롬 프트",
+"hangul_anchors":"검토 괴적 노출 롬프 명령 보안 시크 안전 에이 이전 인젝 전트 젝션 크릿 파괴 프롬 프트",
+"label":"omh-security-safety-review",
+"name":"security-safety-review",
+"situation":"Agent or automation safety risks",
+"terms":{
+"1":"code identify releas",
+"2":"ai api audit befor broad certificat chain coding command credential dangerous dependency execution explicit exposur guard install leak old revok rm rotation safe sandbox script supply",
+"3":"automation herm",
+"4":"action destructiv key local rotat",
+"5":"agent injection permission",
+"6":"plugin prompt review risk safety secret security tool"
+}
+},
+{
+"anchors":"automat automation blueprint continuously cron daily day digest discord morn noth notify ops ping post put recur schedul send silent slack telegram timed weekly",
+"hangul":"감시 계속 공유 그램 니터 동화 디스 레그 매일 매주 모니 반복 변화 보내 스케 스코 슬랙 없으 예약 용히 으면 자동 정기 조용 지켜 케줄 켜봐 코드 터링 텔레 화해",
+"hangul_anchors":"감시 계속 공유 그램 니터 동화 디스 레그 매일 매주 모니 반복 변화 보내 스케 스코 슬랙 없으 예약 용히 으면 자동 정기 조용 지켜 케줄 켜봐 터링 텔레 화해",
+"label":"omh-automation-blueprint",
+"name":"automation-blueprint",
+"situation":"Recurring Hermes job on a schedule (cron, digests)",
+"terms":{
+"1":"agent chain claim context design execution host natural observ platform policy prepar request retrieval silenc sourc status turn vs without",
+"2":"automat check continuously day delivery herm keep monitor noth notify ping put ready report silent summary task telegram timed updat watch weekly",
+"3":"digest job operation ops",
+"4":"chang daily discord morn post send slack",
+"6":"automation blueprint cron recur schedul"
+}
+},
+{
+"anchors":"budget downtim followup incident last left mortem outag post postmortem recur reliability remediation sla slo sre stop target uptim",
+"hangul":"검증 러버 뢰성 리뷰 모템 방지 버짓 분석 비스 사후 서비 스트 신뢰 에러 장애 재발 트모 포스 회고",
+"hangul_anchors":"검증 러버 뢰성 모템 방지 버짓 분석 비스 사후 서비 신뢰 에러 장애 재발 트모 포스 회고",
+"label":"omh-reliability-review",
+"name":"reliability-review",
+"situation":"Postmortem for an outage or SLO miss",
+"terms":{
+"1":"claim closur herm keep miss note observ ups",
+"2":"action downtim evidenc followup last left mortem post recur sla sre stop target track uptim week writ",
+"3":"follow outag postmortem remediation",
+"4":"error servic slo",
+"6":"budget incident",
+"7":"reliability",
+"8":"review"
+}
+},
+{
+"anchors":"bootstrap complet deployment empty idea mvp scaffold scratch take",
+"hangul":"가보 기획 까지 디어 루프 배포 보자 부터 비스 서비 스로 시까 아이 어를 어부 완제 운영 이디 제품 출시 포까 획부",
+"hangul_anchors":"가보 기획 까지 디어 루프 배포 보자 부터 비스 서비 스로 시까 아이 어를 어부 완제 운영 이디 제품 출시 포까 획부",
+"label":"omh-idea-to-deploy",
+"name":"idea-to-deploy",
+"situation":"App idea headed for launch",
+"terms":{
+"1":"acceptanc agent befor boundary carry ci context executor file fresh gate git greenfield head herm includ licens pass readiness readm repository skeleton start status work",
+"2":"build complet decision deployment end featur first handoff loop monitor mvp operation scaffold scratch set shap ship take verification",
+"3":"bootstrap empty plan product through",
+"4":"delivery new production project releas repo",
+"5":"launch",
+"6":"app deploy",
+"9":"idea"
+}
+},
+{
+"anchors":"chatbot dev evaluat extract field invoic pin reliably",
+"hangul":"가셋 개발 골든 관리 구조 구축 기능 든셋 라인 롬프 리케 버전 스키 애플 이션 이프 조화 출력 케이 키마 파이 평가 프라 프롬 프트 플리 화된",
+"hangul_anchors":"가셋 개발 골든 관리 구조 구축 기능 든셋 라인 롬프 리케 버전 스키 애플 이션 이프 조화 출력 케이 키마 파이 평가 프라 프롬 프트 플리 화된",
+"label":"omh-llm-app-dev",
+"name":"llm-app-dev",
+"situation":"LLM-powered feature to build",
+"terms":{
+"1":"befor board boundary call coding communication deliverabl disciplin engineer first guard harden path prepar public request ship swap user work",
+"2":"add application augment back chang chatbot document evaluat extract field file generation golden ground handoff invoic pipelin power provider reliably set",
+"3":"development model pin schema structur",
+"4":"build eval featur json output rag retrieval suit",
+"5":"dev version",
+"6":"prompt",
+"8":"app",
+"9":"llm"
+}
+},
+{
+"anchors":"act cto dev engineer lead leadership operat ops pm risky roadmap security several tech technical together tradeoff",
+"hangul":"구조 기술 더십 드맵 드오 레이 로드 리더 아키 오프 이드 준비 출시 키텍 텍처 트레",
+"hangul_anchors":"구조 기술 더십 드맵 드오 로드 리더 아키 오프 이드 출시 키텍 텍처 트레",
+"label":"omh-cto-loop",
+"name":"cto-loop",
+"situation":"Engineering leadership over roadmap and risk",
+"terms":{
+"1":"cadenc explicit handoff herm signal styl turn",
+"2":"across act follow launch lead risky security several ship team tech together",
+"3":"decision engineer readiness run",
+"4":"delivery dev leadership operat ops qa releas technical tradeoff",
+"5":"pm",
+"6":"loop risk roadmap",
+"7":"cto"
+}
+},
+{
+"anchors":"deploy deployment eye health hold incident metric monitor post production roll rollback safely watch",
+"hangul":"감시 니터 덕션 라에 로덕 롤백 리즈 릴리 모니 배포 비스 서비 인프 장애 체크 터링 프라 프로 헬스",
+"hangul_anchors":"감시 니터 덕션 라에 로덕 롤백 리즈 릴리 모니 배포 비스 서비 인프 장애 체크 터링 프라 헬스",
+"label":"omh-deploy-and-monitor",
+"name":"deploy-and-monitor",
+"situation":"Release rollout needing health signals",
+"terms":{
+"1":"criteria decision herm infrastructur narrat need operation prepar pretend rollout run without",
+"2":"after back check checklist deployment eye hold incident keep metric new production roll safely servic ship signal status version",
+"3":"gate",
+"4":"health post releas rollback watch",
+"5":"monitor",
+"9":"deploy"
+}
+},
+{
+"anchors":"adversarial break case e2e edge flow hostil input installer nasty real scenario throw try ultraqa wizard world",
+"hangul":"검증 네티 리스 리즈 릴리 버네 상황 스트 장애 적절 절히 진단 체크 쿠버 크리 티스",
+"hangul_anchors":"검증 네티 리스 리즈 릴리 버네 상황 장애 적절 절히 진단 체크 쿠버 크리 티스",
+"label":"ulw-qa",
+"name":"ultraqa",
+"situation":"Hostile scenario testing",
+"terms":{
+"1":"task verification",
+"2":"befor break case e2e edge end failur featur fix flow input install installer loop nasty real setup test throw try wizard world",
+"3":"hostil",
+"4":"adversarial releas",
+"5":"qa ultraqa",
+"6":"scenario"
+}
+},
+{
+"anchors":"break breakdown bug github hub reproduc reproduction safely templat",
+"hangul":"계획 구사 다음 답할 로젝 브가 비할 사항 상태 요구 운영 작업 재현 정리 젝트 준비 차례 태와 트별 프로 필요 행동 허브",
+"hangul_anchors":"계획 구사 다음 답할 로젝 브가 비할 사항 상태 요구 운영 작업 재현 정리 젝트 차례 태와 트별 필요 행동 허브",
+"label":"omh-plan",
+"name":"plan",
+"situation":"Software feature or bugfix not yet planned",
+"terms":{
+"1":"bugfix execution includ ready softwar yet",
+"2":"break breakdown build fix github hub issu new pr product project reproduc reproduction request step structur task templat triag writ",
+"3":"handoff implementation safe start work",
+"4":"add befor bug coding",
+"5":"safely",
+"6":"featur",
+"9":"plan"
+}
+},
+{
+"anchors":"acceptanc approach consensus criteria dangerous implement ralplan refactor reviewabl risky safety sign unsaf",
+"hangul":"가능 검증 검토 계획 능한 단위 대안 드베 리뷰 리서 리스 리팩 베이 비교 서치 스크 웹리 위험 이스 있게 있는 조사 코드 터링 팩터 험한",
+"hangul_anchors":"가능 검증 검토 계획 능한 단위 대안 드베 리서 리스 리팩 베이 비교 서치 스크 웹리 위험 이스 있게 있는 조사 터링 팩터 험한",
+"label":"ulw-plan",
+"name":"ralplan",
+"situation":"High-stakes technical proposal needing approval",
+"terms":{
+"1":"alternativ approval architectur clear enough evidenc execution gate high need proposal requirement risk stak technical",
+"2":"acceptanc approach chang compar dangerous implement reviewabl safety sign turn unsaf verification",
+"3":"befor consensus test",
+"4":"command criteria issu pr refactor risky",
+"5":"ralplan",
+"6":"plan review"
+}
+},
+{
+"anchors":"adversarial advocat angl approach architectur argu consensus devil hyperplan migration perspectiv stress",
+"hangul":"검토 계획 관점 다관 대적 드팀 레드 반박 에서 여러 적대 점에 찾아 허점",
+"hangul_anchors":"검토 계획 관점 다관 대적 드팀 레드 반박 에서 여러 적대 점에 찾아 허점",
+"label":"omh-adversarial-consensus",
+"name":"adversarial-consensus",
+"situation":"Technical proposal facing adversarial scrutiny",
+"terms":{
+"1":"befor bundl consum direction facing input meant planner rather result scrutiny separat technical written",
+"2":"advocat against angl approach architectur argu decision design devil distill hyperplan migration multi multipl pick review stress test",
+"4":"attack hole independent perspectiv poke red team",
+"5":"consensus plan",
+"6":"adversarial proposal"
+}
+},
+{
+"anchors":"actually bug eye happen logic match pair pull readm second spot",
+"hangul":"검증 결과 까지 는가 는지 드와 리뷰 리즈 릴리 맞는 뷰까 실제 제로 증된 코드 했는",
+"hangul_anchors":"검증 결과 까지 는가 는지 드와 리즈 릴리 맞는 뷰까 실제 제로 증된 했는",
+"label":"omh-code-review",
+"name":"code-review",
+"situation":"Pull request or changes to vet",
+"terms":{
+"1":"cite come concret shap vet",
+"2":"actually audit claim diff error eye first gate happen logic match pair releas second spot",
+"3":"chang find pull",
+"4":"evidenc readm request",
+"5":"bug",
+"7":"code",
+"9":"review"
+}
+},
+{
+"anchors":"ai behavior clean cleaner cleanup dead delet deslop duplicat helper legacy logic preserv refactor remov risky simplify unus wrot",
+"hangul":"리팩 범위 변경 분석 스트 위험 제한 터링 테스 토링 팩터 팩토 회귀",
+"hangul_anchors":"리팩 범위 변경 분석 위험 제한 터링 테스 토링 팩터 팩토 회귀",
+"label":"omh-ai-slop-cleaner",
+"name":"ai-slop-cleaner",
+"situation":"Messy or AI-generated code to clean up",
+"terms":{
+"1":"after befor duplication edit exist goal identical lock low messy quality stay test",
+"2":"analysis anti cleanup deslop generat helper legacy logic observabl pass preserv refactor review risk risky simplify sweep unus without wrot",
+"3":"chang clean dead delet duplicat remov",
+"4":"code",
+"5":"cleaner",
+"6":"behavior slop",
+"9":"ai"
+}
+},
+{
+"anchors":"between codebas larg lockfil migrat move safely split stag",
+"hangul":"계별 계획 단계 롤백 리팩 세워 터링 토링 팩터 팩토",
+"hangul_anchors":"계별 계획 단계 롤백 리팩 세워 터링 토링 팩터 팩토",
+"label":"omh-refactor-plan",
+"name":"refactor-plan",
+"situation":"Decided cross-module refactor to phase",
+"terms":{
+"1":"already approval back contract execution explicit first gate order reconnaissanc roll shap tabl turn verification verify",
+"2":"befor between blast boundary break code codebas cross decid dependency edit file larg lockfil migrat packag radius restructur safely split stag step upgrad",
+"3":"chang move",
+"4":"framework major next phas version",
+"5":"rollback",
+"6":"modul",
+"7":"refactor",
+"8":"plan"
+}
+},
+{
+"anchors":"budget clean cleanup codebas quick rank win worst",
+"hangul":"감사 기술 부채 사해 술부 원장 장부 점검",
+"hangul_anchors":"감사 기술 부채 사해 술부 원장 장부 점검",
+"label":"omh-tech-debt-audit",
+"name":"tech-debt-audit",
+"situation":"Accumulated tech debt to rank",
+"terms":{
+"1":"against big build carri citation diff dimension evidenc find judg measur named new observ orient previous rather reconcil repo rerun resolv separat spot",
+"2":"accumulat budget cleanup effort file first fix line plan problem severity technical week worst",
+"3":"clean codebas",
+"4":"code ledger quick rank report win",
+"6":"audit tech",
+"9":"debt"
+}
+},
+{
+"anchors":"a100 cach cpp deployment gguf host kubernet level llama measur prefix qwen throughput ttft vllm worth",
+"hangul":"띄워 마크 모델 배포 벤치 빙해 서버 서빙 추론 치마 포해",
+"hangul_anchors":"띄워 마크 모델 배포 벤치 빙해 서버 서빙 추론 치마 포해",
+"label":"omh-inference-serving",
+"name":"inference-serving",
+"situation":"Self-hosted LLM serving on GPUs",
+"terms":{
+"1":"ad choos chosen command decision docker gated gpus guess hoc idempotent itl llm observ process self standard tabl user verification want",
+"2":"a100 benchmark deploy engin gguf goodput level pick prepar protocol qwen runbook set throughput tpot worth",
+"3":"host kubernet model",
+"4":"cach cpp deployment llama measur prefix ttft vllm",
+"6":"endpoint quantization",
+"7":"inferenc serv"
+}
+},
+{
+"anchors":"came claud glm gpt latest",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-model-optimization",
+"name":"model-optimization",
+"situation":"Onboarding a newly released model generation",
+"terms":{
+"1":"check current doc fixed handl honest keep measurement newly operator pric research strengthen through walk want",
+"2":"calibrat came chang claud contract family generation glm gpt latest optimiz process recognition serv ship support updat version",
+"3":"releas",
+"4":"rout",
+"5":"optimization",
+"6":"calibration new onboard",
+"9":"model"
+}
+},
+{
+"anchors":"benchmark bill bottleneck ci cloud databas don footprint goal grow hot hotspot inferenc investigation jank janky know latency leak long perf performanc pipelin profil query render slow storag take throughput token ultraperf ulw went",
+"hangul":"누수 느려 려진 메모 모리 병목 성능 원인 전반 점검",
+"hangul_anchors":"누수 느려 려진 메모 모리 병목 성능 원인 전반 점검",
+"label":"ulw-perf",
+"name":"ultraperf",
+"situation":"Software slowness, memory leaks, or cost spikes",
+"terms":{
+"1":"actually behind budget expensiv inspect localiz loop problem regression runtim several slowness softwar spik suspect system time yet",
+"2":"across app audit benchmark bill bottleneck cloud databas domain don fix footprint goal grow investigation jank janky keep know latency long measur model page perf pipelin profil take throughput ulw went",
+"3":"find hot hotspot inferenc leak path performanc render storag token",
+"4":"cost",
+"5":"ci memory query slow ultraperf"
+}
+},
+{
+"anchors":"base driv googl knowledg live markdown notion obsidian organiz shar stor system vault wiki",
+"hangul":"노션 다운 디언 마크 베이 볼트 시디 식베 옵시 위키 이스 정리 지식 체계 크다",
+"hangul_anchors":"노션 다운 디언 마크 베이 볼트 시디 식베 옵시 위키 이스 정리 지식 체계 크다",
+"label":"omh-wiki",
+"name":"wiki",
+"situation":"Scattered knowledge needing a wiki",
+"terms":{
+"1":"audienc awar blueprint connection construction convention databas design destination durabl folder group guidanc local maintenanc model need organization page personal retain scatter seed sized skeleton small today",
+"2":"answer base build captur keep live project question set shar stor system",
+"3":"doc driv external googl markdown start team",
+"4":"knowledg note organiz",
+"5":"notion obsidian vault",
+"9":"wiki"
+}
+},
+{
+"anchors":"advisor ai another claud consult critiqu cross different gemini opinion outsid say second",
+"hangul":"의견",
+"hangul_anchors":"의견",
+"label":"omh-ask",
+"name":"ask",
+"situation":"Outside AI critique wanted",
+"terms":{
+"1":"answer improv materially want",
+"2":"another check configur cross different model opinion plan review say second",
+"3":"ai critiqu outsid",
+"4":"advisor claud external gemini",
+"5":"ask consult"
+}
+},
+{
+"anchors":"abort cancel everyth kill progress stop",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-cancel",
+"name":"cancel",
+"situation":"Aborting an active workflow",
+"terms":{
+"1":"adapt ending",
+"2":"activ cleanly current everyth kill progress stat",
+"3":"end",
+"4":"loop run stop",
+"5":"abort",
+"7":"cancel"
+}
+},
+{
+"anchors":"edit manag remov",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-skill",
+"name":"skill",
+"situation":"Installing, removing, or editing skills",
+"terms":{
+"1":"add list task",
+"2":"file local new",
+"3":"install manag search",
+"4":"edit remov"
+}
+},
+{
+"anchors":"diagnos doctor health installation look show wrong",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-doctor",
+"name":"doctor",
+"situation":"OMH install misbehaving",
+"terms":{
+"1":"config misbehav oh registration",
+"2":"after check look setup show updat work wrong",
+"3":"health install",
+"4":"diagnos herm installation",
+"5":"doctor"
+}
+},
+{
+"anchors":"capability disabl don enabl family offer orchestration switch toggl trim",
+"hangul":"관리 기능 끄기 레이 메모 모리 비활 성화 스트 오케 이션 케스 코딩 트레 활성",
+"hangul_anchors":"관리 기능 끄기 메모 모리 비활 성화 오케 이션 케스 코딩 트레 활성",
+"label":"omh-capability-toggle",
+"name":"capability-toggle",
+"situation":"Tailoring enabled OMH families",
+"terms":{
+"1":"delegation install instead material operation own plan rather run tailor taken uninstall user want whol",
+"2":"back disabl don featur offer policy switch trim",
+"3":"enabl research",
+"4":"family orchestration turn",
+"5":"coding memory toggl",
+"7":"capability"
+}
+},
+{
+"anchors":"activ elaps long",
+"hangul":"델로 돌고 모델 뭐가 실행 작업 중인",
+"hangul_anchors":"델로 돌고 모델 뭐가 실행 작업 중인",
+"label":"omh-running-work-board",
+"name":"running-work-board",
+"situation":"Live view of running coding units",
+"terms":{
+"1":"ask asking live observ plan rather review show start user view",
+"2":"activ right runtim task token",
+"3":"elaps long time",
+"4":"coding",
+"5":"board",
+"6":"model unit",
+"8":"work",
+"9":"run"
+}
+},
+{
+"anchors":"finish left mark migration progress rest",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-todo-checklist",
+"name":"todo-checklist",
+"situation":"Resume or finish the work we agreed on",
+"terms":{
+"1":"agre ask bound completion context continu evidenc hand hud idea infer intent isolat keyword languag metadata ordinary person preserv previously read reject report user visibl want",
+"2":"accept advanc conversation delivery engin keep left mark migration next phas pick progress rest resum start step task track without work",
+"3":"clear",
+"4":"declar finish",
+"5":"todo",
+"6":"plan",
+"9":"checklist"
+}
+},
+{
+"anchors":"account chain cheaper configur connect default different exceed limit openai quick quota rate role slot switch",
+"hangul":"계정 고리 그인 다른 로그 로바 리별 모델 바이 설정 세팅 슬롯 연결 으로 이더 전환 정으 체인 카테 테고 프로",
+"hangul_anchors":"계정 고리 그인 다른 로그 로바 리별 모델 바이 설정 세팅 슬롯 연결 으로 이더 전환 정으 체인 카테 테고",
+"label":"omh-model-setup",
+"name":"model-setup",
+"situation":"Model and provider configuration changes",
+"terms":{
+"1":"activ after alias approv approval check coding configuration confirm connection contract editabl external handoff history inspect metadata nativ prerequisit recommendation review through user verify want",
+"2":"apply chain cheaper default diagnos diff different exceed guid key limit log openai quick quota rate set task",
+"3":"chang configur herm session slot switch",
+"4":"account connect role",
+"5":"setup",
+"6":"provider",
+"9":"model"
+}
+},
+{
+"anchors":"capability enabl faster parallel",
+"hangul":"데이 도구 르메 메스 병렬 설정 업데 이트 인해 헤르 확인",
+"hangul_anchors":"데이 도구 르메 메스 병렬 설정 업데 이트 인해 헤르 확인",
+"label":"omh-parallel-tools",
+"name":"parallel-tools",
+"situation":"Parallel tool-call capability in doubt",
+"terms":{
+"1":"after approv approval contract diagnos doubt follow guid mcp prerequisit report request run shar user want whether",
+"2":"apply diff faster setup",
+"3":"current enabl status verify",
+"4":"capability support",
+"5":"check herm updat",
+"6":"call version",
+"9":"parallel tool"
+}
+},
+{
+"anchors":"bill cheaper configur connect extraction grow reduc scraper websearch",
+"hangul":"검색 비용 서치 설정 싸게 웹서 이기 줄이",
+"hangul_anchors":"검색 비용 서치 설정 싸게 웹서 이기 줄이",
+"label":"omh-websearch-setup",
+"name":"websearch-setup",
+"situation":"Expensive or unconfigured web search",
+"terms":{
+"1":"account adding approv approval chang check choos contract expensiv follow paid prerequisit read shar unconfigur user verify want",
+"2":"add apply backend bill connect diagnos diff extract extraction grow guid keep keyless page set",
+"3":"cost reduc",
+"4":"cheaper free provider scraper tier web",
+"5":"api configur herm key websearch",
+"6":"search",
+"8":"setup"
+}
+},
+{
+"anchors":"access calendar configur connect daily digest email gmail inbox integration mail morn",
+"hangul":"동해 리핑 메일 모닝 브리 설정 아침 연동 정해",
+"hangul_anchors":"동해 리핑 메일 모닝 브리 설정 아침 연동 정해",
+"label":"omh-morning-brief",
+"name":"morning-brief",
+"situation":"Mail and calendar brief configuration",
+"terms":{
+"1":"apply approv approval check configuration contract demand diagnos draft follow guid herm itself mcp prerequisit produc scop shar time user verify want",
+"2":"diff digest gmail inbox integration set summary",
+"3":"access daily read setup",
+"4":"configur email mail",
+"6":"calendar connect",
+"7":"brief",
+"9":"morn"
+}
+},
+{
+"anchors":"attachment buzz community configur connect connection diagnostic gateway host imag join media post relay self",
+"hangul":"니티 메시 뮤니 버즈 시지 연결 첨부 커뮤",
+"hangul_anchors":"니티 메시 뮤니 버즈 시지 연결 첨부 커뮤",
+"label":"omh-buzz",
+"name":"buzz",
+"situation":"Buzz community agent setup or relay trouble",
+"terms":{
+"1":"activ after attach conversation deliver diagnos evidenc inspect invent mean operat public receipt referenc request select singl transport troubl troubleshoot user verifi want without",
+"2":"attachment connection diagnostic imag join local nativ post",
+"3":"agent configur",
+"4":"herm media setup",
+"5":"community connect gateway",
+"6":"host relay self",
+"9":"buzz"
+}
+},
+{
+"anchors":"bug creat discord duplicat github intak maintainer submit",
+"hangul":"깃허 등록 록해 리포 버그 생성 성해 슈로 올려 이슈 포트 허브",
+"hangul_anchors":"깃허 등록 록해 리포 버그 생성 성해 슈로 올려 이슈 포트 허브",
+"label":"omh-github-issue-intake",
+"name":"github-issue-intake",
+"situation":"Chat report that should become a GitHub issue",
+"terms":{
+"1":"ask authoriz chang classify connector creation decision direction hand packag question scop search three verifi",
+"2":"becom chat check confirm creat discord file first log maintainer open public submit writ",
+"3":"duplicat new turn",
+"4":"bug",
+"5":"intak",
+"6":"report",
+"9":"github issu"
+}
+},
+{
+"anchors":"obligation past",
+"hangul":"계약 고서 뉴얼 매뉴 문서 보고 약서 약해 연간 요약 읽기 읽어 전체",
+"hangul_anchors":"계약 고서 뉴얼 매뉴 문서 보고 약서 약해 연간 읽기 읽어 전체",
+"label":"omh-long-document-reading",
+"name":"long-document-reading",
+"situation":"Huge PDF or document to read in full",
+"terms":{
+"1":"60 budget compact continu cover coverag delegat file fit full huge instead keep miss next plan restart resum session sized specification stat suppli",
+"2":"300 anchor entir herm ledger list obligation process rang whol",
+"3":"chunk larg past through",
+"4":"big page summariz",
+"5":"annual",
+"6":"contract manual pdf report",
+"7":"long",
+"9":"document read"
+}
+},
+{
+"anchors":"attacker hacker payment perspectiv system",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-application-threat-model",
+"name":"application-threat-model",
+"situation":"Attack paths into an operated system",
+"terms":{
+"1":"agent component data deploy fail flow herm hold never prov reach remov runtim stop subject taking turn user worth",
+"2":"abus analysis api asset build case control design hacker modell operat payment perspectiv review session surfac test tree workshop",
+"3":"attacker boundary chang hand path scenario servic",
+"4":"architectur strid system",
+"5":"attack threat",
+"6":"application model security trust"
+}
+},
+{
+"anchors":"cannot during mitigat progress sev1 sev2 sev3",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-live-incident-response",
+"name":"live-incident-response",
+"situation":"Production is down or an incident is open",
+"terms":{
+"1":"against clos draft kept named review signal user work",
+"2":"activ app append bleed bridg call cannot channel during mitigat notic ongo progress record room servic sev2 sev3 site stat status still stop updat verifi verify war",
+"3":"assign production run",
+"4":"command commander customer declar mitigation open outag page recovery role sev1 severity temporary timelin",
+"5":"respons right",
+"7":"live",
+"9":"incident"
+}
+},
+{
+"anchors":"away cannot ci fifth figur function give goes heisenbug negativ number overwrit",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-app-debugging",
+"name":"app-debugging",
+"situation":"Application code misbehaves -- a wrong value, a flaky test, a lost update",
+"terms":{
+"1":"behav dependent discriminat first form jvm library misbehav move observ order python separat servic typescript unknown wrongly",
+"2":"analysis answer away cannot cheapest code compet condition demonstrat disappear failur fifth figur find fix function give goes heisenbug hypothes intermittently log minimal negativ number observation overwrit pass print request return",
+"3":"flaky intermittent race reproduc reproduction work",
+"4":"add application caus ci fail locally lost root run updat valu",
+"5":"app bug debug",
+"6":"test wrong"
+}
+},
+{
+"anchors":"branch describ fill put reviewer say word",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-commit-pr-authoring",
+"name":"commit-pr-authoring",
+"situation":"Commit message or pull-request body to write for a change",
+"terms":{
+"1":"executor first line push read ready recent record repo requir subject text user want written",
+"2":"branch command convention describ description diff everyth fill list lore observ prepar put repository reviewer run say squash summariz word",
+"3":"draft log trailer writ",
+"4":"body chang messag test",
+"5":"author templat",
+"6":"pull request",
+"8":"pr",
+"9":"commit"
+}
+},
+{
+"anchors":"bottom line reflog reset restack tidy",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-git-workflow",
+"name":"git-workflow",
+"situation":"Git branch in trouble -- a merge conflict, a commit that broke something, history to repair",
+"terms":{
+"1":"back code first includ introduc new rather regression resolution step troubl work",
+"2":"after already befor bottom chang cherry clean detach failur head interactiv last line marker name pick plan prs reflog repair restack review start tidy undo",
+"3":"brok forc leas rebas resolv squash stack",
+"4":"bisect conflict find history lost push reset rewrit",
+"5":"recover",
+"6":"branch commit merg",
+"7":"git"
+}
+},
+{
+"anchors":"column db ddl endpoint enough grew hundr hung item million mysql postgr row slow wait year",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-relational-db",
+"name":"relational-db",
+"situation":"Database work on a relational store -- a slow query, an index to size, a migration on a big table, a lock taken during deploy, N+1 queries",
+"terms":{
+"1":"behaviour big call connect engin fix itself output plus ready rollback stor take taken without",
+"2":"add alter analyz bloat check column concurrently creat enough explain grew hundr hung item million miss never next order prov row scan seq sequential wait work year",
+"3":"ddl endpoint larg mysql onlin partition run shard size took",
+"4":"during index migration plan safe slow",
+"5":"db postgr",
+"6":"databas deploy lock query tabl",
+"7":"relational"
+}
+},
+{
+"anchors":"agpl critical cve ended env flag github gpl library log4j npm ok push reachabl scanner token",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-security-event-response",
+"name":"security-event-response",
+"situation":"Security event on the code already shipped -- a CVE in a dependency, a secret committed to the repo, a license question, an advisory",
+"terms":{
+"1":"call contact contain containment exist fit forc happen major noth output question registry rotat rotation scan step version",
+"2":"agpl alert already analysis audit aws befor clos code compatibility compatibl critical dependabot ended env file flag git github history issu key library log4j never npm observ ok order packag public reachabl scanner servic severity token vulnerability vulnerabl",
+"3":"credential leak product push repo ship triag",
+"4":"advisory api commit cve dependency gpl licens reachability secret",
+"5":"respons",
+"7":"event security"
+}
+},
+{
+"anchors":"ai assistant codex cursorrul date edit generat md stop tell wrong",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-agent-instructions",
+"name":"agent-instructions",
+"situation":"Agent instruction file for a repo -- AGENTS.md, CLAUDE.md, a Cursor rule",
+"terms":{
+"1":"byte cannot code cost count delimit deriv drift exact gate hand kept map marker output pitfall regenerat repository section surviv time written",
+"2":"ai assistant codex coding cursorrul date document edit insid keep mark region run set stop tell unverifi verifi wrong",
+"3":"build copilot current gemini generat repo test updat writ",
+"4":"claud command cursor md",
+"6":"file rule",
+"9":"agent instruction"
+}
+},
+{
+"anchors":"cloud cloudformation cluster come config databas environment happen iac infra infracost kubectl kustomiz longer match month opentofu pod pulumi resourc roll undo",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-iac-change",
+"name":"iac-change",
+"situation":"Infrastructure-as-code change -- Terraform, OpenTofu, Pulumi, a Kubernetes manifest, a Helm chart",
+"terms":{
+"1":"appli behind between declar kustomization noth output reality valu",
+"2":"blast cloud cluster come config databas detection diff environment gate happen health infra infracost k8s kubectl kustomiz longer match modul month pod preview radius read resourc roll rollback saved set time tofu undo upgrad",
+"3":"cloudformation code stat",
+"4":"delta drift helm infrastructur kubernet manifest opentofu plan pulumi stag terraform",
+"5":"iac",
+"6":"apply chart cost",
+"9":"chang"
+}
+},
+{
+"anchors":"backfill behind break catch column count dag dagster dashboard doubl drop elt etl fell idempotency idempotent last lineag load nightly number rerun row stream twic warehous",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-data-pipelines",
+"name":"data-pipelines",
+"situation":"Data pipeline work -- an ETL or streaming job, a backfill or replay, duplicate events, a schema change downstream, a lineage question, a data-quality regression",
+"terms":{
+"1":"contract impact miss observ output pass past plan read reader repair unknown work",
+"2":"after arriv behind bound break catch chang column count dag dagster dashboard dead doubl downstream drop evolution exactly fell gate last late letter model nightly number question queu regression report topic twic week without",
+"3":"airflow batch check dbt elt idempotency idempotent kafka rerun row run spark warehous",
+"4":"backfill consumer duplicat etl lineag load quality replay schema stream",
+"6":"event job",
+"7":"data pipelin"
+}
+},
+{
+"anchors":"actually automatically base botch dpo favor finetun format higher improv lora matter one qlora rated regress reply rlvr say scor sft solv teach thousand train untun well word worth",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-model-finetuning",
+"name":"model-finetuning",
+"situation":"Fine-tuning a model on your own data -- SFT, DPO, RLVR or a LoRA adapter",
+"terms":{
+"1":"against already availabl beat choos chosen clos comparison decision first gap gate learn noth output plan promot promotion reinforcement retrieval run split their want",
+"2":"actually answer automatically base botch check decid direct favor format higher improv keep matter method one optimization problem qlora rated regress reply say scor ship solv teach thousand user version well whether word worth",
+"3":"preferenc prompt reward supervis train tune verifiabl",
+"4":"adapter baselin checkpoint data dpo eval fine held lora rlvr sft tuned tuning untun",
+"5":"finetun",
+"9":"model"
+}
+},
+{
+"anchors":"appl bad beta boot cert creat devic everyon expir fastlan fifty know misbehav month nobody older privacyinfo reach reject replacement resubmit stop tester testflight today xcprivacy",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-mobile-release",
+"name":"mobile-release",
+"situation":"Releasing an iOS or Android app through the stores -- signing, the privacy manifest, a TestFlight or Play beta, a staged rollout, a hotfix",
+"terms":{
+"1":"already back becaus cannot check declaration enforc gate noth output prepar roll start threshold",
+"2":"api appl ask bad boot cert certificat clos connect consol creat devic everyon expedit expir external fastlan fifty halt hotfix internal key keystor know launch misbehav month new nobody older plan privacyinfo profil reach read reason reject replacement requir resubmit review rollout ship stag stop submission tester through time today version week xcprivacy",
+"3":"befor code data form googl hand next phas provision safety submit test track upload user",
+"4":"android beta build distribution ios manifest play privacy sign stor testflight",
+"5":"mobil",
+"6":"app",
+"7":"releas"
+}
+},
+{
+"anchors":"access actually auditor bad committee creat enough entry found happen icfr invoic itgc journal payment person proof pull quarterly re reconciliation reperform reperformanc three unapprov vendor workpaper",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-internal-audit",
+"name":"internal-audit",
+"situation":"Testing an internal control -- SOX, ICFR or ITGC",
+"terms":{
+"1":"assertion compensat decid defin deriv design failur general itself ledger likelihood magnitud name never noth output owner prov read record transaction whether",
+"2":"404 access actually approv attribut auditor bad check committee creat criteria duty enough entry external fail found grad happen invoic item journal payment perform person proof pull quarterly reperform reperformanc report review segregation stat step three unapprov vendor workpaper",
+"3":"approval itgc material performanc reconciliation severity significant weakness",
+"4":"control deficiency evidenc icfr population re sox test",
+"6":"sampl",
+"7":"audit internal"
+}
+},
+{
+"anchors":"asked attach bug chat contractor copy de deidentify email export number phon pseudonymis pseudonymisation pseudonymiz pseudonymization researcher server spreadsheet still train usag vendor",
+"hangul":"가명 감정 개인 객정 거래 계좌 고객 구기 구자 기관 너사 대행 드번 등록 락처 래처 력사 록번 메일 명처 명화 민감 민등 민번 번호 벤더 별자 별정 비식 식별 실명 업체 에이 연구 연락 외부 외주 이메 이전 익명 인정 전시 전화 정보 좌번 주민 주소 처리 카드 트너 파트 행사 협력 화번",
+"hangul_anchors":"가명 감정 개인 객정 거래 계좌 고객 구기 구자 기관 너사 대행 드번 등록 락처 래처 력사 록번 메일 명처 명화 민감 민등 민번 번호 벤더 별자 별정 비식 식별 실명 업체 에이 연구 연락 외부 외주 이메 이전 익명 인정 전시 전화 정보 좌번 주민 주소 처리 카드 트너 파트 행사 협력 화번",
+"label":"omh-data-share-review",
+"name":"data-share-review",
+"situation":"Before data leaves the team -- a dataset, log, ticket export or transcript excerpt bound for a vendor, a public issue, a model provider or a training corpus",
+"terms":{
+"1":"after befor bound bundl call class classify come count crm file inventory keep kept left local map metadata minimiz minimization noth observ output plan raw record secret upload",
+"2":"anonymiz asked attach bug chat copy corpus customer de deidentify direct email excerpt field first hand identify issu leav list mask model number phon pii provider pseudonymis pseudonymisation pseudonymization quasi redaction remov report researcher safe scrub server set spreadsheet still strip support team ticket transcript usag want",
+"3":"contractor identifier personal pseudonymiz redact",
+"4":"dataset export public residual scan train vendor",
+"5":"review shar",
+"6":"log",
+"9":"data"
+}
+},
+{
+"anchors":"bad five number percent restor semver send yesterday",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-release-cut",
+"name":"release-cut",
+"situation":"Shipping a versioned release -- tag it, stage it behind a canary, or roll back the last deploy",
+"terms":{
+"1":"already befor ci execut host named need output perform plan publish undon",
+"2":"bad behind build bump candidat decid exact first five note number percent percentag previous progressiv restor semver send set user week yesterday",
+"3":"last prepar rollout",
+"4":"back canary command deploy goes new roll rollback ship stag trigger",
+"5":"cut",
+"6":"tag version",
+"9":"releas"
+}
+},
+{
+"anchors":"fee month really renew sign sure went",
+"hangul":"갑에 갱신 결제 계좌 구독 구매 구입 기부 납부 드로 보내 사주 송금 에서 예매 예약 이체 입금 좌에 주문 지갑 지불 충전 카드 후원",
+"hangul_anchors":"갑에 갱신 결제 계좌 구독 구매 구입 기부 납부 드로 보내 사주 송금 에서 예매 예약 이체 입금 좌에 주문 지갑 지불 충전 카드 후원",
+"label":"omh-spend-gate",
+"name":"spend-gate",
+"situation":"Spending money on the user's behalf -- a card checkout, an HTTP 402 or pay-per-request call, a wallet transfer, a booking, a paid data endpoint",
+"terms":{
+"1":"against approver browser confirm credential deposit first hold ledger metadata move never nobody observ output payee person prov rail refund renewal run term their total user",
+"2":"approv approval call challeng click complet cost credit limit month plac purchas really receipt renew requir retry saved send servic sign sure want went",
+"3":"agent answer befor behalf charg fee",
+"4":"402 book buy cap checkout data endpoint http order paid pay payment pre request through transfer wallet",
+"5":"gate",
+"6":"card money",
+"7":"spend"
+}
+},
+{
+"anchors":"big migration modul parallel part several whol",
+"hangul":"",
+"hangul_anchors":"",
+"label":"dag-ulw",
+"name":"dag-ulw",
+"situation":"Large multi-part job to run on its own",
+"terms":{
+"1":"befor broad cleanup delegat fail goal graph herm larg multi node one person plan ready repair report request say separat small task through",
+"2":"big end step ultrawork whol",
+"3":"across build featur migration modul order research several",
+"4":"job parallel part run verify",
+"6":"dag ulw"
+}
+},
+{
+"anchors":"assumption choic concept disposabl experiment feasibility library performanc prob proof prototyp quick quickly risky small solution spik throwaway timing try uncertain",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-decision-prototype",
+"name":"decision-prototype",
+"situation":"Uncertain technical choice for a spike",
+"terms":{
+"1":"answer ask bound cannot cheap deriv discussion falsifiabl featur feed isolat multi observ refus resolv result reversibl settl technical unbound",
+"2":"assumption concept decid feasibility first integration interaction library prob proof quick quickly risky run small solution timing try work",
+"3":"disposabl question uncertain",
+"4":"choic experiment performanc test throwaway",
+"5":"befor spik",
+"6":"api plan prototyp",
+"7":"decision"
+}
+},
+{
+"anchors":"activation campaign churn come conversion engagement experiment growth holdout increas journey led lifecycl market messag monetization nudg onboard paid re referral retention sign trial win",
+"hangul":"그로 라이 로스 마케 보딩 사이 실험 여정 온보 이클 이프 케팅 프사",
+"hangul_anchors":"그로 라이 로스 마케 보딩 사이 실험 여정 온보 이클 이프 케팅 프사",
+"label":"omh-lifecycle-growth",
+"name":"lifecycle-growth",
+"situation":"Churn or weak activation among users",
+"terms":{
+"1":"among assembl audienc behavior consent data design eligibl evidenc explicit gate insufficient launch measurement observ owner policy problem review rollback safe safety ship stag target turn want weak",
+"2":"bound campaign come conversion decision holdout increas led loop market never nudg paid plan readout sign test trial",
+"3":"churn engagement improv journey monetization product re referral user",
+"4":"back messag win",
+"5":"activation app onboard retention",
+"6":"experiment lifecycl",
+"7":"growth"
+}
+},
+{
+"anchors":"addressabl assumption demand pain purchas quantify rival seat side synthesiz trigger",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-market-research",
+"name":"market-research",
+"situation":"Market sizing or customer/competitive analysis",
+"terms":{
+"1":"attribut generic investigat list merely scop specific task",
+"2":"assumption bottom bound brief business comparabl jtbd matrix model plan purchas quantify rival seat side signal synthesiz trigger",
+"3":"addressabl befor competitiv decision demand job pain profil sam sensitivity sizing som sourc tam",
+"4":"analysis competitor evidenc size",
+"5":"research",
+"6":"customer pric",
+"9":"market"
+}
+},
+{
+"anchors":"assumption demand discovery guid hypothesis idea interview kill pay peopl persever pivot portfolio prd riskiest solution startup validat validation willingness worth zero",
+"hangul":"가정 검증 결정 고객 발견 스트 지속 테스 피벗",
+"hangul_anchors":"가정 검증 결정 고객 발견 지속 테스 피벗",
+"label":"omh-product-discovery-validation",
+"name":"product-discovery-validation",
+"situation":"Unvalidated early product idea",
+"terms":{
+"1":"bring delivery deserv ending evidenc exist explicit founder fram inconclusiv investment owner proposition prototyp typed unvalidat valu whether",
+"2":"assumption demand early guid peopl portfolio riskiest segment solution startup willingness writ zero",
+"3":"decision kill persever plan",
+"4":"build business hypothesis interview pay prd validat worth",
+"5":"customer pivot validation",
+"6":"befor discovery idea problem test",
+"7":"product"
+}
+},
+{
+"anchors":"calibration coverag deal enough export forecast health loss pipelin quarter realistic renewal sale salesforc seller slip stal stuck win",
+"hangul":"라인 리뷰 보정 영업 예측 이프 파이 프라",
+"hangul_anchors":"라인 보정 영업 예측 이프 파이 프라",
+"label":"omh-sales-pipeline-review",
+"name":"sales-pipeline-review",
+"situation":"CRM pipeline or sales forecast to review",
+"terms":{
+"1":"aging business concentration criteria definition exit freshness gap handoff leader learn lost movement optional owned owner portfolio prior quality recur scenario scop stag step suppli supply turn won",
+"2":"bound call coverag crm enough evidenc follow loss quarter realistic salesforc seller snapshot stuck win",
+"3":"calibration health next renewal risk stal",
+"4":"export",
+"5":"deal slip",
+"6":"forecast",
+"7":"sale",
+"9":"pipelin review"
+}
+},
+{
+"anchors":"audienc compell different instead introduction movement narrativ reproducibl rhythm script short showreel slid static timed",
+"hangul":"쇼케 영상 이스 제품 케이",
+"hangul_anchors":"쇼케 영상 이스 제품 케이",
+"label":"omh-show-reel",
+"name":"show-reel",
+"situation":"Motion showcase to make",
+"terms":{
+"1":"based concept direction evidenc fram ground inspection local localiz measur produc qa render segment specific time user variant",
+"2":"animat approv author captur compell delivery different export instead introduction launch movement narrativ read rhythm script short showreel slid static timed turn video",
+"3":"film reproducibl work",
+"4":"audienc motion portfolio showcas sourc teaser",
+"5":"reel",
+"6":"product"
+}
+},
+{
+"anchors":"authoritativ conversion coordinat cover coverag declar declaration differ footprint geojson geospatial measurement pair parcel polygon shar sum uniqu wrong",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-geospatial-analysis",
+"name":"geospatial-analysis",
+"situation":"Spatial layers to intersect",
+"terms":{
+"1":"actual crs decorativ execut geometry map narrativ output report reproducibl safe suppli validat",
+"2":"after authoritativ boundary comput conversion coordinat cover coverag declar declaration differ file footprint measur measurement pair parcel shar sum uniqu wrong",
+"3":"geojson intersect intersection overlay spatial",
+"4":"polygon",
+"5":"analysis area geospatial overlap",
+"6":"layer"
+}
+},
+{
+"anchors":"accession alteration biomcp biomedical cach classification clinvar date differ different disagree gene genom last omit registry respons return success timed transcript",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-biomedical-evidence",
+"name":"biomedical-evidence",
+"situation":"Public variant claims to cross-check",
+"terms":{
+"1":"against assertion claim clinical conclusion conflict disagreement diseas failur freshness identity infer labell preserv rather reconcil retriev trial",
+"2":"accession alteration biomcp build cach captur classification command current date differ different disagree genom last matrix omit provider reconciliation respons return sourc success timed transcript updat",
+"3":"clinvar gene record registry",
+"4":"check cross public variant",
+"6":"biomedical evidenc"
+}
+},
+{
+"anchors":"autodock box budget differ energy engin genuin measur mistaken number pdbqt result saved scor tutorial vina",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-molecular-docking",
+"name":"molecular-docking",
+"situation":"Prepared PDBQT inputs",
+"terms":{
+"1":"bind computational efficacy explicit infer input never provenanc real replay safety standalon",
+"2":"autodock budget differ energy engin genuin measur mistaken number output result saved search tutorial",
+"3":"box file ligand pdbqt rigid scor vina",
+"4":"bound prepar run",
+"5":"molecular pose receptor",
+"8":"dock"
+}
+},
+{
+"anchors":"ai based career confirm cv event explanation invitation match opportunity person preferenc preparation requisition saved shortlist submit suitability truthful vacancy",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-ai-job-search",
+"name":"ai-job-search",
+"situation":"Career search to interview",
+"terms":{
+"1":"across assist awar fact find ground hunt profession sourc support verifi",
+"2":"after answer based bound cover cv document evaluat event explanation invitation letter match outcom person post preferenc prepar report requisition resum saved shortlist submit suitability suppli vacancy version",
+"3":"evidenc preparation track truthful",
+"4":"career confirm opportunity",
+"5":"application draft tailor",
+"6":"ai interview job search"
+}
+},
+{
+"anchors":"option probability rate scal true typed",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-jev-ask",
+"name":"jev-ask",
+"situation":"User named Jev for yes/no or pick-one probabilities",
+"terms":{
+"1":"fit key never order pros return suppli want whether writ",
+"2":"named true user",
+"3":"option pick probability rate scal scor text",
+"4":"typed",
+"6":"question",
+"7":"ask",
+"9":"jev"
+}
+},
+{
+"anchors":"break fit sent tie undecidabl",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-jev-route",
+"name":"jev-route",
+"situation":"Undecided OMH route handed to Jev",
+"terms":{
+"1":"answer answerer back block came hand ladder list re record undecid user without",
+"2":"break choos decid sent tie",
+"3":"ask fit undecidabl",
+"4":"pick question",
+"9":"jev rout"
+}
+},
+{
+"anchors":"accord broken flaky move retry",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-jev-failure-triage",
+"name":"jev-failure-triage",
+"situation":"Failing run handed to Jev for a next move",
+"terms":{
+"1":"access approach asked befor chang command dependency hand keep ordinary pick prepar quick run signal typed user",
+"2":"accord broken error fix flaky read transient",
+"3":"ask build retry test",
+"4":"fail move next",
+"8":"failur",
+"9":"jev triag"
+}
+},
+{
+"anchors":"auth extra flag migration reviewer severity",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-jev-review-gate",
+"name":"jev-review-gate",
+"situation":"Wants Jev risk flags on a diff under review",
+"terms":{
+"1":"approv merg never test typed user want",
+"2":"chang check issu pr",
+"3":"ask auth extra migration reviewer risk severity signal",
+"4":"flag",
+"5":"gate",
+"6":"diff",
+"7":"review",
+"9":"jev"
+}
+},
+{
+"anchors":"blast email hold object radius rm screen send",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-jev-action-check",
+"name":"jev-action-check",
+"situation":"Risky command screened by Jev",
+"terms":{
+"1":"add approval asked especially mode outbound permissiv risky run secret user writ",
+"2":"ask email first object risk rm",
+"3":"blast hold radius send",
+"4":"befor safe screen",
+"6":"action command",
+"8":"check",
+"9":"jev"
+}
+},
+{
+"anchors":"agree completion confirm finish object really",
+"hangul":"",
+"hangul_anchors":"",
+"label":"omh-jev-done-check",
+"name":"jev-done-check",
+"situation":"Completion claim tested by Jev",
+"terms":{
+"1":"agent befor complet gather observ rather summary support user",
+"2":"agree confirm finish really test verify",
+"3":"against ask evidenc object output task",
+"4":"claim completion",
+"8":"check",
+"9":"jev"
+}
+},
+{
+"anchors":"arriv auto branch brok ci event github incom label main ops pull sort webhook",
+"hangul":"깃허 드오 라벨 리뷰 실패 어온 오프 이슈 픽스 핸드 허브",
+"hangul_anchors":"깃허 드오 라벨 실패 어온 오프 이슈 픽스 핸드 허브",
+"label":"omh-github-event-ops",
+"name":"github-event-ops",
+"situation":"Incoming GitHub PR, issue, or CI event",
+"terms":{
+"1":"asked bot card choos claim herm operation ran reason receiv rout without",
+"2":"action analysis arriv auto branch brok fail main repo sort",
+"3":"incom",
+"4":"check ci fix handoff label open pr pull request review triag",
+"5":"ops webhook",
+"6":"issu",
+"9":"event github"
+}
+},
+{
+"anchors":"among assign between blocker board builder coordination heartbeat helper interviewer kanban multi multipl profil reviewer role split sub subagent",
+"hangul":"같이 멀티 명이 배분 보드 브에 서브 에이 여러 역할 이전 작업 전트 칸반 할과",
+"hangul_anchors":"같이 멀티 명이 배분 보드 브에 서브 에이 여러 역할 이전 작업 전트 칸반 할과",
+"label":"omh-agent-board",
+"name":"agent-board",
+"situation":"Coordinating several agents or profiles",
+"terms":{
+"1":"collaborativ completion contract coordinat several shap stat status target",
+"2":"among assign between block builder coordination hand helper interviewer kanban multi reviewer split sub subagent track",
+"3":"blocker handoff heartbeat work",
+"4":"herm multipl role",
+"5":"task",
+"6":"profil",
+"8":"board",
+"9":"agent"
+}
+},
+{
+"anchors":"don fact forget naming remember rule save secret stor token",
+"hangul":"기억 로젝 메모 모리 저장 제품 젝트 추가 캡처 프로",
+"hangul_anchors":"기억 로젝 메모 모리 저장 제품 젝트 추가 캡처",
+"label":"omh-memory-new",
+"name":"memory-new",
+"situation":"Project fact to remember across future sessions",
+"terms":{
+"1":"across assess bound clear directly exist explicit futur herm local past recall review session sync through user want",
+"2":"add defer don durabl forget keep naming next refus rule secret stor time token",
+"3":"candidat decision",
+"4":"captur fact save",
+"5":"context remember",
+"6":"new product project",
+"9":"memory"
+}
+},
+{
+"anchors":"clean cleanup conflict curat curation detail duplicat fact forget info inspect know md old outdat remember stal sync wrong",
+"hangul":"검사 기억 나에 너한 대해 데이 드백 등록 래된 로잡 로젝 로필 록된 르메 맥락 메모 메스 모리 바로 스가 스킬 알고 억하 업데 오래 이트 인터 있는 잘못 장된 저장 점검 정리 정보 젝트 중복 터뷰 프로 피드 한테 헤르 현재",
+"hangul_anchors":"검사 기억 나에 너한 대해 데이 드백 등록 래된 로잡 로젝 로필 록된 르메 맥락 메모 메스 모리 바로 스가 스킬 알고 억하 업데 오래 이트 인터 있는 잘못 장된 저장 점검 정리 정보 젝트 중복 터뷰 피드 한테 헤르 현재",
+"label":"omh-memory-sync",
+"name":"memory-sync",
+"situation":"Outdated or wrong Hermes memory entries",
+"terms":{
+"1":"accumulat appli approv candidat decision entry exist past product recall surfac tool without",
+"2":"apply canonical claim clean cleanup context curat curation detail diff english file fix forget guidanc info interview invok know nativ new observ old prepar remember stal still true updat writ",
+"3":"fact inspect outdat project wrong",
+"4":"check conflict duplicat md review user",
+"5":"sync",
+"6":"herm",
+"9":"memory"
+}
+},
+{
+"anchors":"attachment bot card channel discord gateway intent notification post quiet reply send silent slack stay telegram thread unless webhook",
+"hangul":"게이 그램 디스 레그 레드 보내 스레 스코 슬랙 알림 용히 웨이 이트 전달 조용 채널 코드 텔레 트웨",
+"hangul_anchors":"게이 그램 디스 레그 레드 보내 스레 스코 슬랙 알림 용히 웨이 이트 전달 조용 채널 텔레 트웨",
+"label":"omh-gateway-intent-card",
+"name":"gateway-intent-card",
+"situation":"Bot replies via Discord, Slack, or Telegram",
+"terms":{
+"1":"chat herm neutral normaliz origin platform target",
+"2":"action need notification post quiet send stay unless webhook",
+"3":"bot discord reply",
+"4":"channel delivery policy session",
+"5":"card intent silent slack telegram",
+"6":"attachment status thread updat",
+"7":"gateway"
+}
+},
+{
+"anchors":"claud codex helper lack machin migration mode omc omx subagent vs worktree",
+"hangul":"길지 넘겨 넘길 덱스 런타 로드 르메 메스 브에 비성 서브 실행 업트 에이 으로 이전 임으 작업 전트 준비 코덱 코드 코딩 클로 타임 트리 헤르",
+"hangul_anchors":"길지 넘겨 넘길 덱스 런타 로드 르메 메스 브에 비성 서브 실행 업트 에이 으로 이전 임으 작업 전트 코덱 코딩 클로 타임 트리 헤르",
+"label":"omh-executor-runtime-readiness",
+"name":"executor-runtime-readiness",
+"situation":"Unsure whether Codex or Claude Code is ready",
+"terms":{
+"1":"another api befor capability choos compar connector credential external gap inventory named oh plugin toolbelt unsur user whether whol",
+"2":"helper lack machin migration miss omc omx run set subagent support vs",
+"3":"mode ready",
+"4":"agent handoff herm worktree",
+"6":"claud code codex coding executor readiness tool",
+"7":"runtim"
+}
+},
+{
+"anchors":"attach attachment client deck deliver deliverabl generat mode pdf thread",
+"hangul":"상태 전달 첨부",
+"hangul_anchors":"상태 전달 첨부",
+"label":"omh-deliverable-package",
+"name":"deliverable-package",
+"situation":"Attachment and deliverable status tracking",
+"terms":{
+"1":"docx generation herm hwp markdown ppt request stat through track user visibl xlsx",
+"2":"client deck deliver delivery document mode prepar qa thread",
+"3":"approv generat pdf report",
+"4":"attachment",
+"5":"attach file packag",
+"6":"status",
+"7":"deliverabl"
+}
+},
+{
+"anchors":"accessibility dictat driv free line messag mobil phon push quick short speech spoken talk ters voic",
+"hangul":"근성 드폰 말로 말한 명령 모바 바일 성으 요청 으로 음성 접근 짧게 짧은 폰으 핸드",
+"hangul_anchors":"근성 드폰 말로 말한 명령 모바 바일 성으 요청 으로 음성 접근 짧게 짧은 폰으 핸드",
+"label":"omh-voice-input",
+"name":"voice-operator",
+"situation":"Dictated voice note about project work or status",
+"terms":{
+"1":"action clarification clarify concis confirmation handoff herm produc project receiv turn ux work",
+"2":"accessibility command driv first free hand line messag plan push quick speech status styl talk",
+"3":"ask note short spoken",
+"4":"phon ters",
+"5":"dictat operator",
+"6":"mobil request",
+"9":"voic"
+}
+},
+{
+"anchors":"automat automation blocker browser button checkout click fill flow form interactiv link login navigat observation playwright site stag submit trac url visit webpag",
+"hangul":"그인 라우 로그 링크 막히 부분 브라 열고 우저 웹페 이지 입력 작성 작업 조작 캡처 클릭 페이 히는",
+"hangul_anchors":"그인 라우 로그 링크 막히 부분 브라 열고 우저 웹페 이지 입력 작성 작업 조작 캡처 클릭 페이 히는",
+"label":"omh-browser",
+"name":"browser-operator",
+"situation":"Browser login, click, or form task",
+"terms":{
+"1":"action add after auth claim confirmation execution gate herm interaction nativ observ ordinary overlay policy prefer prepar request supervis without",
+"2":"automat automation block button flow interactiv link navigat observation operation playwright session site stag submit through visit webpag",
+"3":"blocker captur log login page task trac",
+"4":"checkout url web",
+"5":"fill open operator",
+"6":"click form",
+"9":"browser"
+}
+},
+{
+"anchors":"archiv clean cleanup copy delet directory download duplicat filesystem folder move name old organiz pdf remov renam safely system workspac",
+"hangul":"검색 다운 디렉 렉터 로드 목록 변경 복사 삭제 운로 이동 이름 작업 정리 조작 찾아 터리 파일 폴더",
+"hangul_anchors":"검색 다운 디렉 렉터 로드 목록 변경 복사 삭제 운로 이동 이름 작업 정리 조작 찾아 터리 파일 폴더",
+"label":"omh-files",
+"name":"workspace-file-operator",
+"situation":"Folder cleanup, renames, or deletions",
+"terms":{
+"1":"action add after claim deletion destructiv gate herm moving nativ ordinary overlay path policy prefer prepar ran scop supervis tool without",
+"2":"clean directory duplicat filesystem name old pdf remov report safely",
+"3":"cleanup move operation system task",
+"4":"copy download find list local organiz search",
+"5":"archiv delet folder operator",
+"6":"renam workspac",
+"9":"file"
+}
+},
+{
+"anchors":"bun cargo cli execut npm pnpm print pytest python script shell suit terminal unittest uv",
+"hangul":"결과 널에 령어 명령 미널 스트 실행 에서 요약 준비 터미 테스",
+"hangul_anchors":"결과 널에 령어 명령 미널 실행 에서 터미 테스",
+"label":"omh-terminal",
+"name":"command-operator",
+"situation":"Shell command or test-suite execution",
+"terms":{
+"1":"add after claim cwd environment evidenc gate herm manager nativ ordinary overlay packag policy prefer prepar ran result safety succeed supervis tool without",
+"2":"build bun cargo install output pnpm print pytest python script summariz task unittest uv",
+"3":"suit",
+"4":"cli execut execution npm terminal",
+"5":"operator run shell test",
+"9":"command"
+}
+},
+{
+"anchors":"calendar channel creat crm discord dm draft edit email event gmail googl hubspot invit jira linear meet notion post saa salesforc send slack ticket",
+"hangul":"넥터 노션 린더 메일 발송 보내 액션 외부 이메 이슈 이지 초대 초안 캘린 커넥 티켓 페이",
+"hangul_anchors":"넥터 노션 린더 메일 발송 보내 액션 외부 이메 이슈 이지 초대 초안 캘린 커넥 티켓 페이",
+"label":"omh-apps",
+"name":"connector-operator",
+"situation":"Email, Slack, or Jira action to perform",
+"terms":{
+"1":"auth availability back claim confirmation credential delivery evidenc gate herm mutation payload perform prepar result scop similar success supervis without",
+"2":"add channel creat dm draft edit event gmail googl hubspot invit issu meet provider record saa salesforc",
+"3":"api discord linear",
+"4":"action app calendar customer external open page post send ticket updat",
+"5":"crm email jira notion operator slack",
+"6":"connector"
+}
+},
+{
+"anchors":"airport bitcoin btc crypto direction exchang forecast game info information krw last live near nearby night pric rate real restaurant scor seoul sport stock timezon today traffic usd weather won york zone",
+"hangul":"가격 간대 결과 경기 길찾 날씨 스포 시간 식당 예보 점수 주가 주변 지도 찾기 코인 포츠 현재 환율",
+"hangul_anchors":"가격 간대 결과 경기 길찾 날씨 스포 시간 식당 예보 점수 주가 주변 지도 찾기 코인 포츠 현재 환율",
+"label":"omh-live-info",
+"name":"live-info-operator",
+"situation":"Live rate, score, or local time a work task needs",
+"terms":{
+"1":"access add after api availability claim correctness data financ gate herm local nativ ordinary overlay policy prefer prepar quality read request result retrieval sourc supervis task tool unit without work",
+"2":"airport bitcoin btc crypto direction exchang forecast freshness krw last lookup near nearby new night provider real restaurant seoul stock timezon today traffic usd won york",
+"3":"information map scor sport zone",
+"4":"current game pric",
+"5":"info operator rate time weather",
+"7":"live"
+}
+},
+{
+"anchors":"adopt adoption affordabl agentchat agy antigravity assistant audio auth auto awar backend barg behavior blockchain bridg chainlink chat clawsocial cli comparison composio control crustocean crypto cryptocurrency demo devic discovery enough evaluat gateway genai generat generation graph handl home identity integration integrity keychain maco mailbox matrix messag microsoft minivers multimodal nextcloud oauth oci onequery oracl pair peer platform plugin privat real realtim receipt reliabl safety screenshot smart social solana spoken sql stack transaction trial universal video voic weather websocket windy windymail wire workspac wxtrain xmr",
+"hangul":"그인 기기 기준 넥터 데모 도입 라우 러그 리스 마트 멀티 모달 비도 비용 생성 스마 스크 스턴 시스 어시 연동 영상 외부 우팅 인증 자동 제어 제품 준비 채택 커넥 턴트 트홈 티모 플러 홈어",
+"hangul_anchors":"그인 기기 기준 넥터 데모 도입 라우 러그 리스 마트 멀티 모달 비도 비용 생성 스마 스크 스턴 시스 어시 연동 영상 외부 우팅 인증 자동 제어 제품 채택 커넥 턴트 트홈 티모 플러 홈어",
+"label":"omh-external-connector-readiness",
+"name":"external-connector-readiness",
+"situation":"Evaluating a plugin, connector, or API for adoption",
+"terms":{
+"1":"answer assess automatic befor choic coding deletion enabl evidenc executor fallback fresh freshness herm hook inventory miss modality named optional owner paus remov runtim scop toolbelt whether",
+"2":"agent agentchat agy antigravity assistant audio auto awar backend barg behavior benchmark blockchain bridg capability chainlink chat clawsocial cli comparison composio control crustocean crypto cryptocurrency delet demo devic disabl discovery enough failur gateway genai generat generation graph handl home integration integrity keychain lifecycl maco mailbox matrix messag microsoft migration minivers new nextcloud oauth observabl oci onequery oracl pair peer platform portability postur privat product read real realtim receipt reliabl risk rollback screenshot smart social solana spoken sql stack sync text time tool transaction turn universal video voic weather websocket windy windymail wire workspac wxtrain xmr",
+"3":"adopt affordabl auth compar cost evaluat export identity multimodal retention safe safety switch",
+"4":"adoption rout",
+"5":"data memory trial",
+"6":"api plugin provider readiness",
+"7":"external",
+"9":"connector"
+}
+},
+{
+"anchors":"arg argument bring clash claud cli codex collision compatibility directory folder frontmatter gemini import interpolation library name opencod reus slash",
+"hangul":"가져 디렉 래시 렉터 롬프 매핑 명령 슬래 오기 인자 져오 터리 폴더 프롬 프트",
+"hangul_anchors":"가져 디렉 래시 렉터 롬프 매핑 명령 슬래 오기 인자 져오 터리 폴더 프롬 프트",
+"label":"omh-prompt-import-readiness",
+"name":"prompt-import-readiness",
+"situation":"Importing prompt files for Hermes",
+"terms":{
+"1":"adoption api candidat capability connector dry evidenc expos format miss offer plugin run runtim sourc status stay toolbelt trust",
+"2":"arg audit befor bring clash compatibility directory external folder frontmatter gemini normaliz opencod reus review turn",
+"3":"agent cli collision explicit interpolation name",
+"4":"claud code codex file library map",
+"5":"argument",
+"6":"command herm readiness slash",
+"7":"import",
+"9":"prompt"
+}
+},
+{
+"anchors":"3d arm automation camera control cultivation devic equipment gated hardwar heat home iot klipper lab moonraker mushroom physical pi print printer raspberry relay robot robotic safety sensor snapmaker vla",
+"hangul":"드웨 레이 로봇 린터 릴레 물리 센서 안전 웨어 장비 제어 준비 프린 하드",
+"hangul_anchors":"드웨 로봇 린터 릴레 물리 센서 안전 웨어 장비 제어 프린 하드",
+"label":"omh-physical-device-readiness",
+"name":"physical-device-readiness",
+"situation":"Agent control of a robot, 3D printer, or IoT relay",
+"terms":{
+"1":"actuat adopt adoption affect connector dry emergency envelop explicit external miss move observation operator otherwis policy prepar provider requirement stop tool toolbelt trial unlock",
+"2":"arm automation befor check command cultivation equipment gated home klipper moonraker mushroom robotic snapmaker start vla",
+"3":"agent approval camera hardwar heat iot lab print run",
+"4":"gate pi raspberry sensor",
+"5":"3d control printer relay robot safety",
+"6":"physical readiness",
+"8":"devic"
+}
+},
+{
+"anchors":"announcement audienc changelog content copy draft email executiv guid land linkedin newsletter plain post publish rewrit social tone voic word",
+"hangul":"가이 객용 고객 공지 글쓰 널별 노트 뉴스 레이 레터 리즈 릴리 메일 문체 스레 쓰기 오퍼 요약 워크 이드 이메 이터 즈노 지문 채널 초안 콘텐 크플 텐츠 퍼레 플로",
+"hangul_anchors":"가이 객용 고객 공지 글쓰 널별 노트 뉴스 레터 리즈 릴리 메일 문체 스레 쓰기 오퍼 워크 이드 이메 이터 즈노 지문 채널 초안 콘텐 크플 텐츠 퍼레 플로",
+"label":"omh-content-operator",
+"name":"content-operator",
+"situation":"Product or company copy to publish or rewrite",
+"terms":{
+"1":"access approval claim company controll creation delivery export fact file gate hallucination herm prepar quality readm review scop send stakeholder summarization supervis transformation translation verification without work",
+"2":"changelog fix guid land launch linkedin page plain sourc summariz text version voic word",
+"3":"audienc customer email note product ready releas social styl",
+"4":"announcement executiv post publish",
+"5":"copy draft newsletter operator rewrit tone writ",
+"6":"content"
+}
+},
+{
+"anchors":"audio clip extract extraction field graphic imag input media meet ocr pars photo pictur podcast pull receipt say screenshot timestamp transcrib transcript transcription video webinar youtub",
+"hangul":"녹음 디오 라인 린샷 미지 샷에 수증 스크 스탬 스트 에서 영상 영수 오디 요약 유튜 음성 이미 임라 임스 전사 지에 추출 크린 타임 탬프 텍스 튜브 회의",
+"hangul_anchors":"녹음 디오 라인 린샷 미지 샷에 수증 스크 스탬 에서 영상 영수 오디 유튜 음성 이미 임라 임스 전사 지에 추출 크린 타임 탬프 텍스 튜브 회의",
+"label":"omh-media-input",
+"name":"media-input-operator",
+"situation":"Audio, video, or screenshot to process",
+"terms":{
+"1":"access claim download evidenc factual gated hallucination herm link output permission prepar process risk sent sourc supervis user without work",
+"2":"extract field graphic pictur pull read say summariz webinar",
+"3":"clip extraction imag meet pars transcription",
+"4":"audio ocr photo podcast summary transcrib transcript",
+"5":"input operator record text",
+"6":"receipt screenshot timestamp video youtub",
+"7":"media"
+}
+},
+{
+"anchors":"analyz anomaly causal causality chart cohort column correlation csv dataset delta executiv json retention schema segment spreadsheet tabl trend",
+"hangul":"과관 관계 관관 데이 델타 로그 분석 상관 상치 오류 요약 이상 이터 인과 전환 차트 추세 컬럼 패턴 환율",
+"hangul_anchors":"과관 관계 관관 데이 델타 로그 분석 상관 상치 오류 이상 이터 인과 전환 차트 추세 컬럼 패턴 환율",
+"label":"omh-data-analysis",
+"name":"data-analysis",
+"situation":"Dataset or table to analyze",
+"terms":{
+"1":"guard hallucination herm mixed numeric prepar provenanc scop structur unstructur unsupport without",
+"2":"causality check claim cohort column delta executiv find json retention schema segment summariz summary suppli",
+"3":"analyz dataset",
+"4":"anomaly chart correlation csv log spreadsheet trend",
+"5":"tabl",
+"6":"analysis causal",
+"7":"data"
+}
+},
+{
+"anchors":"automation browser cli credential driv generator github gmail googl imag integration jira linear mcp notion plugin requir server slack toolbelt",
+"hangul":"격증 그인 넥터 도구 러그 연결 외부 자격 증명 커넥 플러",
+"hangul_anchors":"격증 그인 넥터 도구 러그 연결 외부 자격 증명 커넥 플러",
+"label":"omh-toolbelt-readiness",
+"name":"toolbelt-readiness",
+"situation":"Which tools and credentials a workflow needs",
+"terms":{
+"1":"apis assess choos clis coding depend executor herm install inventory named optional owner runtim unsaf",
+"2":"automation browser driv generator gmail googl imag jira key notion plugin requir slack triag",
+"3":"external integration server",
+"4":"connector github linear need",
+"5":"api cli miss toolbelt",
+"6":"credential mcp readiness tool"
+}
+},
+{
+"anchors":"adapter around between claud codex config control differ drift earlier harness inventory last lifecycl mcp pane previous recall recover still worktree",
+"hangul":"기억 네스 넥터 드리 리프 벤토 복구 설정 세션 워크 인벤 지난 커넥 코딩 크트 토리 트리 프트 하네",
+"hangul_anchors":"기억 네스 넥터 드리 리프 벤토 복구 설정 세션 워크 인벤 지난 커넥 코딩 크트 토리 트리 프트 하네",
+"label":"omh-harness-session-inventory",
+"name":"harness-session-inventory",
+"situation":"Lost track of agent sessions and worktrees",
+"terms":{
+"1":"awar befor claim cross cursor herm load lost metadata normaliz opencod progress ran summary track wrapper",
+"2":"adapter agent around between control differ earlier host last lifecycl list open pane previous recall still tool",
+"3":"claud code connector operator",
+"4":"coding config drift find recover",
+"5":"codex",
+"6":"harness mcp worktree",
+"7":"inventory",
+"9":"session"
+}
+},
+{
+"anchors":"board card dashboard grafana health history latency metric mode monitor number observability ops overview prometheus rate slo spend telemetry token uptim",
+"hangul":"관측 그라 라파 로메 메테 메트 비스 서비 시간 연시 우스 운영 지연 지휘 측성 테우 트릭 파나 품질 프로 휘판",
+"hangul_anchors":"관측 그라 라파 로메 메테 메트 비스 서비 시간 연시 우스 운영 지연 지휘 측성 테우 트릭 파나 품질 휘판",
+"label":"omh-ops-observability-card",
+"name":"ops-observability-card",
+"situation":"Tracking cost, tokens, latency, or service health",
+"terms":{
+"1":"automation boundary evidenc executor gateway handoff prepar queu suppli track visibility work wrapper",
+"2":"error fail keep monitor number overview rate safe slo spend telemetry uptim",
+"3":"external health run",
+"4":"board command cost dashboard failur grafana history metric mode operation prometheus provider quality servic",
+"5":"card loop observability ops",
+"6":"latency token"
+}
+},
+{
+"anchors":"achievement badg card clos earn newest progress recent shar tier unlock",
+"hangul":"과제 도전 배지 뱃지 업적 요약 전과",
+"hangul_anchors":"과제 도전 배지 뱃지 업적 전과",
+"label":"omh-achievements",
+"name":"achievements",
+"situation":"Hermes badges unlocked and achievement progress",
+"terms":{
+"1":"artifact ask local observation plugin prepar section summariz user want",
+"2":"card clos earn newest next shar summary",
+"3":"herm report",
+"4":"recent",
+"6":"badg progress tier unlock",
+"9":"achievement"
+}
+},
+{
+"anchors":"ai blocker ce codex dashboard est good ist los manager ops productiv productivity progress qu qui se throughput view",
+"hangul":"관리 까지 는지 덱스 됐는 됐어 되었 디까 리량 리뷰 리서 리자 리핑 무슨 뭐해 뭔일 브리 상황 서치 슨일 어디 업상 업이 었는 이노 이야 일이 일임 입장 작업 진행 처리 코덱 코딩 품질 행됐 행되 행상",
+"hangul_anchors":"관리 까지 는지 덱스 됐는 됐어 되었 디까 리량 리서 리자 리핑 무슨 뭐해 뭔일 브리 상황 서치 슨일 어디 업상 업이 었는 이노 이야 일이 일임 입장 작업 진행 처리 코덱 코딩 품질 행됐 행되 행상",
+"label":"omh-agent-ops-review",
+"name":"agent-ops-review",
+"situation":"AI agent progress for managers",
+"terms":{
+"1":"action explain herm inspect lever next",
+"2":"ce codex coding dashboard est gate good ist los operator output pass productiv productivity qu qui se status summary task updat view week",
+"4":"blocker throughput",
+"5":"manager ops review work",
+"6":"ai progress quality",
+"9":"agent"
+}
+},
+{
+"anchors":"burn debug drift goal introspection lost progress repeat retry self stall stuck token way",
+"hangul":"낭비 도구 드리 디버 리프 반복 버그 스트 실패 에이 이전 전트 컨텍 텍스 토큰 프트",
+"hangul_anchors":"낭비 도구 드리 디버 리프 반복 버그 실패 에이 이전 전트 컨텍 텍스 토큰 프트",
+"label":"omh-agent-debug",
+"name":"agent-debug",
+"situation":"Agent is stuck, looping, or drifting",
+"terms":{
+"1":"action assumption diagnos environment likely losing objectiv pattern prepar recoverabl recovery repeatedly safe smallest without",
+"2":"goal introspection keep lost prompt repeat retry self stall track way",
+"3":"captur context failur progress",
+"4":"call drift fail loop run stuck",
+"5":"burn debug token tool",
+"9":"agent"
+}
+},
+{
+"anchors":"bad broken catch consol dangerous empty exception fallback fals green hidden hide hunter ignor mask network nobody propagation say see silent swallow",
+"hangul":"감사 무음 백이 삼킨 삼킴 숨김 숨은 신호 실패 에러 용한 위험 조용 폴백 험한",
+"hangul_anchors":"감사 무음 백이 삼킨 삼킴 숨김 숨은 신호 실패 에러 용한 위험 조용 폴백 험한",
+"label":"omh-failure-signal-audit",
+"name":"failure-signal-audit",
+"situation":"Hidden or swallowed errors suspected",
+"terms":{
+"1":"agent becom befor behavior browser code downgrad enough evidenc find frontend herm report suspect trac ui unsaf without",
+"2":"bad block broken dangerous empty exception fail hunter ignor mask network nobody runtim say see silent test",
+"3":"fals miss propagation status",
+"4":"catch consol hidden hide pass swallow",
+"5":"error signal",
+"6":"audit fallback green",
+"9":"failur"
+}
+},
+{
+"anchors":"confidenc confident cross export global habit import instinct ledger lesson pattern promot promotion relearn scor specific",
+"hangul":"로젝 본능 스코 승격 전역 젝트 코프 트별 패턴 프로 학습",
+"hangul_anchors":"로젝 본능 스코 승격 전역 젝트 코프 트별 패턴 학습",
+"label":"omh-instinct-ledger",
+"name":"instinct-ledger",
+"situation":"Recurring lessons worth promoting",
+"terms":{
+"1":"boundary correction decision evidenc failur herm observation recur turn user worth",
+"2":"atomic confident habit keep relearn repeat specific",
+"3":"cross global import review scor",
+"4":"candidat confidenc learn lesson promotion scop",
+"5":"ledger pattern promot",
+"6":"export project",
+"7":"instinct"
+}
+},
+{
+"anchors":"adopt adoption agentskill community creat discovery don extend famous fork github io marketplac plugin popular reinvent scout top useful worth",
+"hangul":"검색 그인 기존 들기 러그 명한 비교 설치 스카 스킬 없는 용한 우트 유명 유용 찾기 찾아 치할 카우 플러 할지 후보",
+"hangul_anchors":"검색 그인 기존 들기 러그 명한 비교 설치 스카 스킬 없는 용한 우트 유명 유용 찾기 찾아 치할 카우 플러 할지 후보",
+"label":"omh-skill-scout",
+"name":"skill-scout",
+"situation":"Existing skills to reuse before authoring",
+"terms":{
+"1":"adapt author copy creation default install metadata option prepar report reus review risk trust without",
+"2":"adopt after agentskill already befor community discovery don extend famous find fork herm io local new plugin popular reinvent top useful web worth",
+"3":"adoption compar creat",
+"4":"candidat github marketplac",
+"5":"scout search",
+"6":"exist"
+}
+},
+{
+"anchors":"amendment backlog dashboard health improvement overview pattern pend portfolio stal",
+"hangul":"개선 대시 보드 보류 상태 수정 스킬 시보 실패 패턴 헬스 후보",
+"hangul_anchors":"개선 대시 보드 보류 상태 수정 스킬 시보 실패 패턴 헬스 후보",
+"label":"omh-skill-health",
+"name":"skill-health",
+"situation":"OMH skill portfolio health overview",
+"terms":{
+"1":"action automatic execution install level live metadata mutation observ operator prepar repair signal success surfac top treat without",
+"2":"backlog chang fail improvement pattern quality updat",
+"3":"amendment dashboard failur overview stal",
+"4":"portfolio",
+"5":"pend",
+"7":"health"
+}
+},
+{
+"anchors":"bundl case corpus didn export gepa happen improv improvement index lesson process queu rebuild regression self stor supervision trac vprm wiki",
+"hangul":"개선 기록 내기 내보 누락 라우 보내 상태 스킬 실행 썼어 우팅 워크 이번 이스 점검 준비 케이 크플 플로 학습 회귀",
+"hangul_anchors":"개선 기록 내기 내보 누락 라우 보내 상태 스킬 실행 썼어 우팅 워크 이번 이스 점검 케이 크플 플로 학습 회귀",
+"label":"omh-workflow-learning",
+"name":"workflow-learning",
+"situation":"Missed route or run lessons to record",
+"terms":{
+"1":"after artifact automation becom befor canonical captur classify convert decision destination drift durabl eval evaluabl handoff herm inspectabl persist produc prompt proposal raw repair replayabl retrospectiv surfac until without writ",
+"2":"attempt auxiliary bundl candidat corpus didn execution gepa happen improv lane metadata patch pick process readiness rebuild session supervision turn vprm",
+"3":"case failur improvement lesson memory self signal trac wiki",
+"4":"audit export index miss queu record review rout",
+"5":"run",
+"6":"learn regression stor"
+}
+},
+{
+"anchors":"alternativ approach dismiss drop idea option previously recall reject rule",
+"hangul":"각된 거절 결정 기각 대안 절된",
+"hangul_anchors":"각된 거절 결정 기각 대안 절된",
+"label":"omh-decision-recall",
+"name":"decision-recall",
+"situation":"Previously rejected options to revisit",
+"terms":{
+"1":"context elevat evidenc execution revisit without",
+"2":"against already approach approv befor decid dismiss drop idea memory review rule scop turn",
+"3":"option previously",
+"4":"alternativ",
+"6":"recall reject",
+"7":"decision"
+}
+},
+{
+"anchors":"breakdown duration efficiency efficient last slow spent timing utilization wast",
+"hangul":"도구 리포 사용 스트 시간 실행 용량 지연 컨텍 텍스 포트 효율",
+"hangul_anchors":"도구 리포 사용 시간 실행 용량 지연 컨텍 텍스 포트 효율",
+"label":"omh-run-efficiency",
+"name":"run-efficiency",
+"situation":"Run efficiency and context usage report",
+"terms":{
+"1":"bound data explicit gap metadata stay unobserv usag",
+"2":"breakdown duration efficient last provider session slow spent step suppli time timing utilization wast",
+"3":"context",
+"4":"local report tool",
+"7":"efficiency",
+"8":"run"
+}
+},
+{
+"anchors":"capability confirmation credential postur presenc present profil safely secret show",
+"hangul":"공급 급자 넥터 로필 상태 시크 존재 준비 커넥 크릿 프로 확인",
+"hangul_anchors":"공급 급자 넥터 로필 상태 시크 존재 커넥 크릿 확인",
+"label":"omh-provider-profile-posture",
+"name":"provider-profile-posture",
+"situation":"Provider credentials without exposure",
+"terms":{
+"1":"action befor call exposur metadata prepar preparation read",
+"2":"api check confirmation exist key present readiness safely setup show",
+"3":"capability presenc without",
+"4":"credential",
+"5":"connector postur",
+"6":"secret",
+"9":"profil provider"
+}
+}
+],
+"stem_exceptions":"atlas bus does gas goes lens news series species this thus yes",
+"stopwords":"a about again all also am an and any anything are as at be been being both but by can can't could did didn't do does doesn't doing don't done down e.g each either etc every for from get give go going got had has have having he help her here him how i i'd i'm i've i.e if in into is isn't it it's its just less let lets like look make many may me might more most much must my need needs neither no not now of off omh on once one only onto or other our out over own per please same see shall she should show skill skills so some someone something stuff such tell than that that's the them then there there's these they thing things this those to too two under up us use used uses using very via want was we we're we've were what when where which while who whom whose why will with won't workflow workflows would yes you your"
+}

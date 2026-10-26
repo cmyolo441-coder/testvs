@@ -1,0 +1,30 @@
+omh_home: "~/.omh"
+status_limit: 3
+hud_preset: focused
+inject_context: true
+privacy: metadata_only
+# Profile-local plugins.entries.omh.settings.group_chat_activity (legacy config fallback).
+# Requires on_room_member_activity and OMH core admission; native coverage is partial.
+group_chat_activity:
+  enabled: false
+claim_boundary: "Prepared handoffs are not execution, review, CI, merge-readiness, or merge evidence."
+evidence:
+  # Token-prefix allowlist for explicit local verification probes.
+  # These commands are run with shell=False and bounded to a project_root that is the
+  # host working directory or inside it; `-m unittest` takes only reporting flags, a
+  # path that compileall or an omh option opens must stay inside workdir, and so must a
+  # git diff path argument (a `:/` pathspec or `<rev>:<path>` still reaches the repo).
+  allowlist_prefixes:
+    - "omh --help"
+    - "omh doctor"
+    - "omh probe"
+    - "omh harness validate"
+    - "omh docs workflows --check"
+    - "omh release checklist"
+    - "omh release product-readiness"
+    - "omh release evidence-bundle"
+    - "python -m unittest"
+    - "python3 -m unittest"
+    - "python -m compileall"
+    - "python3 -m compileall"
+    - "git diff --check"

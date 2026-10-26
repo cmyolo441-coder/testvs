@@ -1,0 +1,496 @@
+from __future__ import annotations
+
+from .. import runtime_paths
+
+import hashlib
+import json
+import re
+from typing import Any
+
+from ..awareness import awareness_route_hint
+from ..degradation import safe_error_type as _safe_error_type
+from ..host_context import active_main_agent_model
+from ..host_observation import OBSERVATION_SCHEMA, attach_public_observation, host_session_id, observe_plugin_tool_call
+from ..route_answerers import answerer_ladder
+
+OMH_INTERACT_SCHEMA = {
+    "name": "omh_interact",
+    "description": (
+        "Build the OMH chat_interaction/v1 envelope for a natural-language Hermes request and, "
+        "by default, record a metadata-only wrapper session. This is chat orchestration evidence, "
+        "not executor dispatch, implementation, review, CI, or merge evidence."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "description": "Current user request. The plugin returns hash/length metadata instead of echoing it.",
+            },
+            "source": {
+                "type": "string",
+                "enum": ["generic", "discord", "slack", "telegram", "hermes"],
+                "default": "hermes",
+                "description": "Host chat surface that produced the request.",
+            },
+            "platform_context": {
+                "type": "object",
+                "description": (
+                    "Optional omh platform context: platform (one of the registered platform ids) "
+                    "plus opaque conversation_ref/thread_ref/user_ref and optional limits, "
+                    "capabilities, or render_profile. Validated into an omh_platform_envelope/v1 "
+                    "before any session write; unsafe or contradictory input fails closed."
+                ),
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "route", "plan", "delegate"],
+                "default": "auto",
+                "description": "OMH chat interaction mode.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 3,
+                "description": "Maximum route recommendations to consider.",
+            },
+            "min_confidence": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "default": "high",
+                "description": "Minimum confidence threshold for auto routing.",
+            },
+            "executor_target": {
+                "type": "string",
+                "default": "choose",
+                "description": "Preferred coding-agent/runtime target when mode=delegate.",
+            },
+            "record_session": {
+                "type": "boolean",
+                "default": True,
+                "description": "Record or resume a metadata-only wrapper session under OMH runtime state.",
+            },
+            "source_metadata": {
+                "type": "object",
+                "description": "Optional bounded wrapper metadata such as source_event_id, channel_ref, user_ref, target_ref, or runtime_ref.",
+            },
+            "omh_home": {
+                "type": "string",
+                "description": "Standalone operator override only. Native Hermes calls reject this field; omit it to use the active profile.",
+            },
+            "hermes_home": {
+                "type": "string",
+                "description": "Standalone operator override only. Native Hermes calls reject this field; omit it to use the active profile.",
+            },
+            "observation": OBSERVATION_SCHEMA,
+        },
+        "required": ["message"],
+    },
+}
+
+_CLAIM_BOUNDARY = (
+    "A wrapper chat/session record proves OMH chat orchestration metadata only. "
+    "It is not executor dispatch, implementation, verification, review, CI, merge, "
+    "or proof of unrecorded Hermes wrapper behavior."
+)
+_METADATA_TEXT_LIMIT = 180
+_SENSITIVE_PATTERNS = (
+    "api_key",
+    "apikey",
+    "authorization:",
+    "bearer ",
+    "ghp_",
+    "password",
+    "private-token",
+    "secret",
+    "token",
+    "xoxb-",
+    "xoxp-",
+)
+_SENSITIVE_VALUE_PATTERN = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(?:sk-[a-z0-9_-]+|github_pat_[a-z0-9_]+|gh[opsu]_[a-z0-9_]+)"
+)
+
+
+def omh_interact_handler(args: dict, **kwargs) -> str:
+    if error := runtime_paths.tool_home_error(args):
+        return json.dumps(error, sort_keys=True)
+    observation = observe_plugin_tool_call("omh_interact", args, kwargs)
+    message = str(args.get("message") or "").strip()
+    if not message:
+        payload = {
+            "schema_version": "omh_interact_result/v1",
+            "status": "error",
+            "error": "omh_interact.message is required",
+            "claim_boundary": _CLAIM_BOUNDARY,
+        }
+        return json.dumps(attach_public_observation(payload, observation), sort_keys=True)
+
+    # Validate the requested source before any package or fallback work: an
+    # unknown source fails closed here, and every later path -- including the
+    # ImportError fallback -- can trust that `_source(args)` will not raise.
+    try:
+        _source(args)
+    except _UnsupportedSourceError:
+        payload = _invalid_input_interaction(error="unsupported_source")
+        return json.dumps(attach_public_observation(payload, observation), sort_keys=True)
+
+    try:
+        payload = _package_interaction(
+            args,
+            message,
+            host_kwargs=kwargs,
+            observation=observation,
+        )
+    except _InvalidPlatformContextError:
+        payload = _invalid_input_interaction(error="invalid_platform_context")
+    except (ImportError, ModuleNotFoundError) as exc:
+        payload = _fallback_interaction(args, message, error=str(exc))
+    except Exception as exc:
+        payload = _backend_error_interaction(args, message, error_type=type(exc).__name__)
+    _attach_answerer_ladder(payload, args)
+    return json.dumps(attach_public_observation(payload, observation), sort_keys=True)
+
+
+def _attach_answerer_ladder(payload: dict[str, Any], args: dict) -> None:
+    """Name who could answer this envelope's route question, when there is one.
+
+    The ladder sits beside the route rather than inside it: the routing
+    payload is a pure function of the message and says nothing about the
+    machine, and a per-machine list nested under it would travel into every
+    record built from a route. Attached only when the route carries a
+    question, because that is the only time the answer to "who could answer
+    it" means anything.
+
+    It is a report, never a recommendation. A rung naming an installed
+    third-party plugin is a fact about this machine; OMH does not call it and
+    does not ask the model to.
+    """
+    route = payload.get("route")
+    if not isinstance(route, dict) or not isinstance(route.get("route_question"), dict):
+        return
+    try:
+        omh_home = runtime_paths.plugin_home(args.get("omh_home"))
+        hermes_home = runtime_paths.plugin_home(args.get("hermes_home"), hermes=True)
+    except (runtime_paths.RuntimeBindingError, OSError, RuntimeError):
+        # A home that will not bind costs the ladder, not the envelope: the
+        # question is still there to answer, and the model is still one of
+        # the answerers whether or not OMH could read the plugin directory.
+        return
+    payload["route_question_answerers"] = answerer_ladder(hermes_home, omh_home)
+
+
+class _UnsupportedSourceError(ValueError):
+    """The caller named a chat source OMH does not serve."""
+
+
+class _InvalidPlatformContextError(ValueError):
+    """The supplied platform_context cannot produce a safe envelope."""
+
+
+#: Fixed safe detail per invalid-input error. The exception text behind
+#: these errors quotes the caller's own source or platform strings, which are
+#: attacker-controlled: echoing them would reflect secrets, phone numbers, or
+#: injection-shaped text into a payload OMH signs with its claim boundary.
+_INVALID_INPUT_DETAILS = {
+    "unsupported_source": "the requested source is not one OMH serves",
+    "invalid_platform_context": "platform_context failed envelope validation",
+}
+
+
+def _invalid_input_interaction(*, error: str) -> dict[str, Any]:
+    """Bounded omh_interact_result/v1 for input OMH refused before any work.
+
+    Deliberately carries no ``source`` and no ``thread_key``: the input failed
+    validation, so there is no verified source to report -- and reporting the
+    ``hermes`` default here would claim a host surface the caller never had.
+    The detail is a fixed safe string, never the validator's message.
+    """
+    return {
+        "schema_version": "omh_interact_result/v1",
+        "status": "error",
+        "error": error,
+        "detail": _INVALID_INPUT_DETAILS.get(error, "invalid input"),
+        "supported_sources": list(_SUPPORTED_SOURCES),
+        "hint": (
+            "Use source=generic (or another supported source) and pass the platform "
+            "identity as platform_context.platform with opaque conversation_ref, "
+            "thread_ref, or user_ref values."
+        ),
+        "redaction_policy": "metadata_only",
+        "claim_boundary": _CLAIM_BOUNDARY,
+    }
+
+
+def _package_interaction(
+    args: dict[str, Any],
+    message: str,
+    *,
+    host_kwargs: dict[str, Any] | None = None,
+    observation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from omh.paths import resolve_paths
+    from omh.system.platform_envelope import PlatformContextError
+    from omh.workflows.domain_project_context import bind_plugin_project
+    from omh.wrapper.contract import build_chat_interaction_payload
+    from omh.wrapper.sessions import create_or_resume_wrapper_session
+
+    paths = resolve_paths(
+        omh_home=runtime_paths.plugin_home(args.get("omh_home")),
+        hermes_home=runtime_paths.plugin_home(args.get("hermes_home"), hermes=True),
+    )
+    source = _source(args)
+    mode = _mode(args)
+    limit = _bounded_limit(args.get("limit"), default=3)
+    min_confidence = _min_confidence(args)
+    executor_target = str(args.get("executor_target") or "choose")
+    source_metadata = _source_metadata(args)
+    platform_context = _platform_context(args)
+    main_agent_model = active_main_agent_model()
+    host_values = host_kwargs or {}
+    # The chat this call serves, from the dispatch keyword only: a handoff
+    # carries what that chat's memory lens admits, and in a gateway process
+    # `HERMES_SESSION_ID` belongs to whichever agent was built last.
+    hermes_session_id = host_session_id(host_values)
+    if bool(args.get("record_session", True)):
+        try:
+            result = create_or_resume_wrapper_session(
+                paths,
+                message,
+                source=source,
+                mode=mode,
+                limit=limit,
+                min_confidence=min_confidence,
+                source_metadata=source_metadata,
+                executor_target=executor_target,
+                platform_context=platform_context,
+                main_agent_model=main_agent_model,
+                record_provenance={
+                    "producer": "plugin_tool",
+                    "producer_detail": "omh_interact plugin tool",
+                    "observed_by_host": bool(observation and observation.get("status") == "observed"),
+                },
+                hermes_session_id=hermes_session_id,
+                _host_project_binding_factory=lambda: bind_plugin_project(host_values),
+            )
+        except PlatformContextError as exc:
+            raise _InvalidPlatformContextError(str(exc)) from exc
+        interaction = dict(result["interaction"])
+        session = result["session"]
+        interaction["wrapper_session"] = {
+            "schema_version": "omh_wrapper_session_ref/v1",
+            "recorded": True,
+            "resumed": bool(result.get("resumed", False)),
+            "session_id": str(session.get("session_id", "")),
+            "session_status": str(session.get("status", "")),
+            "thread_key": str(session.get("thread_key", "")),
+            "record_provenance": session.get("record_provenance", {}),
+            "status_next_action": str(result.get("status", {}).get("next_action", "")),
+            "claim_boundary": _CLAIM_BOUNDARY,
+        }
+        interaction["wrapper_session_status"] = result.get("status", {})
+        return interaction
+
+    try:
+        interaction = build_chat_interaction_payload(
+            message,
+            source=source,
+            mode=mode,
+            limit=limit,
+            min_confidence=min_confidence,
+            include_message=False,
+            executor_target=executor_target,
+            source_metadata=source_metadata,
+            paths=paths,
+            platform_context=platform_context,
+            main_agent_model=main_agent_model,
+            hermes_session_id=hermes_session_id,
+            _host_project_binding_factory=lambda: bind_plugin_project(host_values),
+        )
+    except PlatformContextError as exc:
+        raise _InvalidPlatformContextError(str(exc)) from exc
+    interaction["wrapper_session"] = {
+        "schema_version": "omh_wrapper_session_ref/v1",
+        "recorded": False,
+        "reason": "record_session=false",
+        "claim_boundary": _CLAIM_BOUNDARY,
+    }
+    return interaction
+
+
+def _backend_error_interaction(args: dict[str, Any], message: str, *, error_type: str) -> dict[str, Any]:
+    source = _source(args)
+    metadata = _source_metadata(args)
+    message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    return {
+        "schema_version": "omh_interact_result/v1",
+        "status": "error",
+        "error": "package_backend_error",
+        "error_type": _safe_error_type(error_type),
+        "source": source,
+        "source_metadata": metadata,
+        "message_sha256": message_hash,
+        "message_length": len(message),
+        "thread_key": _thread_key(source, metadata, message_hash),
+        "wrapper_session": {
+            "schema_version": "omh_wrapper_session_ref/v1",
+            "recorded": False,
+            "reason": "package_backend_error",
+            "claim_boundary": _CLAIM_BOUNDARY,
+        },
+        "redaction_policy": "metadata_only",
+        "claim_boundary": _CLAIM_BOUNDARY,
+    }
+
+
+def _fallback_interaction(args: dict[str, Any], message: str, *, error: str) -> dict[str, Any]:
+    source = _source(args)
+    metadata = _source_metadata(args)
+    route_hint = awareness_route_hint(message, max_hints=_bounded_limit(args.get("limit"), default=3))
+    workflow = str(route_hint.get("primary_workflow") or "oh-my-hermes")
+    message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    payload: dict[str, Any] = {
+        "schema_version": "chat_interaction/v1",
+        "source": source,
+        "source_metadata": metadata,
+        "message_sha256": message_hash,
+        "message_length": len(message),
+        "thread_key": _thread_key(source, metadata, message_hash),
+        "mode": "route",
+        "next_action": str(route_hint.get("primary_next_action") or "show_workflow_guidance"),
+        "route_hint": route_hint,
+        "chat_response": {
+            "schema_version": "chat_response/v1",
+            "kind": "route_hint",
+            "headline": f"[omh] route - {workflow}",
+            "body": "OMH can suggest the nearest workflow here, but package-backed chat/session recording is unavailable.",
+            "state": {
+                "selected_workflow": workflow,
+                "recording_status": "not_recorded",
+                "recording_error": "package_backend_unavailable",
+            },
+            "actions": [
+                {
+                    "id": "show_status",
+                    "label": "Show status",
+                    "style": "secondary",
+                    "enabled": True,
+                }
+            ],
+            "claim_boundary": _CLAIM_BOUNDARY,
+        },
+        "wrapper_session": {
+            "schema_version": "omh_wrapper_session_ref/v1",
+            "recorded": False,
+            "reason": "package_backend_unavailable",
+            "claim_boundary": _CLAIM_BOUNDARY,
+        },
+        "redaction_policy": "metadata_only",
+        "degraded": True,
+        "source_backend": "standalone_plugin_bundle_fallback",
+        "claim_boundary": _CLAIM_BOUNDARY,
+    }
+    return payload
+
+
+#: Chat sources the plugin serves, in the canonical CHAT_SOURCES order.
+_SUPPORTED_SOURCES = ("generic", "discord", "slack", "telegram", "hermes")
+
+
+def _source(args: dict[str, Any]) -> str:
+    """The requested chat source, or raise for one OMH does not serve.
+
+    An unknown source must fail closed: silently rewriting it to ``hermes``
+    would report a host surface the caller never had and key sessions under a
+    source that never produced the event.
+    """
+    value = str(args.get("source") or "hermes")
+    if value not in _SUPPORTED_SOURCES:
+        raise _UnsupportedSourceError(f"unsupported source: {value!r}")
+    return value
+
+
+def _platform_context(args: dict[str, Any]) -> dict[str, Any] | None:
+    """The optional platform context, type-checked at the plugin boundary.
+
+    Shape and safety validation lives in the envelope builder, which raises
+    ``PlatformContextError``; this boundary only guarantees a mapping (or
+    None) crosses into the package, and translates builder failures into the
+    plugin's own invalid-input error so the handler can classify them.
+    """
+    raw = args.get("platform_context")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise _InvalidPlatformContextError("platform_context must be an object")
+    return dict(raw)
+
+
+def _mode(args: dict[str, Any]) -> str:
+    value = str(args.get("mode") or "auto")
+    return value if value in {"auto", "route", "plan", "delegate"} else "auto"
+
+
+def _min_confidence(args: dict[str, Any]) -> str:
+    value = str(args.get("min_confidence") or "high")
+    return value if value in {"low", "medium", "high"} else "high"
+
+
+def _bounded_limit(value: object, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(parsed, 10))
+
+
+def _source_metadata(args: dict[str, Any]) -> dict[str, str]:
+    allowed = {
+        "source_event_id",
+        "channel_ref",
+        "user_ref",
+        "timestamp",
+        "agent_ref",
+        "target_ref",
+        "runtime_ref",
+        "hermes_home",
+        "agent_count",
+        "target_count",
+        "render_profile",
+    }
+    raw = args.get("source_metadata")
+    metadata: dict[str, str] = {}
+    if isinstance(raw, dict):
+        metadata.update(
+            {
+                str(key): cleaned
+                for key, value in raw.items()
+                if key in allowed and (cleaned := _safe_metadata_text(value))
+            }
+        )
+    for key in allowed:
+        if key in args and (cleaned := _safe_metadata_text(args.get(key))):
+            metadata.setdefault(key, cleaned)
+    return metadata
+
+
+def _optional_path_arg(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _thread_key(source: str, metadata: dict[str, str], message_hash: str) -> str:
+    channel = metadata.get("channel_ref") or "channel"
+    event = metadata.get("source_event_id") or message_hash[:12]
+    return f"{source}:{channel}:{event}"
+
+
+def _safe_metadata_text(value: object) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    lowered = text.lower()
+    if any(pattern in lowered for pattern in _SENSITIVE_PATTERNS) or _SENSITIVE_VALUE_PATTERN.search(text):
+        return ""
+    return text[:_METADATA_TEXT_LIMIT]

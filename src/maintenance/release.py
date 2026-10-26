@@ -1,0 +1,5043 @@
+from __future__ import annotations
+
+from ..skills.catalog import omh_skill_display_name
+
+from dataclasses import dataclass
+import importlib.resources as resources
+import json
+from pathlib import Path
+import re
+import shlex
+import shutil
+from typing import Callable, Mapping, Sequence
+
+from ..version import __version__
+from ..capabilities.playbooks import playbook_capabilities
+from ..capabilities.skills import skill_capabilities
+from ..catalogs.roles import role_definitions, role_file_markdown
+from ..command_path import (
+    installed_command_path_check_plan,
+    inspect_installed_command_path,
+    path_check_kind,
+)
+from ..install.plugin_compat import compat_matrix_drift
+from ..local_store import atomic_write_json, read_json_object_result, utc_now
+from .drift import BudgetMetric, budget_metrics, drift_report
+from .changelog import ChangelogError, MAX_CHANGELOG_BYTES, bound_release_body, extract_notes
+from .release_notes import notes_metadata, read_bounded, read_notes
+from .documentation_claims import DocumentationClaimReport, documentation_claims_report
+from .release_identity import (
+    RELEASE_EVIDENCE_BUNDLE_SCHEMA_V2,
+    build_input_manifest,
+    probe_source_identity,
+)
+from ..plugin_bundle.omh.awareness import (
+    awareness_primer_payload,
+    awareness_workflow_context_markdown,
+)
+# Re-exported under their old names; each limit and its history live in the bundle.
+from ..plugin_bundle.omh import turn_budget
+from ..plugin_bundle.omh.turn_budget import (
+    AWARENESS_PRIMER_CONTEXT_CHAR_LIMIT as AWARENESS_PRIMER_CONTEXT_CHAR_LIMIT,
+    AWARENESS_PRIMER_MARKDOWN_CHAR_LIMIT as AWARENESS_PRIMER_MARKDOWN_CHAR_LIMIT,
+    AWARENESS_WORKFLOW_CONTEXT_CHAR_LIMIT as AWARENESS_WORKFLOW_CONTEXT_CHAR_LIMIT,
+    PRE_LLM_CALL_CONTEXT_CHAR_LIMIT as PRE_LLM_CALL_CONTEXT_CHAR_LIMIT,
+    PRE_LLM_CALL_CONTEXT_FALLBACK_CHAR_LIMIT as PRE_LLM_CALL_CONTEXT_FALLBACK_CHAR_LIMIT,
+    ROLE_CONTEXT_CHAR_LIMIT as ROLE_CONTEXT_CHAR_LIMIT,
+)
+from ..plugin_bundle.omh.tools.capability_tool import (
+    standalone_playbook_capability_items,
+    standalone_skill_capability_ids,
+    standalone_skill_capability_items,
+)
+from ..parity import build_parity_matrix
+from ..quality.chat_card_coverage import build_chat_card_coverage_demo
+from ..quality.common_request_coverage import build_common_request_coverage_demo, common_request_coverage_errors
+from ..quality.context_brief_coverage import build_context_brief_coverage_demo
+from ..quality.grounded_score import build_grounded_score_demo
+from ..quality.hermes_ux_quality import build_hermes_ux_quality_demo, hermes_ux_quality_errors
+from ..quality.localized_chat_copy import build_localized_chat_copy_demo, localized_chat_copy_errors
+from ..quality.native_skill_competition import (
+    build_native_skill_competition_report,
+    native_skill_competition_errors,
+)
+from ..quality.route_hint_alignment import build_route_hint_alignment_demo
+from ..quality.router_fast_path import build_router_fast_path_demo, router_fast_path_errors
+from ..quality.routing_precision import build_routing_precision_demo, routing_precision_errors
+from ..release_smoke_core import Runner, bounded_text, expand_home, subprocess_runner
+from ..skill_pack import builtin_skill_templates
+from ..skills.catalog import builtin_definitions
+from ..system.paths import OmhPaths
+from ..use_cases import (
+    USE_CASES,
+    build_all_use_case_artifacts,
+    demo_all_use_cases,
+    replay_use_case_fixtures,
+    use_case_readiness,
+    validate_use_case_artifact,
+)
+
+REPOSITORY_ARCHIVE_ROOT = "https://github.com/rlaope/oh-my-hermes/archive/refs"
+RELEASE_ASSET_ROOT = "https://github.com/rlaope/oh-my-hermes/releases/download"
+RELEASE_CHANNELS = ("stable", "preview", "local")
+# `.github/workflows/release.yml` refuses any tag that is not `vX.Y.Z` and
+# names the wheel it uploads after that version, so a stable version of this
+# shape has a predictable release-asset URL. Anything else does not, and falls
+# back to the repository archive rather than pointing pip at a guess.
+RELEASE_WHEEL_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+# Measured 2026-08-15 with `curl -sL -o /dev/null -w '%{size_download}'`: the
+# v1.0.6 tag archive is 45,921,555 bytes and the main branch archive is
+# 46,012,605 bytes, against 2,714,885 bytes for the published v1.0.6 wheel.
+# The archive carries assets/, tests/, and site/; none of the three is needed
+# to run omh, and downloading them is what made `omh update` take minutes.
+RELEASE_ARCHIVE_APPROX_SIZE = "~44 MB"
+RELEASE_WHEEL_APPROX_SIZE = "~2.7 MB"
+HERMES_SMOKE_SCHEMA = "hermes_release_smoke/v1"
+RELEASE_CHECKLIST_SCHEMA = "release_readiness_checklist/v1"
+INSTALLED_COMMAND_SMOKE_SCHEMA = "installed_omh_command_smoke/v1"
+FIRST_USE_STATUS_SMOKE_SCHEMA = "first_use_status_smoke/v1"
+SKILL_CONTENT_SMOKE_SCHEMA = "skill_content_smoke/v1"
+PRODUCT_READINESS_SCHEMA = "omh_product_readiness/v1"
+RELEASE_EVIDENCE_BUNDLE_SCHEMA = RELEASE_EVIDENCE_BUNDLE_SCHEMA_V2
+RELEASE_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)*(?:[-_+.]?[A-Za-z0-9][A-Za-z0-9._+-]*)?$")
+DEFAULT_HERMES_TAP = "rlaope/oh-my-hermes"
+DEFAULT_HERMES_SKILL = "oh-my-hermes"
+DEFAULT_FIRST_USE_MESSAGE = "I want to safely add a feature to this repo"
+INSTALL_PATHS = ("tap", "setup")
+REPRESENTATIVE_CONTEXT_RAIL_SKILLS = (
+    "img-summary",
+    "frontend",
+    "visual-qa",
+    "loop",
+    "ultrawork",
+    "research",
+    "materials-package",
+)
+ROUTER_CONTENT_MARKERS = ("OMH Awareness Primer", "img-summary", "Normal users should talk to Hermes Agent")
+WORKFLOW_CONTEXT_MARKERS = (
+    "Workflow Lane",
+    "Shared product, routing, compatibility, and evidence rules",
+    "Prepared OMH routing",
+)
+ROLE_CONTEXT_MARKERS = ("OMH Role Context", "OMH workflow-layer responsibility context", "prepared guidance only")
+CONCEPTUAL_AWARENESS_SURFACES = ("request-to-handoff", "executor selection", "coding runtime handoff")
+# AWARENESS_PRIMER_CONTEXT_CHAR_LIMIT, AWARENESS_PRIMER_MARKDOWN_CHAR_LIMIT,
+# AWARENESS_WORKFLOW_CONTEXT_CHAR_LIMIT, ROLE_CONTEXT_CHAR_LIMIT: moved with their
+# history to src/plugin_bundle/omh/turn_budget.py; imported at the top of this file.
+# Per-request budgets: text Hermes can send on every turn of a session with OMH
+# installed (the tool schemas only with tool_search off; see below), unlike the
+# skill-body total further down, which is paid per `skill_view` load. Each
+# limit is the value its producer measured when the budget landed
+# (2026-09-23); raise one only with the reason written beside it -- here for
+# the skill index and tool schemas, in src/plugin_bundle/omh/turn_budget.py
+# for the two pre_llm_call limits.
+#
+# The full-profile `<available_skills>` lines, rendered with Hermes's 60-char
+# description rule (`src/skills/skill_index.py`): 124 skill lines and 9
+# category headers, joined by newlines, when the budget landed (130 lines
+# with the Jev skills).
+# 10894 -> 11411: the six default-installed `jev-*` skills add six index
+# lines. They declare `requires_tools: [omh_jev_ask]`, so a Hermes caller that
+# passes a tool set drops them where the tool is not registered (code-read);
+# this producer renders the full profile and counts them. Re-derived from the
+# producer.
+# 11411 -> 11497: one index line for the new `app-debugging` skill (#1709); the
+# name and the visible description window. Re-derived from the producer.
+# 11497 -> 11589: one index line for the new `commit-pr-authoring` skill
+# (#1711); the name and the visible description window. Re-derived from the
+# producer.
+# 11589 -> 11674: one index line for the new `git-workflow` skill (#1695); the
+# name and the visible description window. Re-derived from the producer.
+# 11674 -> 11760: one index line for the new `relational-db` skill (#1692); the
+# name and the visible description window. Re-derived from the producer.
+# 11760 -> 11856: one index line for the new `security-event-response` skill (#1694); the
+# name and the visible description window. Re-derived from the producer.
+# 11856 -> 11940: one index line for the new `release-cut` skill (#1693); the
+# name and the visible description window. Re-derived from the producer.
+# 11940 -> 12031: one index line for the new `agent-instructions` skill (#1713); the
+# name and the visible description window. Re-derived from the producer.
+# 12031 -> 12114: one index line for the new `iac-change` skill (#1566); the
+# name and the visible description window. Re-derived from the producer.
+# 12114 -> 12201: one index line for the new `data-pipelines` skill (#1565); the
+# name and the visible description window. Re-derived from the producer.
+# 12201 -> 12290: one index line for the new `model-finetuning` skill (#1567); the
+# name and the visible description window. Re-derived from the producer.
+# 12290 -> 12377: one index line for the new `mobile-release` skill (#1568); the
+# name and the visible description window. Re-derived from the producer.
+# 12377 -> 12464: one index line for the new `internal-audit` skill (#1569); the
+# name and the visible description window. Re-derived from the producer.
+# 12464 -> 12554: one index line for the new `data-share-review` skill; the
+# name and the visible description window. Re-derived from the producer.
+# 12554 -> 12637: one index line for the new `spend-gate` skill; the name and
+# the visible description window. Re-derived from the producer.
+# 12637 -> 12713: one index line for the new `dag-ulw` skill; the name and the
+# visible description window. Re-derived from the producer.
+# 12713 -> 12801: one index line for the new `market-research` skill; the
+# name and the visible description window. Re-derived from the producer.
+# 12801 -> 12883: one index line for the new `show-reel` skill; its name
+# and visible description window. Re-derived from the producer.
+# 12883 -> 13157: the three optional science skill index lines, producer measured.
+# 13157 -> 13243: ai-job-search adds one visible 85-character index entry
+# plus its newline (+86), measured against clean 85673e100. This exposes the
+# complete career workflow; no eager toolkit text or standing padding is added.
+# test_ai_job_search_context_budget pins the legacy index and marginal cost.
+SKILL_INDEX_CHAR_LIMIT = 13243
+# The longest single skill line in that index. Every description is already cut
+# to 60 characters, so what moves this is a longer skill name.
+SKILL_INDEX_LINE_CHAR_LIMIT = 100
+# The plugin bundle's registered tool schemas, 19 tools when the budget landed
+# (20 with `omh_jev_ask`), serialized as JSON with
+# sorted keys (`src/maintenance/per_turn_context.py`); `omh_todo` and `omh_loop`
+# are the largest. This is the eager ceiling: all of it rides every request only
+# when Hermes's `tools.tool_search.enabled` is `off`, or on a host without the
+# bridge. Under the Hermes default (`auto`, an alias of `on`) every non-core
+# plugin tool is deferrable (`tools/tool_search.py::is_deferrable_tool_name`),
+# so a request carries a bounded listing entry per tool plus the schemas of the
+# tools the model describes or calls.
+# 57968 -> 55468: the `omh_todo` (9827 -> 7752) and `omh_loop` (7812 -> 7230)
+# descriptions drop prose that restated another field of the same schema or
+# gave the reason behind a rule the schema still states;
+# `omh_capabilities` (1433 -> 1590) now says its default is `summary`
+# (`export` when only a section is given) and which actions read `section`.
+# Producer-measured after the change.
+# 55468 -> 59258: the `omh_jev_ask` schema (its description carries the
+# consent rule and the egress disclosure the model reads before calling) and
+# `omh_route_answer`'s `ask_id` field and `omh_jev_ask` provenance wording.
+# Hermes exposes `omh_jev_ask` only where a route resolves (`check_fn`), so a
+# keyless install does not pay its share. Re-derived from the producer.
+# 59258 -> 59302: `omh_status` says it also reports what the last `omh update`
+# changed, so "what's new?" reaches the recorded change note through a tool the
+# model already has. The alternative -- a first-turn notice -- would grow the
+# `pre_llm_call` injection that Hermes replays every later turn; 44 schema
+# characters (deferrable under the default tool search) is the cheaper seam.
+# Re-derived from the producer.
+# 59302 -> 59451: `omh_run_summary` now also answers "what did this work
+# cost?" from its `cost_receipt`. The first sentence names the receipt because
+# it is all the tool_search listing shows (60 chars), and one closing sentence
+# tells the model to relay the receipt with observed cost, unpriced usage and
+# missing records kept apart. Reusing this tool instead of adding one keeps the
+# growth to those two sentences. Re-derived from the producer.
+# 59451 -> 60871: the `omh_resume` schema (1420), the read a session calls
+# when the person asks to continue work from another surface. It replaces
+# nothing per turn: the alternative, carrying earlier work in `pre_llm_call`
+# or the primer, would be paid on every turn whether or not anyone asked.
+# Re-derived from the producer.
+# 60871 -> 61183: one sentence (78 chars) in each of the four tools whose
+# results now carry a `say` field -- `omh_delegate_route`, `omh_todo`,
+# `omh_loop`, `omh_agent_board` -- telling the model to relay it once, in the
+# user's language and its own words. The sentence rides the schema of the tool
+# that returns the field, so it is read exactly where the field appears; the
+# alternatives were a primer line (19 chars of headroom left) or a
+# `pre_llm_call` line, both paid on every turn and both the channel the reply
+# rules keep out of. Re-derived from the producer.
+# 61183 -> 62397: the `omh_team` schema (1214), a new tool rather than three
+# more actions on `omh_agent_board`, because `omh_team` runs check commands and
+# `omh_agent_board`'s description promises it runs nothing; widening that tool
+# would have made its own description false and its outputs no longer
+# byte-identical. The description carries the whole loop (start from the
+# accepted plan, dispatch unchanged, reconcile after helpers return, stop at
+# done or blocked, relay `say`, read events newer than `since_seq`) so no
+# per-turn primer line is added for it. It names the plan binding form,
+# check: `<command>`, because a command that is merely mentioned in the plan
+# binds nothing. Re-derived from the producer.
+# 62397 -> 63261: `omh_memory` gains `capture` (864): the model's only write
+# path into OMH memory, five parameters and a description that says when to
+# call it unprompted (a lasting preference, decision, setup fact or lesson;
+# one fact per call; never secrets, logs, transcripts or task progress). The
+# guidance rides this schema because the always-on primer has 6 characters of
+# headroom and `pre_llm_call` is zero-slack; a tool description is read only
+# where the tool appears, and is deferrable under the default tool search.
+# Owner decision 2026-10-06: approval is auto-safe, no operator step in the
+# loop. Re-derived from the producer.
+# 63261 -> 63616: `omh_memory` gains `demote` (355): the `entry_sha256`
+# parameter and one sentence saying the Hermes entry is removed with Hermes'
+# own memory tool only when the status is demoted or already_covered, plus one
+# saying to tell the user in one short line what was kept, with `display_line`
+# as suggested wording (no language instruction: the bot's persona owns its
+# reply language). Hermes memory sat nearly full on the owner machine while
+# demotion was operator-only and never ran; the consolidation brief now asks
+# the model to call this action, so the rule has to ride the schema the model
+# reads at the call. The primer and `pre_llm_call` are zero-slack. Owner
+# decision 2026-10-12. Re-derived from the producer.
+# 63616 -> 64031: `omh_memory` gains `recall`, `confirm`, `correct` and
+# `retire` (415): four enum values, three bare parameters (`query`,
+# `record_id`, `reason` with its closed three-value enum) and `limit` with a
+# four-word gloss, plus one sentence naming when to call each. The model kept
+# memory with no human step only in one direction (capture); correcting,
+# confirming or retiring a record was operator CLI only, in a package the
+# Hermes process cannot import. Trimmed before raising: the new parameters
+# carry no descriptions the sentence already gives, and `summary`/`tags` keep
+# their capture-only glosses. Owner rule 2026-10-06. Re-derived from the
+# producer.
+# 64031 -> 64158: `omh_memory` gains the optional `subject` parameter (127
+# with its gloss), the slug capture and correct store so recall serves only
+# the newest record per scope and subject. The gloss says only what it names;
+# what recall does with it rides the capture result's computed `next_action`,
+# read where it applies. A first revision dropped the capture status list
+# from the description to make room; review of #2091 asked for it back,
+# because it is what the model reads at the call to know how to report a
+# capture, so it stays and the subject gloss was shortened instead. The
+# capture hints (`subject_held_by`, `similar_record_id`) add no schema text.
+# Re-derived from the producer.
+# 64158 -> 64654: `omh_todo` says which ONE tool holds a plan's steps (496): a
+# planning run, an accepted plan or a code-story template keeps them in
+# omh_todo, and leaving one for unrelated work means clearing it first, since
+# until then todo_list writes are not mirrored over it (a deferred_reason only
+# pauses it); otherwise Hermes' native todo_list holds them wherever it is in the
+# tool list or tool_search finds it, OMH mirrors each write into this plan, and
+# omh_todo is called only for checkpoint/record/recall, blocked_reason,
+# deferred_reason or re-advancing a done item after its check. On the owner's
+# machine 8 of 17 todo-using sessions declared the same plan in both tools, in
+# paraphrased items. The sentence rides the schema the model reads when it
+# reaches for either list; the per-turn alternative would be paid on every
+# turn. Re-derived from the producer.
+# 64654 -> 64651: `omh_hud` names the OMH TUI, not Hermes', as the surface its
+# payload is for (-3): bare `hermes` no longer draws the HUD. Re-derived from
+# the producer.
+# 64651 -> 66952: the `omh_dag` schema (2301), the tool that keeps a dag-ulw run
+# (define, ready, settle, repair, status, cancel, export). A new tool rather
+# than more actions on `omh_team`, whose description promises that a part is
+# done only when OMH runs its check; a dag node is settled by the parent from
+# its handoff file. The description carries the run loop (route then
+# delegate_task per returned call, settle after each completion, repair at
+# most twice) so no per-turn primer line is added for it; deferrable under
+# the default tool search. Re-derived from the producer.
+# 66952 -> 67130: `omh_dag` gains `extend` (+178): the action in the enum, one
+# sentence saying when (every node passed, the goal check finds work missing)
+# and its two-round limit, and what `node` names for it. Re-derived from the
+# the producer.
+# 67130 -> 68402: `omh_search` adds a compact 1272-character registered tool
+# schema rather than embedding its full nested contracts. The optional-tool
+# research hint is 695 characters and does not change registered system
+# sections. Independently remeasured across all 24 builtin schemas.
+# 68402 -> 68757: `omh_agent_board` states its prepare fields (+355). The
+# schema required only `action` and `request_id`, so a prepare built from it
+# omitted the five fields the engine requires and was refused with an opaque
+# reason (#2277). One description sentence plus a `profile` description carry
+# the rule to the model (+149). A top-level `oneOf` carries the two closed
+# shapes for a host that keeps it (+206); current Hermes removes top-level
+# combinators from every tool schema before any provider sees it
+# (`tools/schema_sanitizer.py`), so those bytes are counted here but not sent.
+# Re-derived from the producer.
+# 68757 -> 69186: `omh_dag` adds parked waits (+429): the bounded-wait
+# description (+152), outcome enum (+10), and handle / wake_at properties
+# (+267). A live wait keeps its resume handle without spending a repair cycle;
+# the schema must name that outcome and its required metadata. Only omh_dag
+# moves (2479 -> 2908); measured by per_turn_context's register() recorder
+# against pinned main eeebba5bb. Composed preflight retains its approved
+# 947-character marker/cap description and adds only the same parked note;
+# the recorder still measures exactly 69186. No headroom: test_per_turn_budgets
+# holds the +429 parked cap against the intact approved preflight schema.
+PLUGIN_TOOL_SCHEMA_CHAR_LIMIT = 69186
+# PRE_LLM_CALL_CONTEXT_CHAR_LIMIT, PRE_LLM_CALL_CONTEXT_FALLBACK_CHAR_LIMIT: moved with
+# their history to src/plugin_bundle/omh/turn_budget.py; imported at the top of this file.
+# 340000 -> 349637: three capability-skill sections were added by the domain
+# skill pack (`backend`, `rust`, `native-debugging`), on top of the
+# `llm-app-dev` section that landed on main under the old ceiling. Each section
+# is well under the per-item ceiling below; the growth is one section per new
+# workflow, not per-section padding. Re-measured on the merged tree after
+# #1181, #1183, and #1182 rather than carried over from this branch's base.
+# 349637 -> 349663: the trigger language packs put the first Japanese and
+# Chinese trigger phrases into the catalog, and a handful reach the picker
+# description of skills whose English trigger list did not already fill the
+# eight-phrase budget (+26 chars). Recognising a language is what the growth
+# buys; it is one line-tail per affected skill, not per-section padding;
+# warranted growth.
+# 349663 -> 353786: `model-optimization` is a new installable skill (the
+# model-onboarding process contract distilled from the GLM 5.3 run); one new
+# capability section for one new workflow, not per-section padding; warranted
+# growth.
+# 353786 -> CAPLIMIT: the memory-sync boundary/safety sentences now name who
+# applies a user-approved diff (Hermes's own native memory tool). The
+# capability section truncates safety rules and caps triggers, so the delta
+# here is truncation-boundary jitter from those rewordings, not the full
+# sentence growth; measured live, warranted growth.
+# 353787 -> 356826: `web-research` is a new installable skill -- the web lookup
+# lane split out of the `research` engine so a cited one-round lookup stops
+# paying the engine's declared depth budget and reference-implementation
+# study. One section for one new workflow, not per-section padding;
+# the engine's own section shrank by the triggers that left it.
+# 356826 -> 357345: `research` gained the audience branch -- three required
+# inputs (audience, format, language), the briefing artifact in its outputs,
+# and the three quality-bar rules that make Hermes ask before retrieval
+# rather than after. The document standard itself is a reference file, so it
+# costs progressive disclosure rather than the SKILL.md body; what is
+# counted here is the asking, not the standard.
+# 357345 -> 358092: ai-slop-cleaner's capability section grew its taxonomy,
+# ordered-pass, detection, and closing-report rules; instruction lines on one
+# existing skill, not padding; warranted growth.
+# 358092 -> 358305: the code-review capability section grew its two-axis
+# (correctness/spec) and checked-and-clean closing rules; instruction lines on
+# one existing skill, not padding; warranted growth.
+# 358305 -> 362620: `codebase-uml` is a new installable skill (the
+# interface-level PlantUML diagram workflow over `omh codegraph uml`); one new
+# capability section for one new workflow, not per-section padding; warranted
+# growth.
+# 362620 -> 366626: `frontend-refactor` is a new installable skill (the
+# behavior-preserving UI refactor workflow); one new capability section for
+# one new workflow, not per-section padding; warranted growth.
+# 366626 -> 370598: `refactor-plan` is a new installable skill (the phased
+# refactor planning workflow); one new capability section for one new
+# workflow, not per-section padding; warranted growth.
+# 370598 -> 375067: `inference-serving` is a new installable skill (engine
+# decision, gated deploy runbooks, benchmark protocol); one new capability
+# section for one new workflow, not per-section padding; warranted growth.
+# 375067 -> 375623: agent-ops-review, ops-observability-card, and
+# llm-app-dev grew instrumentation-ladder, span-vocabulary, and
+# budget-discipline rules; instruction lines on three existing skills, not
+# padding; warranted growth.
+# 375623 -> 379709: `tech-debt-audit` is a new installable skill (the
+# severity-by-effort debt ledger with rerun reconciliation); one new
+# capability section for one new workflow, not per-section padding;
+# warranted growth.
+# 379709 -> 379904: `strategy-brief` grew the decision-record discipline
+# (three-condition trigger, docs/adr/ convention pointer, never-edit-accepted
+# lifecycle rule); instruction lines on one existing skill, not padding;
+# warranted growth.
+# 379904 -> 383766: `award-bar-score` is a new installable skill (scoring a
+# web surface against published award axes); one new capability section for
+# one new workflow, not per-section padding; warranted growth.
+# 383766 -> 384097: the axis-spread and reduced-motion quality-bar lines
+# were corrected against measured entry data; bounds and a counter-claim
+# replacing a wrong rule, not padding; warranted growth.
+# 384097 -> 387367: omh-docs adds one measured full capability section for
+# current-source product documentation; one row, not per-section padding.
+# 387367 -> 387378: use the unambiguous `product-docs` canonical identifier
+# while keeping `omh-docs` as the public label.
+# 387378 -> 390713: `github-issue-intake` is a new installable skill (the
+# public-chat issue intake workflow with a bounded interview, duplicate
+# search, and confirmation-gated connector handoff); one new capability
+# section for one new workflow, not per-section padding; warranted growth.
+# 390713 -> 394961: apple-design adds one platform-aware design/review/improve capability row.
+# 394961 -> 395663: the shared execution-wait discipline reaches the capability
+# sections of the skills that carry it (the coding-handling harness bar, the
+# two executing engines, and the command-operator overlay). The
+# interjection-resume rule the six executing engines share got shorter in the
+# same pass -- naming the armed wait costs fewer chars than the example clause
+# it replaced -- so the net is one shared constant's worth of instruction lines,
+# not per-section padding; warranted growth.
+# 410980 -> 411280: the two research lanes (`web-research`, `research`) bind
+# as-of claims to `temporal_source_receipt/v1` (#1403): one shared safety
+# rule, one quality-bar line separating capture, publication, and retrieval
+# time, one required input, one expected output, and one recovery note on
+# each lane. One evidence contract reaching the two lanes that answer
+# point-in-time questions, not per-section padding; warranted growth.
+# 411280 -> 411288: `external-connector-readiness` names
+# `memory_provider_posture/v1` in its expected outputs (#1428). Eight chars for
+# the one artifact that answers whether enabling an optional memory provider is
+# reversible; warranted growth.
+# 411288 -> 411497: `external-connector-readiness` binds realtime voice
+# adoption to `realtime_voice_trial_receipt/v1` (#1426), and `voice-input` and
+# `media-input` each state that their own record is never that receipt. One
+# evidence contract reaching the one lane that decides voice adoption, plus
+# the two non-promotion lines on the lanes a reader would otherwise mistake
+# for it, not per-section padding; warranted growth.
+# 411497 -> 411497_PENDING: `img-summary` names `visual_generation_receipt/v1` in
+# its expected outputs (#1425). The capability section renders skill names
+# rather than the rule text; the requested-versus-observed contract itself
+# lives in the profile body and in `docs/VISUAL-GENERATION-RECEIPTS.md`;
+# warranted growth.
+# 411498 -> 411570: `agent-board` names its native Kanban outputs and the two
+# native boundaries in the capability section (#1417). The section renders the
+# skill's declared outputs, not the rule text; the operation table and the
+# native/fixture boundary live in `docs/AGENT-BOARD.md`, outside this budget;
+# warranted growth.
+# 411570 -> 412999: the same two shared engine rules and the extended
+# interjection rule render into the capability sections of the executing
+# engines (the section carries each engine's quality bar); warranted growth.
+# 412999 -> 417015: `long-document-reading` is a new installable skill (the
+# page-anchored chunk ledger over a document too large for one read); one new
+# capability section for one new workflow, not per-section padding; warranted
+# growth.
+# 417027 -> 421221: `application-threat-model` is a new installable skill
+# (#1564). It exists because `security-safety-review` maps the AGENT's prompt,
+# tool, and credential surface into `threat_surface_map/v1`, so an application
+# threat-model request came back as an agent tool inventory under a
+# near-identical name. One new capability section for one new workflow, not
+# per-section padding; warranted growth.
+# 421221 -> 425447: `live-incident-response` is a new installable skill
+# (#1563). It exists because an incident that is still open had no owner:
+# `support-operations` routed an active incident to `reliability-review`, and
+# that lane reviews incident notes after the fact. One new capability section
+# for one new workflow plus the reciprocal boundary lines in the three siblings
+# it hands back to; not per-section padding, warranted growth.
+# 425447 -> 425489: `context-budget-review` names `must_keep_item_class_delta/v1`
+# among its outputs (#1572), so the capability section renders one more declared
+# output line. The item-class vocabulary and the unavailable-versus-empty rule
+# are artifact expectations and a quality bar, not section text; warranted
+# growth.
+# 425489 -> 425832: `automation-blueprint` declares `recurring_surface_comparison/v1`
+# and the rule that a recurring recommendation carries its stop condition
+# (#1570). The four-way table, the retry axes, and the delivery/silence rules
+# are `references/recurring-surface-choice.md`, outside this budget; warranted
+# growth.
+# 425832 -> 426032: `external-connector-readiness` declares
+# `memory_provider_trial_comparison/v1` and the one-corpus rule (#1573). The
+# trial procedure, the three dimensions, and the exercised-rollback steps are
+# `references/memory-provider-trial.md`, outside this budget; warranted growth.
+# 426032 -> 426395: `verification-gate` declares
+# `generated_artifact_provenance/v1`, its `map_not_declared` state, and the
+# five generated-path triggers (#1575). The declaration sources, the row
+# fields, and the shapes that look like violations are
+# `references/generated-artifact-provenance.md`, outside this budget;
+# warranted growth.
+# 426395 -> 426477: `refactor-plan` names the upgrade intake among its
+# reconnaissance outputs and gains six upgrade triggers (#1576). The advisory,
+# licence, migration-guide, and lockfile procedures are
+# `references/dependency-upgrade.md`, outside this budget; warranted growth.
+# 426477 -> 426787: `security-safety-review` declares
+# `credential_rotation_sequence/v1` and its eight rotation triggers (#1578).
+# The five-step order, the overlap window, and the per-credential-type steps
+# are `references/credential-rotation.md`, outside this budget; warranted
+# growth.
+# 426787 -> 427396: `legal-compliance-review` declares
+# `legal_negotiation_preparation/v1` and six negotiation triggers, which also
+# render into the router's workflow registry (#1579). The row shape and the
+# concession-order rules are `references/negotiation-preparation.md`, outside
+# this budget; warranted growth.
+# 427396 -> 427563: `strategy-brief` gains one `do_not_use_when` line against
+# `people-ops` and six resourcing triggers, which also render into the router's
+# workflow registry (#1580). The worked figures are
+# `references/capacity-planning.md`, outside this budget; warranted growth.
+# 427563 -> 430048: `todo-checklist` (#1642). `omh_todo` is registered on every
+# session and no skill named it, so a user looking for `/omh-todo` found
+# nothing and only the two delivery engines mentioned the tool at all. The
+# SKILL.md body carries only what is wrong to discover late -- items are
+# declarations and never execution evidence, exactly one item active, and
+# `action=set` replaces the whole list so a partial write silently drops the
+# items left out. The shaping rules, the `blocked_reason` versus
+# `deferred_reason` distinction, and the when-not-to-declare guidance are in
+# `skills/omh-todo-checklist/references/checklist-discipline.md`, which loads on
+# demand and is counted outside this budget. Re-derived from the producer.
+# 430048 -> 430123: `ultrawork` gains one clause on its dependency-topology
+# quality bar pointing a lane that must outlive the session at
+# `references/kanban-lane.md`. The board create recipe, the readback
+# discipline, and the role table are in that reference, counted outside this
+# budget; the capability row carries only the pointer. Re-derived from the
+# producer.
+# 430123 -> 430308: the three sibling engines learn the board lane on the same
+# substrate, one quality-bar clause each (2026-09-17). `loop` points an
+# iteration that must outlive the session at `references/board-iteration.md`,
+# `ultraqa` points a probe that must run in isolation at
+# `references/board-fanin.md`, and `ralplan` lists every accepted lane in
+# node-prompt shape with `depends_on` so `ultrawork` prepares rows without
+# re-planning. The iteration chain, the stop rule, the resume readback, the
+# probe rows, the fan-in, and the review-lane re-verification are in the two
+# references, counted outside this budget; the capability rows carry only the
+# pointers and the lane shape. Re-derived from the producer.
+# 430308 -> 422526: the three capability rows of the skills retired by #1691
+# leave the full capability section with them. Re-derived from the producer.
+# 422526 -> 422450: `todo-checklist`'s quality bar and recovery note now name
+# `action=advance`, the single-item write #1730 added, because the sentence
+# they carried -- "there is no partial update" -- became false with it. The
+# claim they replace was the reason a session re-sent a ten-item list to tick
+# one item, so leaving it would cost far more per run than these 86 characters
+# cost per load. The guard, the refusals, and the byte-equality with
+# `action=set` are in `references/checklist-discipline.md`, counted outside
+# this budget.
+#
+# The limit FALLS across this change even though the change adds to it: the
+# section measured 422364 on this branch's base, because #1690 removed a
+# rendered harness line from fourteen skills, and the limit was still sitting
+# at the pre-#1690 422526. So the number here is the producer's reading of the
+# two changes together, 422364 plus this change's 86, and it ratchets the
+# leftover slack down with it. Re-derived from the producer, both readings
+# measured, never by arithmetic on the limit.
+# 422450 -> 422474: the six trigger phrases #1688 adds reach the capability
+# rows too. The entry above deliberately left this budget with no slack at
+# all, so the first ordinary change after it has to move the number; that is
+# the ratchet working, not a regression. Re-derived from the producer.
+# 422474 -> 422755: the two executing-engine rules (follow-up authority,
+# closing brief) now say how a stop ends the turn -- the next action offered
+# as a question, never a statement of what will not be done -- and the one
+# capability row that carries an engine's quality bar (`ultraqa`) carries
+# the longer rules; the other six engines' bars do not reach this section.
+# Re-derived from the producer.
+# 422755 -> 422796: the Claude Opus 5.5 / GPT-6 Luna onboarding's capability
+# rows (model-setup, model-optimization, maestro) carry the new chain members
+# and rules. The branch fitted inside the slack the budget had before the
+# raise above; that raise left none, so rebasing past it surfaced the 41.
+# Re-derived from the producer.
+# 422796 -> 422817: the closing brief rule now says the result leads "in the
+# user's words"; the delta is that one clause in the one capability row
+# (`ultraqa`) that carries it. Re-derived from the producer after rebasing
+# past the onboarding raise.
+# 422817 -> 422908: `verification-gate`'s capability row carries its artifact
+# expectations, and `observed_check_results/v1` now renders from one
+# declaration that glosses each field a reader cannot infer -- source,
+# summary, scope, freshness (#1788). The row used to be written out twice in
+# that skill's own body with different field sets, so a consumer recorded
+# whichever copy it read and the field that went missing was freshness. The
+# meanings travel with the declaration, so a surface quoting it cannot quote a
+# name without its definition. 91 of the body's 298 reach this section.
+# Re-derived from the producer.
+# 422908 -> 438876: the six default-installed `jev-*` skills add their
+# capability rows. Re-derived from the producer after rebasing past the
+# observed_check_results declaration (#1788).
+# 438876 -> 441446: every skill description now opens on the user's situation
+# ("Remember a fact for future sessions: ...") before what the skill produces,
+# so the visible index window says when to load it. The capability rows carry
+# the description, and the situation lead adds about 20 chars per row. The
+# index budgets above do not move: Hermes cuts each line to 60 chars either
+# way. Re-derived from the producer.
+# 441446 -> 441476: review follow-up rewords eight situation openings to
+# drop words the negative-control corpus uses (margins back to main's) and
+# to say what the user wants; net +30 across those rows. Re-derived from the
+# producer.
+# 441476 -> 441693: 26 situation openings now name the work context inside
+# the visible index window ("Company hiring or HR process to structure",
+# "Upcoming work meeting that lacks an agenda") because a live model loaded
+# them for private-life chat (a weekend plan, a personal budget, a book club);
+# net +217 across those capability rows. Re-derived from the producer.
+# 441693 -> 441698: two of those openings get back what Korean requests to
+# them are about. omh-image-cards names meeting notes again (most of its
+# Hangul triggers are meeting minutes turned into an image), and
+# omh-live-info says a work task needs the rate, score, or local time rather
+# than that it "must cite with sources", which an ordinary exchange-rate
+# lookup for an invoice never says. Net +5 across the two rows. Re-derived
+# from the producer.
+# 441698 -> 445370: one capability row for the new `app-debugging` skill
+# (#1709) plus the reciprocal boundary lines its siblings gained. Re-derived
+# from the producer.
+# 445370 -> 448864: one capability row for the new `commit-pr-authoring` skill
+# (#1711); it adds no sibling boundary line. Re-derived from the producer.
+# 448864 -> 452456: one capability row for the new `git-workflow` skill (#1695);
+# it adds no sibling boundary line. Re-derived from the producer.
+# 452456 -> 456445: one capability row for the new `relational-db` skill
+# (#1692); it adds no sibling boundary line. Re-derived from the producer.
+# 456445 -> 460446: one capability row for the new `security-event-response` skill
+# (#1694) plus its siblings' reciprocal boundary lines. Re-derived from the
+# producer.
+# 460446 -> 464159: one capability row for the new `release-cut` skill
+# (#1693) plus its siblings' reciprocal boundary lines. Re-derived from the
+# producer.
+# 464159 -> 467710: one capability row for the new `agent-instructions` skill
+# (#1713) plus its siblings' reciprocal boundary lines. Re-derived from the
+# producer.
+# 467710 -> 467905: the dependabot split (#1712) -- `github-event-ops` and
+# `refactor-plan` each gain one boundary line naming the other side, and
+# `security-event-response` now names `refactor-plan` for a bump. Re-derived
+# from the producer.
+# 467905 -> 471620: one capability row for the new `iac-change` skill
+# (#1566) plus its siblings' reciprocal boundary lines. Re-derived from the
+# producer.
+# 471620 -> 475200: one capability row for the new `data-pipelines` skill
+# (#1565) plus its siblings' reciprocal boundary lines. Re-derived from the
+# producer.
+# 475200 -> 478926: one capability row for the new `model-finetuning` skill
+# (#1567) plus its siblings' reciprocal boundary lines. Re-derived from the
+# producer.
+# 478926 -> 482613: one capability row for the new `mobile-release` skill
+# (#1568) plus its siblings' reciprocal boundary lines. Re-derived from the
+# producer.
+# 482613 -> 486301: one capability row for the new `internal-audit` skill
+# (#1569) plus its siblings' reciprocal boundary lines. Re-derived from the
+# producer.
+# 486301 -> 486332: `ultrawork`'s dependency-topology quality-bar clause gains
+# one pointer at `references/team-lane.md` for checked in-session lanes
+# (`omh_team`), paid for partly by shortening the kanban-lane pointer beside
+# it, because `ultrawork` sits at the per-skill body ceiling. The team loop, the
+# approval binding and the stop rule are in that reference, counted outside
+# this budget; the capability row carries only the pointer. Re-derived from
+# the producer.
+# 486332 -> 486951: `websearch-setup` stops targeting the auxiliary
+# web-extract slot Hermes removed before the supported floor. Its required
+# inputs, expected outputs, and safety rules now name the `web` keys Hermes
+# reads (`search_backend`, `extract_backend`, `provider_tier`,
+# `keyless_fallback`), the selections and fallbacks a capability's backend
+# comes from, and the rule against writing or verifying the dead slot;
+# `web-research`'s pointer at it was reworded. The rows were tightened before
+# raising. Re-derived from the producer.
+# 486951 -> 487167: review of that change. The diagnosis output now names the
+# managed-gateway selection and the release difference where any
+# per-capability key counts as a selection and the other capability lands on
+# Hermes' default backend, and the safety rule says a key absent from
+# `config.yaml` is at its default rather than unsupported and where to read
+# support instead. Re-derived from the producer.
+# 487167 -> 487221: second review. The diagnosis output ends its list with
+# Hermes' default backend when nothing else resolves. Re-derived from the
+# producer.
+# 487221 -> 487704: one checklist per plan, all of it in `todo-checklist`'s
+# row. Its handoff policy, one quality-bar line and one final-checklist line
+# say which ONE tool holds the steps -- Hermes' todo_list where it is present
+# (OMH mirrors it), else omh_todo, with a planning run, an accepted plan and a
+# code-story template staying in omh_todo -- and what omh_todo alone still
+# records. The handoff policy named omh_todo alone, which is how a session
+# came to declare one plan in both tools. Re-derived from the producer.
+# Stacked on the three `websearch-setup` raises above: 487221 is that tree's
+# value, this change moves only the `todo-checklist` row, and 487704 is the
+# producer's reading of the combined tree.
+# 487704 -> 487739: `observed_check_results/v1` gained `origin`, a field only
+# a failing check carries. `verification-gate`'s quality bar tells a reader
+# that a field left out of a row is a gap in the record, which read alone
+# asks a passing row for an origin, so that line now says which field is the
+# failing row's. It is the third quality-bar line and the capability row
+# carries the first four. The rest of the origin rules sit below that window
+# and do not reach this section. Re-derived from the producer.
+# 487739 -> 488154: operator skills onto Hermes' native gates. Six
+# feature-surface skills (`github-event-ops`, `browser-operator`,
+# `workspace-file-operator`, `command-operator`, `connector-operator`,
+# `physical-device-readiness`) now state their own Do-Not-Use, so the one
+# `do_not_use_when` entry each row carries is that skill's first boundary
+# instead of the shape's shared generic line. `parallel-tools`' expected
+# outputs and a third safety rule name the per-server
+# `supports_parallel_tool_calls` diff and its read/write race instead of an
+# update command. The `security-safety-review` and `morning-brief` additions
+# sit past the row's bounds and move nothing here. The `parallel-tools` rows
+# were tightened before raising. Re-derived from the producer.
+# 488154 -> 488220: review of that change. `browser-operator`'s first
+# Do-Not-Use line, the one its row carries, now says the native browser tools
+# are the route only while OMH's browser adapter bridge is off, since the
+# bridge blocks them. The restored chat confirmations in `command-operator`
+# and `connector-operator` sit past the row's bounds. Re-derived from the
+# producer.
+# 488220 -> 488225: `automation-blueprint`'s artifact is renamed from
+# `hermes_ops_blueprint/v1` to `prepared_native_blueprint/v1`, the record that
+# prepares Hermes' own `metadata.hermes.blueprint` block, so it stops sharing a
+# name with Hermes' Automation Blueprints. The row's first expected output is
+# the only capability field that moved, by the five characters the new id is
+# longer; the native field mapping itself sits below the capability row's
+# quality-bar and safety-rule windows. Re-derived from the producer.
+# 488225 -> 489837: production skills onto Hermes' native producers. Six
+# rows had three quality-bar lines, so the line each gains is the fourth the
+# row carries: `materials-package` and `deliverable-package` the rule that a
+# document QA rung is observed only from the bundled producer's result field
+# (`"rendered": false` stays not observed), `report-package` the bundled
+# `powerpoint` skill as its binary-deck tool, `deploy-and-monitor` the
+# monitor-mode cron job prepared through `automation-blueprint`, and
+# `operating-rhythm` and `meeting-brief` the action-item fields.
+# `deliverable-package` and `ultraqa` state their own first Do-Not-Use line
+# instead of a generic one. The detail of each rule sits past the row's
+# bounds, and the shared document rule and `report-package`'s line were
+# tightened before raising. Re-derived from the producer.
+# 489837 -> 490030: review of that change. The shared document rule now says
+# a rung taken from a bundled producer is observed only from its field while
+# other observed evidence for a rung still counts (`materials-package`,
+# `deliverable-package`); `deploy-and-monitor`'s monitor source is the user's
+# source, never one OMH writes; `visual-qa`'s handoff policy counts captures
+# the session's own browser tools take; `report-package`'s line is shorter.
+# Re-derived from the producer.
+# 490030 -> 492322: tracker skills onto Hermes' own surfaces. `cancel` and
+# `skill` replace the operator shape's two generic quality-bar lines and safety
+# rules with their own -- which OMH record each clear uses and which stop is
+# the person's own host command; Hermes' skill tools, the person's `hermes
+# skills` commands, and no in-place edit of an OMH-managed skill -- so their
+# rows carry what the skill does. `toolbelt-readiness` gains the native-tool
+# presence rule as its fourth quality-bar line, `running-work-board` names
+# `omh_hud`'s delegate and kanban rows in its inputs, outputs, and handoff
+# policy, `run-efficiency` names `host_usage` in its outputs and boundary, and
+# six rows carry a new first Do-Not-Use line. The rows were tightened before
+# raising. Re-derived from the producer.
+# 492322 -> 492768: review of that change. The first Do-Not-Use line of
+# `run-efficiency`, `ops-observability-card`, and `context-budget-review` now
+# says what each Hermes surface shows -- `/usage` tokens, `/status` context,
+# `/insights` an estimated cost, `omh_run_summary` this conversation's
+# recorded tokens and cost -- since neither `/usage` nor `/status` shows a
+# cost; `cancel`'s `/stop` line says what it ends on each surface, and
+# `skill` names the in-chat `/skills` commands. Re-derived from the producer.
+# 492768 -> 492733: second review. The shared usage clause credits `/status`
+# with nothing (the modern TUI's shows no context) and says `/usage` shows
+# tokens and context; `skill`'s in-chat `/skills` line covers the TUI too.
+# Re-derived from the producer.
+# 492733 -> 492655: memory and learning skills onto Hermes' native loop. Seven
+# feature-surface skills (`memory-sync`, `external-connector-readiness`,
+# `prompt-import-readiness`, `instinct-ledger`, `skill-scout`, `skill-health`,
+# `workflow-learning`) now state their own Do-Not-Use, so each row's one
+# `do_not_use_when` entry is that skill's first boundary in place of the
+# shape's shared generic line: six rows got shorter and
+# `prompt-import-readiness`'s grew (3,353 -> 3,360). The pending-write,
+# provider-slot, ledger, scan, import-preview, and usage-count rules sit past
+# the rows' bounds and move nothing here. Re-derived from the producer.
+# 492655 -> 492654: `research-department`'s handoff policy maps Scout to the
+# lanes its prepared plan emits, `research`/`web-research`, instead of
+# `research`/`source-finder`; the row is one character shorter. Re-derived
+# from the producer.
+# 492654 -> 493103: the coding lane onto Hermes' native delegation. `ask`
+# states its own quality bar instead of the two shared default lines: name the
+# question and the advisor before consulting, report the advice as one input,
+# and, for a coding CLI the user named, take only the invocation from Hermes'
+# bundled `claude-code`, `codex`, or `opencode` skill. All three lines are in
+# the row's first four. The `ultrawork`, `plan`, `app-debugging`, and
+# `decision-prototype` additions sit past the row's bounds, in the compact
+# body, or in references, and move nothing here. Re-derived from the producer.
+# 493103 -> 497611: one capability row for the new `data-share-review` skill.
+# The reciprocal boundary line `legal-compliance-review` gains sits past its
+# row's bounds and moves nothing here. Re-derived from the producer.
+# 497611 -> 501668: one capability row for the new `spend-gate` skill, which
+# gates money the agent moves for the person on any rail; no other row moved.
+# Re-derived from the producer.
+# 501668 -> 501786: `skill`'s quality-bar line on `/skills install` adds that
+# `/reload-skills` in a running session makes the new skill available as
+# `/<name>` without a restart (the OMH TUI now runs it in the gateway). The
+# `running-work-board` and `model-setup` edits of the same change sit outside
+# the rows and move nothing here. Re-derived from the producer.
+# 501786 -> 501991: two rows. `skill`'s ownership line (+163) says an
+# OMH-managed skill is one OMH installed under a label its catalog renders,
+# and a companion the person or an agent created is theirs whatever its
+# name, in place of deciding by an `omh-`/`ulw-` prefix; `parallel-tools`
+# (+42) describes reading each MCP server's `supports_parallel_tool_calls`
+# and offering that flag, with an update only when asked, instead of a
+# version-currency check. Every other edit sits past the rows' bounds.
+# Re-derived from the producer.
+# 501991 -> 501984: `parallel-tools` (-7) after review. Its description and
+# use_when go back to the router words the row had before, plus `mcp` and
+# minus `currency`: words such as `installed`, `supports`, `server`, and
+# `runs` had moved ordinary version questions from a direct answer to a
+# clarify. The flag is applied as a diff only after approval, and the version
+# clause names parallel tool calls. `automation-blueprint`'s reworded spend
+# line sits past its row's bounds. Re-derived from the producer.
+# 501984 -> 502002: `parallel-tools` (+18). Its description applies "the diff
+# for parallel tool calls" instead of "that as a diff", whose "that" could
+# read as the report; no router word is added. Its use_when drops what
+# repeated the description and says "if" for "whether"; the row does not
+# carry use_when. Re-derived from the producer.
+# 502002 -> 501990: `ultraperf` (-12) drops its Do-Not-Use line handing a
+# declared metric to `performance-goal`, which #1691 retired into
+# `ultraperf` itself, so the one `do_not_use_when` entry its row carries is
+# now the `code-review` line. `loop`'s new spend-gate safety rule, the shared
+# grounded-citations, curator-ledger, and document-producer rules, and the
+# presence clauses sit past the rows' bounds or render byte-identical and
+# move nothing here. Re-derived from the producer.
+# 501990 -> 501991: the shipped `id` (Indonesian) trigger language pack. Its
+# phrases are ASCII, so they merge after every other pack's phrases and no
+# row shows a different trigger. Of the 21 rows it covers, only
+# `design-orchestration` grows: `+8 more triggers` becomes `+13 more
+# triggers` (+1). The other 20 change their count at the same width.
+# Re-derived from the producer.
+# 501991 -> 505556: one capability row for the new `dag-ulw` skill, and the
+# `intent_to_plan` lane it joins gains its name in the rows that list the
+# lane. Re-derived from the producer.
+# 505556 -> 505649: the `dag-ulw` row's handoff policy says where a coding
+# owner's choice comes from (`omh chat` or `omh coding`, within a day) and
+# that Hermes chat records none (+93). Re-derived from the producer.
+# 505649 -> 509135: one capability row for the new `market-research` skill
+# (3,484 chars plus its separator); no sibling row moved. Re-derived from the
+# producer.
+# 509135 -> 512944: only the new `show-reel` capability row, including its
+# optional companion guidance (+3809); no existing row changed. Re-derived
+# from the producer; no eager toolkit bytes or headroom.
+# 512944 -> 513064: the `dag-ulw` row's handoff policy says only `omh_dag`'s
+# calls start nodes, and a `delegate_task` without the marker they carry is no
+# node of the run, where it said the tool "only keeps the graph" (+120).
+# Re-derived from the producer.
+# 513064 -> 522236: three science catalog rows and procedure contracts, measured
+# from the merged producer with main's DAG handoff and review-method contracts.
+# No eager toolkit bytes or headroom are included.
+# 522236 -> 522329: shared adaptation-quality read rules and complete saved DAG
+# goal guidance, measured by release skill-content-smoke; procedure stays on demand.
+# 522329 -> 525379: clean 85673e100 actually measures 522307, not the old
+# ceiling; ai-job-search adds exactly one 3070-character row + separator
+# (+3072) for career discovery/drafting/interviews/evidenced outcomes. Retire
+# the old 22 unused characters, not carry them forward. Existing rows are
+# byte-stable and test_ai_job_search_context_budget pins them and this delta.
+# 525379 -> 525403: the pi-family runtime's profile was renamed; four
+# capability rows name it in a runtime list ("pi-family" for the old
+# three-letter name, +6 each, +24). No other row moved. Re-derived from the
+# producer.
+FULL_CAPABILITY_SKILL_SECTION_CHAR_LIMIT = 525403
+FULL_CAPABILITY_SKILL_ITEM_CHAR_LIMIT = 9000
+# 100000 -> 102070: the same three domain workflows each add one standalone
+# capability row, again measured on the merged tree; warranted growth for three
+# new workflows.
+# 102070 -> 103020: one standalone capability row for the new
+# `model-optimization` skill; warranted growth.
+# 103020 -> 103952: `web-research` is a new installable skill -- the web lookup
+# lane split out of the `research` engine so a cited one-round lookup stops
+# paying the engine's declared depth budget and reference-implementation
+# study. One row for one new workflow, not per-row padding;
+# the engine's own row shrank by the triggers that left it.
+# 103952 -> 104866: one standalone capability row for the new `codebase-uml`
+# skill; warranted growth.
+# 104866 -> 105813: one standalone capability row for the new
+# `frontend-refactor` skill; warranted growth.
+# 105813 -> 106730: one standalone capability row for the new
+# `refactor-plan` skill; warranted growth.
+# 106730 -> 107677: one standalone capability row for the new
+# `inference-serving` skill; warranted growth.
+# 107677 -> 108618: one standalone capability row for the new
+# `tech-debt-audit` skill; warranted growth.
+# 108618 -> 109590: one standalone capability row for the new
+# `award-bar-score` skill; warranted growth.
+# 109590 -> 110495: one measured standalone capability row for omh-docs.
+# 110495 -> 110519: the canonical `product-docs` identifier removes the generic
+# `docs` routing exception and preserves display-name symmetry.
+# 110519 -> 111483: one standalone capability row for the new
+# `github-issue-intake` skill; warranted growth.
+# 111483 -> 112443: apple-design adds one standalone capability row.
+# 116240 -> 117199: one standalone capability row for the new
+# `long-document-reading` skill; warranted growth.
+# 117199 -> 118167: one standalone capability row for the new
+# `application-threat-model` skill (#1564); warranted growth.
+# 118167 -> 119140: one standalone capability row for the new
+# `live-incident-response` skill (#1563); warranted growth.
+# 119140 -> 120089: `todo-checklist` (#1642). `omh_todo` is registered on every
+# 984912 -> 991599: `todo-checklist` (#1642). `omh_todo` is registered on every
+# session and no skill named it, so a user looking for `/omh-todo` found
+# nothing and only the two delivery engines mentioned the tool at all. The
+# SKILL.md body carries only what is wrong to discover late -- items are
+# declarations and never execution evidence, exactly one item active, and
+# `action=set` replaces the whole list so a partial write silently drops the
+# items left out. The shaping rules, the `blocked_reason` versus
+# `deferred_reason` distinction, and the when-not-to-declare guidance are in
+# `skills/omh-todo-checklist/references/checklist-discipline.md`, which loads on
+# demand and is counted outside this budget. Re-derived from the producer.
+# 120089 -> 117254: the same three standalone capability rows leave with the
+# skills retired by #1691. Re-derived from the producer.
+# 117254 -> 122889: the same six `jev-*` rows in the standalone section.
+# Re-derived from the producer.
+# 122889 -> 123824: one standalone capability row for the new `app-debugging`
+# skill (#1709) plus its siblings' reciprocal boundary lines; warranted growth.
+# Re-derived from the producer.
+# 123824 -> 124777: one standalone capability row for the new
+# `commit-pr-authoring` skill (#1711); warranted growth. Re-derived from the
+# producer.
+# 124777 -> 125709: one standalone capability row for the new `git-workflow`
+# skill (#1695); warranted growth. Re-derived from the producer.
+# 125709 -> 126644: one standalone capability row for the new `relational-db`
+# skill (#1692) plus its siblings' reciprocal boundary lines; warranted growth.
+# Re-derived from the producer.
+# 126644 -> 127609: one standalone capability row for the new `security-event-response`
+# skill (#1694) plus its siblings' reciprocal boundary lines; warranted
+# growth. Re-derived from the producer.
+# 127609 -> 128538: one standalone capability row for the new `release-cut`
+# skill (#1693) plus its siblings' reciprocal boundary lines; warranted
+# growth. Re-derived from the producer.
+# 128538 -> 129488: one standalone capability row for the new `agent-instructions`
+# skill (#1713) plus its siblings' reciprocal boundary lines; warranted
+# growth. Re-derived from the producer.
+# 129488 -> 130414: one standalone capability row for the new `iac-change`
+# skill (#1566) plus its siblings' reciprocal boundary lines; warranted
+# growth. Re-derived from the producer.
+# 130414 -> 131352: one standalone capability row for the new `data-pipelines`
+# skill (#1565) plus its siblings' reciprocal boundary lines; warranted
+# growth. Re-derived from the producer.
+# 131352 -> 132296: one standalone capability row for the new `model-finetuning`
+# skill (#1567) plus its siblings' reciprocal boundary lines; warranted
+# growth. Re-derived from the producer.
+# 132296 -> 133234: one standalone capability row for the new `mobile-release`
+# skill (#1568) plus its siblings' reciprocal boundary lines; warranted
+# growth. Re-derived from the producer.
+# 133234 -> 134172: one standalone capability row for the new `internal-audit`
+# skill (#1569) plus its siblings' reciprocal boundary lines; warranted
+# growth. Re-derived from the producer.
+# 134172 -> 135119: one standalone capability row for the new
+# `data-share-review` skill; the reciprocal boundary line
+# `legal-compliance-review` gains moves no standalone row. Warranted growth.
+# Re-derived from the producer.
+# 135119 -> 136056: one standalone capability row for the new `spend-gate`
+# skill; no sibling row moved. Re-derived from the producer.
+# 136056 -> 136955: one standalone capability row for the new `dag-ulw` skill;
+# no sibling row moved. Re-derived from the producer.
+# 136955 -> 137896: one standalone capability row for the new
+# `market-research` skill (939 chars plus its separator); no sibling row
+# moved. Re-derived from the producer.
+# 137896 -> 138847: one standalone capability row for `show-reel` (+951).
+# Re-derived from the producer; no standing headroom is added.
+# 138847 -> 141700: three science method summaries, producer measured.
+# 141700 -> 142635: one 933-character standalone ai-job-search summary +
+# separator (+935), measured against clean 85673e100; the complete method and
+# offline companion stay on demand. No sibling row or per-item limit moves;
+# test_ai_job_search_context_budget pins existing rows and the feature delta.
+STANDALONE_CAPABILITY_SKILL_SECTION_CHAR_LIMIT = 142635
+STANDALONE_CAPABILITY_SKILL_ITEM_CHAR_LIMIT = 2200
+# ULW fold context ceiling (issue #954, PR D). The limit is the pre-D measured
+# value of the full profile's `skill_body` chars on `main` @ acb9a060, in the
+# producer's own unit (Python str length; the payload field is named `bytes`
+# but counts characters). PR D's fold growth is a reviewed exception recorded
+# in the PR body -- `ultrawork` absorbs four contracts while the four retiring
+# skills still ship, so cost rises until PR G removes them. PR G re-measures
+# and lowers the limit; it must not be bumped silently.
+# Re-tightened to the measured post-retirement value when the four folded ULW
+# engines left the installable surface (#954 stage 5): the PR D reviewed
+# exception is retired with them, per plan §1.2 (the ceiling is relaxed exactly
+# once and re-tightened at retirement). Re-measured after the retirement
+# review repointed the remaining retired-name recommendation copy to
+# `ultrawork` capability phrasing (the fit-recommendation rule grew by the
+# capability wording); the ceiling stays exactly the measured value.
+# Re-measured when the owner made the Hermes coding harness the default
+# implementation owner for ulw-work (#1001): the handoff policy and
+# delivery-boundary quality bar grew by the per-lane `omh_delegate_route`
+# mixture-routing guidance and the inherit-wave rule. Deliberate product
+# copy, not drift; the ceiling stays exactly the measured value.
+# Re-measured for the phase-todo discipline (todo init before engine work,
+# bounded HUD-visible checklist instead of an open-ended reasoning loop) added
+# to the same quality bar. Deliberate; the ceiling stays the measured value.
+# 700058 -> 700304: ralplan gained a state-root guard safety rule (+246
+# chars) pinning plan artifacts to <repo>/.omh/plans/ and forbidding .omc/**
+# after observed cross-product drift; warranted growth, not padding.
+# 700304 -> 700586: ultrawork gained the localized run-summary closing rule
+# (+282 chars, omh_run_summary elapsed/tokens/models block); warranted growth.
+# 700586 -> 701609: model-setup gained the OAuth-login/quota-recovery
+# guidance (+1023 chars: TUI /setup vs hermes model paths, pooled
+# credentials, refreshed chain prose); warranted growth.
+# 701609 -> 704819: the six executing ULW engines gained the shared
+# interjection-resume rule (#1033, +535 chars each: answer a mid-run user
+# message briefly, then continue the run in the same reply); warranted growth.
+# 704819 -> 705236: the architect mixture category (ultrawork routing prose
+# plus the user-named model pin instruction, and model-setup's chain line);
+# warranted growth.
+# 705236 -> 705462: model-setup names ~/.omh/routing/model-chains.json as the
+# no-code chain customization surface; warranted growth.
+# 705462 -> 705999: model-setup gained the chain-interview contract (numbered
+# per-category options applied via `omh model-chains`) and its trigger
+# vocabulary; warranted growth.
+# 705999 -> 706033: DeepSeek V3.2 joined the deep and unspecified-low shipped
+# chains, so model-setup's chain line names it; warranted growth.
+# 706033 -> 706701: the router body gained two structural-code-search pointer
+# lines (+220 chars) and the two code-exploration skills gained a Structural
+# Code Search pointer block (+224 chars each); warranted growth.
+# 706701 -> 707667: the loop skill gained the /goal driver contract (+966
+# chars: goal-driver-handoff outputs, gate registration before the judge,
+# judge-done-is-narration, and the gates-discarded-on-reset recovery note);
+# warranted growth.
+# 707667 -> 709511: the loop skill gained the constraint-discipline section
+# (+1844 chars: five focusing steps in OMH vocabulary, the
+# loop_constraint_assessment/v1 pointer, the next_action precedence sentence,
+# and the reference pointer) plus one constraint-first quality-bar bullet, and
+# ultrawork gained one durable-checkpoint quality-bar bullet pointing at the
+# same reference; warranted growth.
+# 709511 -> 711787: the loop skill gained the measured-loop discipline
+# (+2276 chars: five quality-bar rules for the evaluation contract, the
+# attempt-commit cycle, the experiment ledger, the log rail, and the
+# simplicity tiebreaker, one idea-exhaustion recovery note, and a connective
+# section carrying the constraint-versus-metric precedence and the completion
+# boundary); the full method and the attribution live in the on-demand
+# reference; warranted growth.
+# 711787 -> 712692: the loop skill gained metadata-only native /goal
+# observation and evidence-backed phase-transition contracts (+905 chars:
+# schema names, same-session turn evidence, prepared-versus-observed guidance,
+# and generated output/artifact pointers); warranted growth.
+# 712692 -> 713238: the loop skill gained future-default promotion governance
+# (+546 chars: maintainer ownership, matched observed comparison conditions,
+# unresolved-evidence fallback, and separation from runtime/completion and
+# measured-loop keep/discard decisions); warranted growth.
+# 713238 -> 714446: the deep-interview skill gained the answer-options
+# contract (+1208 chars: the candidate-list block with a free-input entry,
+# the bare-number collision rule, the mid-interview option shape, and one
+# quality-bar bullet), replacing free-text-only replies with an
+# AskUserQuestion-shaped numbered list; warranted growth.
+# 714446 -> 715255: the ralplan skill gained the plan-todo checklist rule
+# (`omh_todo` stage declaration with the declarations-not-evidence boundary,
+# HUD-panel wording, and the rewrite-on-evidence-gap step) and the bounded
+# in-plan research stage rule with its dossier-recording obligation, minus
+# one subsumed recovery note (net +809 chars); warranted growth.
+# 715255 -> 715434: the ultrawork skill's todo-init rule grew into a
+# plan-structure contract on owner direction (+179 chars: numbered phases in
+# delivery order, one implement/verify/deliver task per work unit,
+# independent review lanes, an evidence-and-cleanup close, one task per
+# observable outcome); warranted growth.
+# 715434 -> 716418: the shared delegate model-label rule now tells lanes
+# to show `(model)` alone when the host exposes no reasoning effort instead
+# of printing a literal `unknown` placeholder beside a known model, scoped to
+# narration lines (board columns keep their `unknown` cells) with a
+# say-not-observed carve-out for directly asked figures (renders into all
+# three handoff-guide skill bodies; the common rail carries the same text but
+# sits outside this metric); warranted growth.
+# 716418 -> 716734: JSON-compatible YAML quoting protects every emitted
+# frontmatter name and description from mapping, comment, and delimiter syntax
+# (+316 chars across the generated skill bodies); warranted growth.
+# 716734 -> 717343: visual-qa replaced timestamp freshness prose with exact
+# source-lineage and required-viewport contracts (+609 chars across the
+# generated skill body); warranted growth.
+# 717343 -> 717473: the three specialist workflows gained normalized routing
+# cues for local-negation and compound-intent handling (#1112, +130 chars);
+# warranted growth.
+# 717473 -> 718545: the design family gained its named craft bar and pointers
+# into four on-demand references (+1072 chars across the frontend,
+# design-quality-gate, and design-orchestration quality bars: the named
+# senior-designer bar with flat-output-fails, the DESIGN.md-before-code
+# contract gate, primary-taste-direction selection, and reference-token
+# extraction). The reference bodies themselves load on demand and sit outside
+# this body budget; warranted growth.
+# 718545 -> 719033: the ultrawork and ralplan todo-init quality-bar rules
+# gained an English-labels clause (+488 chars: phase names and task titles
+# stay English even in a non-English conversation, since the HUD todo
+# checklist is an operator surface under the repo's English-by-default
+# output contract); warranted growth.
+# 719033 -> 721424: ten operations skills now expose their artifact contract
+# id, machine-enforcement level, resolvable consumer (when validated), and the
+# enforcement-versus-evidence boundary (#1119; +2391 chars in the merged
+# renderer); warranted growth.
+# 721424 -> 721472: the agent-evaluation contract now names per-task input
+# digests, per-dispatch time bounds, receipt-authenticated observed_at, and
+# the owning-OS-user limitation while replacing the older generic
+# provenance sentence (net +48 chars); warranted growth.
+# 721472 -> 723197: ultrawork gained the tests-first delivery contract
+# (+1725 chars: the red-before-green observed rule with pasted-output
+# evidence, forbidden test-weakening moves, the red-commit checkpoint, and
+# the pointer to the on-demand references/tdd-red-green.md discipline; the
+# reference body loads on demand and sits outside this body
+# budget); warranted growth.
+# 723197 -> 724180: context-budget-review gained the cache-placement
+# discipline (+983 chars: three prompt-cache triggers, the cache-stable
+# prefix-placement quality-bar rule, and the pointer to the on-demand
+# references/cache-placement.md card; the reference body loads on demand
+# and sits outside this body budget); warranted growth.
+# 724180 -> 725734: agent-debug and failure-signal-audit gained real
+# debugging-methodology quality bars (+1554 chars: competing hypotheses
+# held with evidence for and against, cheapest-discriminating-probe-first
+# ordering, last-known-good-to-first-bad bisect discipline, revert-verify
+# before causation claims, and no fix or remediation without a reproduced
+# failure first); warranted growth.
+# 725734 -> 726112: the frontend quality bar wired the screenshot iteration
+# loop into the web build path (+378 chars: the live-environment-first
+# capture-at-1440/768/375 rule with Blocker/High/Medium/Nit triage and the
+# recapture-until-the-difference-list-is-empty contract, plus the pointer to
+# the on-demand references/screenshot-loop.md; the reference body loads on
+# demand and sits outside this body budget); warranted growth.
+# 726112 -> 726847: idea-to-deploy gained the greenfield project-bootstrap
+# pass (+735 chars: six new trigger phrases, a widened use-when clause naming
+# a fresh or empty repository, and the quality-bar rule requiring the
+# bootstrap pass before delivery planning with the explicit throwaway-work
+# skip, plus the pointer to the on-demand references/project-bootstrap.md;
+# the reference body loads on demand and sits outside this body
+# budget); warranted growth.
+# 726847 -> 726824: the bare-noun "project scaffolding" trigger was dropped
+# from idea-to-deploy after review showed it dispatched read-only questions
+# about existing repos into the delivery loop (-23 chars; the imperative
+# bootstrap/scaffold phrases remain); warranted shrink.
+# 726824 -> 727188: ultrawork's run-summary closing rule gained the
+# non-observed-status fallback (print an explicit not_available line instead
+# of omitting or estimating) and a matching final-checklist item pinning the
+# closing brief to the observed `omh_run_summary` line or that fallback
+# (+364 chars); warranted growth.
+# 727188 -> 741811: the new `maestro` (`ulw-maestro`) skill was added
+# (+14623 chars total): its own catalog body -- explicit-owner precondition,
+# handoff-mode statement, skill-set-informed prompt composition, and
+# readiness/session-capture rules -- plus the one-clause `ulw-maestro`
+# composition pointer added to `ultrawork`'s quality bar; warranted growth
+# for a wholly new engine. (The coding_handoff lane's `+N more` bump is
+# byte-neutral and contributes nothing here.)
+# 741811 -> 741942: review fixes on the maestro engine (+131 chars): the two
+# handoff schema identifiers corrected to the real
+# `coding_executor_handoff/v1` / `coding_runtime_handoff/v1` constants, the
+# prepared-record-vs-fanout-dispatch qualifier on the mode-statement rule, and
+# the de-defaulted handoff_policy closing clause; warranted correction.
+# 741942 -> 744243: ultrawork gained dependency-topology selection, standalone
+# node and verification-fan-in contracts, PIN/RED/GREEN/SURFACE/CLEAN evidence
+# discipline, real-surface QA and cleanup receipts, and guarded natural
+# nomination for parallel-then-integrate work (+2301 chars); warranted growth.
+# 744243 -> 744060: maestro's own final checklist replaced the generic
+# Hermes-owner harness line -- which told an engine that structurally cannot
+# have Hermes as owner to consult `hermes_coding_harness/v1` -- with one line
+# stating that this engine does not apply when Hermes is the coding owner
+# (-183 chars); warranted correction, not growth.
+# 744060 -> 744066: `ask`'s retired bare `claude`/`gemini` trigger tokens (two
+# short entries) were replaced by a slightly longer explanatory comment in the
+# same trigger tuple (+6 chars net); warranted, one-time bookkeeping.
+# 744066 -> 744973: maestro gained one final-checklist note naming the
+# post-dispatch result-integration procedure -- collect each unit's
+# `fanout_unit_result/v1` evidence, verify the integrated combination (not
+# just each unit alone), and report merged/unmerged per unit, since merging
+# stays an explicit operator/reviewing-agent action dispatch never performs
+# (the full collect/verify/merge/report walkthrough lives in
+# `references/executor-prompt-composition.md`, outside this body
+# budget); model-setup gained one closing-step quality-bar line pointing a
+# finished model-setup pass at the same maestro-delegation setup surfaces
+# (+907 chars total); warranted growth.
+# 744973 -> 745687: maestro's quality bar and safety rules gained the
+# fanout-dispatch single-run entry point (`omh coding run`): the mode-statement
+# rule and the "only executing surface" rule now name it alongside `omh coding
+# fanout dispatch`, and a new rule states that an explicitly-named owner
+# proceeds automatically through compose, readiness/permission probes, and
+# dispatch with no second confirmation (the no-owner/ambiguous-owner
+# ask-and-stop rule is unchanged) (+714 chars); warranted growth for a real
+# new dispatch surface and its automatic-flow contract.
+# 745687 -> 746326: `omh coding run` gained `--model`/`--effort` flags for a
+# per-run model choice (precedence: the flag beats a routed handoff model,
+# which beats the dispatch-models.json preference, which beats the executor
+# CLI's own default); maestro's quality bar gained two matching rules naming
+# the operator's model-choice phrasing and the flag's unvalidated,
+# never-silently-falls-back passthrough to the executor (+639 chars);
+# warranted growth for a real per-run model-override capability.
+# 746326 -> 756725: the new `adversarial-consensus` (`omh-adversarial-consensus`)
+# skill was added -- an independent-perspectives / cross-attack / distill-only
+# planning contract whose SKILL.md body is 10441 chars, close to
+# `ralplan`'s 9616 and well under `ultrawork`'s 23879. The round-by-round
+# procedure, the per-seat angle table, and the failure-mode table live in the
+# on-demand `references/consensus-protocol.md` (6894 chars), outside this
+# budget; what is in the body is the roster bound, the round order, the
+# independence and no-self-defense rules, the closed bucket set, and the
+# mandatory planner handoff -- the rules that are wrong to discover late. The
+# remainder of the delta is the `+N more` lane line regenerating across the
+# eleven other `intent_to_plan` skills; warranted growth for a new workflow.
+# 756725 -> 756890: `verification-gate`'s safety_rules gained one rule stating
+# that a change touching an authentication, secrets/config, schema/migration,
+# or payment/crypto path escalates to the thorough verification lane
+# regardless of diff size (+165 chars); warranted growth documenting the new
+# deterministic sensitive-path escalation (`quality/verification_tiering.py`)
+# absorbed into `_verification` in `coding_delegation.py`.
+# 756890 -> 758447: design-lane hardening across three existing skills. `visual-qa`
+# gained the scored-verdict stopping rule (integer 0-100 score, 90 pass line, a
+# mandatory edit-and-recapture round under it) plus the pixel-diff demotion, and
+# `frontend` gained the model-default-aesthetic rule (the editorial prior, the
+# briefs it suits and the ones it fails, and the tokens-not-negations override
+# test) with the review-prompt sweep. The verdict JSON shape, the three-state
+# loop exit, the default-prior sections, and the eight review prompts all live in
+# the on-demand references -- the new `omh-visual-qa/references/
+# visual-verdict-contract.md` (4898 chars) and the grown `taste-foundations.md`
+# (+3838) and `design-critique-rubric.md` (+1122) -- outside this budget; what is
+# in the body is the threshold, the rerun obligation, and the two-line override
+# test, the rules that are wrong to discover after a surface has shipped
+# (+1557 chars); warranted growth.
+# 758447 -> 770048: the new `llm-app-dev` (`omh-llm-app-dev`) skill was added --
+# the build-discipline contract for an LLM-powered feature, whose SKILL.md
+# body is 11577 chars, between `adversarial-consensus`'s 10355 and
+# `ultrawork`'s 23881. The per-rail decisions and the eval-harness procedure
+# live in the two on-demand references (`build-rails.md` 6348 chars,
+# `eval-harness.md` 4744), outside this budget; what is in the body is the
+# rail order, the one-client-boundary and exact-model-ID rules, the
+# schema-first validate-and-repair rule, the prompt-artifact separation, the
+# retrieval-before-generation order, and the eval deliverables -- the rules that
+# are expensive to discover after the call sites exist. The remainder of the
+# delta is the `+N more` lane line regenerating across the twelve other
+# `coding_handoff` skills. Value re-measured on each merge of origin/main this
+# branch has taken (#1181, then #1183): the delta is +11601 every time, so this
+# ratchet move is additive to the ones below it rather than overlapping any of
+# them; warranted growth for a new workflow.
+# 770048 -> 795266: the domain skill pack added `backend`, `rust`, and
+# `native-debugging` -- OMH's first technical-domain workflows, closing its two
+# zero-coverage engineering domains. Each SKILL.md body is smaller than
+# `frontend`'s and than `llm-app-dev`'s; the per-stack pointer table, the
+# migration order, the UB category table, and the debugger session recipes live
+# in five on-demand references, outside this budget. What is in the body is
+# only what is wrong to discover late -- the auth boundary before endpoints, the
+# deterministic unsafe/FFI/lock-free escalation trigger, and the
+# three-hypotheses-on-distinct-axes floor. The remainder of the delta is the
+# `+N more` lane line regenerating across the other `coding_handoff` skills.
+# Re-measured on the merged tree after #1181, #1183, and #1182 rather than
+# carried over from this branch's pre-merge base; warranted growth for three
+# workflows closing two zero-coverage technical domains.
+# 795266 -> 795558: the `frontend` quality bar gained the design-reference-data
+# lookup line (+292 chars: `omh design data --kind palette|font|ux --context`
+# with the rows-inform-DESIGN.md-but-the-contract-gates-the-code boundary);
+# warranted growth.
+# 795558 -> 795956: `verification-gate` gained the completion-integrity refusal
+# rule (+398 chars) naming the four things that make a completion claim refuse
+# rather than report -- an unlinked TODO/FIXME/stub marker in changed code, a
+# suppressed test with no linked reason, placeholder or self-referential
+# evidence, and a proof word with no command behind it. It belongs in the
+# SKILL.md body because it changes the verdict the skill issues, and a
+# gate that only reports its verdict after the claim is written is the failure
+# this rule exists to stop; warranted growth.
+# 795956 -> 797568: the seed `ja` and `zh` trigger language packs put their
+# phrases into the catalog, so the body's "Strong routing signals" line
+# of nineteen skills now also carries the Japanese and Chinese phrasings for
+# that skill (+1612 chars across all of them). It belongs in the SKILL.md
+# body for exactly the reason the English and Korean phrases do: the routing
+# signal list is what a host's picker and the skill body both read to decide
+# whether this workflow is the one, and a phrase that is not there is a
+# language the skill cannot be asked for. The number grows with languages
+# rather than with prose -- no skill's own contract changed by a character;
+# warranted growth.
+# 797568 -> 798042: `verification-gate` gained the guard-deletion regression
+# rule (+474 chars) requiring a named adversarial or regression case before a
+# diff that deletes a validation/refusal/sanitization/permission/allowlist
+# check, or the negative test that proved it, can be claimed complete. It
+# belongs in the SKILL.md body for the same reason the completion-
+# integrity rule above does: it changes the verdict the skill issues, and a
+# gate that reports a lost guard instead of refusing the claim is the failure
+# this rule exists to stop; warranted growth.
+# 798042 -> 798440: `codebase-onboarding` and `codegraph-refresh` each gained
+# one sentence (+199 chars x2) in their spliced Structural Code Search section
+# prescribing a capped search budget -- a few bounded, targeted queries before
+# a full-file read, escalate only when a bounded pass finds nothing or stays
+# ambiguous, and stop once the target is found. It belongs in the always-
+# loaded body for the same reason the tool-preference sentence beside it does:
+# it is search discipline the skill states up front, not a fact worth an
+# on-demand reference lookup; warranted growth.
+# 798440 -> 798464: `model-setup` names the shipped editorial chains verbatim,
+# and the unspecified-low / quick chains each gained a GLM 5.3-generation head
+# (owner decision, 2026-08-31: glm-5.3 and glm-5.3-flash lead, the 5.2
+# entries stay as fall-through). +24 chars of chain names, not new prose;
+# warranted growth.
+# 798464 -> 806869: `model-optimization` is a new installable skill carrying
+# the model-onboarding process contract (recognition probe -> official-first
+# research -> trait-to-counter calibration -> config-first routing placement
+# -> documented-price-only cost -> measurement close). One new skill body for
+# one new workflow; warranted growth.
+# 806869 -> 808826: the memory-sync interview protocol gains candidate
+# selection (top-~5 per pass from dreaming/similarity signals), a resume
+# cursor whose resume point is named as conversation-only, the
+# apply-after-approval close (explicit diff approval, tool-unavailable
+# branch, no raw file edits) that stops interviews from ending at an
+# unapplied diff, and the natural interview trigger phrases (with their Korean pack forms); the boundary
+# sentences across the pack now name who applies an approved diff. Protocol
+# and boundary text that change the interview's verdict and completion, not
+# padding; warranted growth.
+# 808826 -> 814951: `web-research` is a new installable skill -- the web lookup
+# lane split out of the `research` engine so a cited one-round lookup stops
+# paying the engine's declared depth budget and reference-implementation
+# study. One body for one new workflow, not per-body padding;
+# the engine's own body shrank by the triggers that left it.
+# 814951 -> 815057: `best-practice-research`'s single boundary statement
+# became two once the lookup half of it stopped belonging to the engine.
+# The split is what removed a deference inversion the policy test had been
+# carrying; 106 chars is the sentence that did it.
+# 815057 -> 816478: `research` gained the audience branch -- three required
+# inputs (audience, format, language), the briefing artifact in its outputs,
+# and the three quality-bar rules that make Hermes ask before retrieval
+# rather than after. The document standard itself is a reference file, so it
+# costs progressive disclosure rather than the SKILL.md body; what is
+# counted here is the asking, not the standard.
+# 816478 -> 817601: ai-slop-cleaner gained the classify-first taxonomy line,
+# the fixed pass order, the detection-first rule, the scope boundary, and the
+# four-part closing report; the taxonomy and command tables live in the new
+# on-demand cleanup-passes reference outside this count; warranted growth.
+# 817601 -> 819169: code-review gained the spec-conformance axis, the
+# smell-baseline pointer, and the checked-and-clean / could-not-assess closing
+# contract; the twelve-smell table itself lives in an on-demand reference
+# outside this body count; warranted growth.
+# 819169 -> 827737: `codebase-uml` is one new installable skill body (the
+# interface-level diagram workflow: scope, generate from the tree, render with
+# the plan's command, read the omissions legend back), plus its lane name on
+# the intent_to_plan skills' Workflow Lane lines; warranted growth.
+# 827737 -> 838981: `frontend-refactor` is one new installable skill body
+# (preview-first, impact-ordered, behavior-locked UI refactor), plus its lane
+# name on the coding-handoff skills' Workflow Lane lines; the pass and
+# state-discipline tables live in two on-demand references outside this
+# count; warranted growth.
+# 838981 -> 846063: `refactor-plan` is one new installable skill body
+# (recon, contracts-first phases, files table, approval gate), plus its lane
+# name on the intent_to_plan skills' Workflow Lane lines; the phase contract
+# lives in an on-demand reference outside this count; warranted growth.
+# 846063 -> 854431: `inference-serving` is one new installable skill body
+# (decide-deploy-measure with observed-only gates), plus its lane name on the
+# research_and_ops skills' Workflow Lane lines; the runbook and benchmark
+# tables live in two on-demand references outside this count; warranted
+# growth.
+# 854431 -> 856342: the observability extension adds the tier-audit,
+# span-vocabulary, and harness-budget quality-bar rules to three existing
+# skills; the ladder, audit rubric, and anti-pattern tables live in the new
+# on-demand instrumentation-ladder reference outside this count; warranted
+# growth.
+# 856342 -> 856696: `model-setup` names the shipped editorial chains verbatim,
+# and the four Claude-headed chains each gained the Fable 5.1 -> Mythos 5.1
+# pair ahead of Fable 5 (owner decision, 2026-09-02), plus the one sentence
+# that states the Claude vendor order and why Mythos never heads a chain.
+# +354 chars of chain names and one rule, not new prose; warranted growth.
+# 856696 -> 864516: `tech-debt-audit` is one new installable skill body
+# (orient, nine-dimension audit, severity-by-effort ledger, rerun
+# reconciliation), plus its lane name on the coding_handoff skills' Workflow
+# Lane lines; the dimension and reconciliation tables live in one on-demand
+# reference outside this count; warranted growth.
+# 864516 -> 865332: `strategy-brief` grew the decision-record discipline
+# (three-condition trigger, record convention and approval gate, lifecycle
+# and supersession rules, the decision-recall wiring); the file convention,
+# lifecycle table, and review checklists live in the new on-demand
+# decision-records reference outside this count; warranted growth.
+# 865332 -> 865700: `model-setup` names the provider-entitlement document the
+# interactive setup writes (~/.omh/routing/providers.json) and the one rule
+# it implies — served entries lead, nothing is removed, a CLI subscription
+# only seeds the Maestro lane — so Hermes explains the reordered chains it
+# will see instead of calling them drift; one sentence, warranted growth.
+# 865700 -> 866062: the refactor-plan repointing lengthens two existing
+# boundary lines (frontend-refactor, ai-slop-cleaner) and adds one to
+# ralplan, so each side of the phase-planning boundary names the other;
+# three boundary sentences, not new prose; warranted growth.
+# 866062 -> 867189: `accessibility-audit` gains the rule-ID, fix-partition,
+# and report-shape rules plus the fix-class safety line; four instruction
+# lines on one existing skill, with the rule table and its WCAG mappings in
+# a new on-demand reference outside this count; warranted growth.
+# 867189 -> 868268: `frontend` gains the web-vitals budget, attribution, and
+# field-vs-lab rules plus the measurement-conditions safety line; four
+# instruction lines on one existing skill, with the threshold and
+# attribution tables in a new on-demand reference outside this count;
+# warranted growth.
+# 868268 -> 869354: `agent-evaluation` gains the loop-shape, stop-rule, and
+# criteria-before-generation rules plus the judge-score safety line; four
+# instruction lines on one existing skill, with the shape table and judging
+# rules in a new on-demand reference outside this count; warranted growth.
+# 869354 -> 876865: `award-bar-score` is one new installable skill body
+# (per-axis scoring, the weighted total against the published threshold, the
+# binding-constraint call, and the accessibility/performance tradeoff
+# ledger), plus its lane name on the materials_and_visuals skills' Workflow
+# Lane lines; the judging model, weights, thresholds, and the worked
+# arithmetic live in one on-demand reference outside this count; warranted
+# growth.
+# 876865 -> 877208: same measured correction reaching the SKILL.md
+# body; warranted growth.
+# 877208 -> 882271: measured full-profile output after adding the 5,295-byte
+# omh-docs body and projecting its research-and-ops lane membership; its four
+# progressive references remain outside the SKILL.md body count.
+# 882271 -> 882729: source-accuracy fixes document project-scoped OMH homes,
+# the doctor state-write side effect, and the metadata-only Hermes-memory
+# comparison boundary; this is measured product documentation, not padding.
+# 882729 -> 890353: `github-issue-intake` is one new installable skill body
+# (classification, the three-question bounded interview, duplicate search,
+# the confirmation gate, and the connector read-back boundary), plus its
+# lane name on the automation_and_status skills' Workflow Lane lines;
+# warranted growth.
+# 890353 -> 890777: one safety rule on `github-issue-intake` encoding the
+# hardened lifecycle (confirmation requires a complete direction check plus
+# a completed duplicate search; any blocker stops confirmation and handoff
+# and cannot be cleared by a later observed result); one rule, not padding;
+# warranted growth.
+# 890777 -> 891138: the final template, security-redirect, privacy-projection,
+# authenticated-maintainer, and idempotent-handoff rules complete that same
+# workflow contract; one bounded workflow correction, not padding.
+# 891138 -> 899556: apple-design adds a concise platform brief and progressive
+# references; detailed production and library guidance stays out of the body.
+# 899556 -> 901000: `llm-app-dev` gains the public-board communication contract
+# -- one quality-bar rule naming the six action classes and the show-then-
+# approve step, one safety rule on authenticated-is-not-private and untrusted
+# peer approval, one final-checklist line, one recovery note on ambiguous
+# delivery, and the public-board clause in its use-when. The per-action
+# authority table, the approval record, the compaction/handoff rules, and the
+# anti-patterns live in the new on-demand `references/public-board.md` outside
+# this count; what is in the body is only what is wrong to discover after a
+# post has already been read; warranted growth.
+# 901000 -> 904072: the shared execution-wait discipline
+# (`EXECUTION_WAIT_DISCIPLINE_RULE`, one constant behind
+# `omh_execution_wait_strategy/v1`) is composed into the coding-handling harness
+# quality bar, the `ultrawork` and `loop` engines, and the command-operator
+# overlay, and the interjection-resume rule the six executing engines share now
+# names the armed wait instead of telling a run to say what it is waiting on.
+# It belongs in the SKILL.md body because choosing the wait strategy is a
+# decision made BEFORE the work starts: a rule discovered after a sleep/status
+# loop has already been invented is a rule that arrives one wasted model turn
+# per check too late. The capability ladder table, the terminal-state list, and
+# the schema pointer live in the on-demand `references/skill-common-rail.md`,
+# outside this budget; warranted growth.
+# 945164 -> 914399: the four issue workflows retain exact frontmatter and
+# triggers on demand, brief inputs/outputs, HOLD/authority/completion/recovery
+# and delegation fallback contracts, and real artifact CLI pointers in their
+# bodies. Their complete skill-specific contracts move to per-skill references;
+# shared rails remain referenced rather than copied.
+# 914399 -> 914611: `achievements` and `run-efficiency` name the supplied
+# `session_activity_receipt/v1` as an artifact expectation (issue #1404). One
+# bounded line each, in the SKILL.md body because it is an input the
+# workflow must ask for BEFORE it reports: without it "the skill was not used"
+# reads as a finding when nobody observed whether the skill was exposed, and
+# a missing counter reads as zero. The contract itself lives in
+# `docs/SESSION-ACTIVITY-RECEIPTS.md`, outside this budget; warranted growth.
+# 914611 -> 916671: `web-research` and `research` bind as-of claims to
+# `temporal_source_receipt/v1` (#1403): the receipt rule, the three-clock
+# quality-bar line, the as-of input, the receipt/surfaces output, and the
+# archive-gap recovery note on each lane. These belong in the SKILL.md
+# body because the choice between a live page and a historical capture is
+# made when the source is cited, not after; the field-level contract lives in
+# `docs/TEMPORAL-SOURCE-RECEIPTS.md`, outside this budget; warranted growth.
+# 916671 -> 917583: `frontend` gains the scroll-motion lane - seven English
+# scroll/parallax triggers, one quality-bar line, and one safety rule. These
+# belong in the SKILL.md body because taking a scroll library at all is
+# decided BEFORE the contract is written: a native-first rule discovered
+# after a smooth-scroll dependency has shipped arrives one dependency and
+# one reduced-motion regression too late. The decision order, the Lenis
+# source record, the integration obligations, and the documented
+# limitations live in `references/scroll-motion-libraries.md`, outside this
+# budget; warranted growth.
+# 917583 -> 919894: `external-connector-readiness` gains the memory-provider
+# lifecycle lane - twelve English lifecycle triggers, the
+# `memory_provider_posture/v1` output and artifact expectation, two completion
+# checklist lines, one recovery note, and three safety rules - and `memory-sync`
+# gains the two lines that keep provider posture `not_omh_reviewed` and send
+# lifecycle questions to readiness. These belong in the SKILL.md body
+# because the decision they guard is made BEFORE the provider is enabled: a
+# reversibility rule discovered after automatic writes have run arrives one
+# irreversible adoption too late. The field-level contract lives in
+# `src/workflows/memory_provider_posture.py`, outside this budget; warranted
+# growth.
+# 919894 -> 922941: `external-connector-readiness` binds realtime voice
+# adoption to `realtime_voice_trial_receipt/v1` (#1426) - the receipt and
+# verdict outputs, three safety rules, one checklist line, one recovery note,
+# and the English voice triggers - while `voice-input` and
+# `media-input` each state that their own record is never realtime voice
+# readiness. These belong in the SKILL.md body because the mistake they
+# prevent is made at routing time: a supplied recording or a terse spoken
+# request reads as voice evidence unless the lane says it is not, and a
+# connector that authenticated reads as ready unless the lane asks for turn
+# integrity first. The field-level contract lives in
+# `docs/REALTIME-VOICE-TRIAL-RECEIPTS.md`, outside this budget; warranted
+# growth.
+# 922941 -> 922941_PENDING: `img-summary` binds image results to
+# `visual_generation_receipt/v1` (#1425): two outputs, one artifact
+# expectation, three safety rules, and one quality-bar line separating
+# requested route from observed route. These belong in the SKILL.md body
+# because the overclaim happens at the moment the result is reported -- a
+# backend that accepts a requested model without attesting it makes a returned
+# file read as proof of that model, and a rule discovered afterwards arrives
+# after the claim. The field-level contract, the warning vocabulary, and the
+# legacy projection live in `docs/VISUAL-GENERATION-RECEIPTS.md`, outside this
+# budget; warranted growth.
+# 923796 -> 925045: `agent-board` gains the integrated native Kanban guidance -
+# the durable-versus-bounded-research choice, prepare-then-normal-tool-loop
+# order, the five request states, idempotent create and the two native
+# boundaries (issue #1417). These belong in the SKILL.md body because a
+# host that skips preparation or treats a prepared card as an observed native
+# result corrupts task evidence before any reference is opened; the operation
+# table and QA boundaries live in `docs/AGENT-BOARD.md`, outside this budget;
+# warranted growth.
+# 925045 -> 925059: model-setup's chain line moved to the 2026-09-11
+# chains (DeepSeek Flash (V4.1) in, the superseded generations out) and
+# gained the one-sentence rule that a chain names the current generation
+# of each line (net +14 chars); warranted growth.
+# 925059 -> 925264: `model-setup` names the three categories added on
+# 2026-09-11 (capable, simple-work, deep-work) in the same sentence that
+# already enumerates every other shipped chain. This belongs in the
+# SKILL.md body because that sentence IS the shipped-recommendation
+# enumeration the lane reads to a user choosing a category: one missing from
+# it reads as a category that does not exist. The chains themselves live in
+# the catalog, outside this budget; warranted growth.
+# 925264 -> 932859: the seven executing ULW engines gained two shared rules
+# from the Codex Desktop prompt review (follow-up authority triad,
+# closing-brief scaling with its required-closing-lines clause; +~500 chars
+# each across seven bars) and the shared interjection rule gained the
+# steering-not-objective sentence; harness discipline the engines read every
+# run, so it belongs in the SKILL.md body; warranted growth.
+# 932859 -> 934125: `maestro` gains the two rules that close the dispatch
+# lifecycle -- observe every unit to a terminal state via `omh coding fanout
+# status`, and treat a finished unit as an event to act on in the same turn
+# (verify, record, then recover or advance). These belong in the SKILL.md
+# body because both decisions are made while a worker is still running: a
+# supervisor that has already ended its turn on "waiting for the worker"
+# cannot be told afterwards that a live process with no new evidence was never
+# progress, and a completion already answered with a status report has already
+# left the result unverified. The state vocabulary and the reader that surfaces
+# an unacknowledged outcome live in `src/coding/unit_execution_state.py` and
+# `src/plugin_bundle/omh/dispatch_outcomes.py`, outside this budget; warranted
+# growth.
+# 934125 -> 934491: `model-setup` gained one recovery note for a provider
+# that serves only dated snapshot ids (`gpt-5.6-terra-2026-07-09`, reported
+# 2026-09-11): confirm the dated id as served, OMH reads the trailing date as
+# the base alias. The lane otherwise tells such a user their model is
+# unavailable, so the note belongs where the lane reads it; warranted growth.
+# Re-derived from the producer after this branch met the maestro entry above,
+# never by adding the two deltas.
+# 934491 -> 934924: `memory-new` gained a "retrieve instead" bullet
+# sending past-session history to Hermes' own session store rather than a
+# retained record. It belongs in the SKILL.md body because the lane
+# applies it at the moment of capture, which is the only moment the choice
+# exists; a record admitted here is context every later turn pays for;
+# warranted growth. Re-derived from the producer after this branch met the
+# dated-snapshot entry above, never by adding the two deltas.
+# 934924 -> 935543: `maestro`'s observe-to-terminal rule now names the roster's
+# own stop condition (`all_units_terminal`, `stuck_units`, the per-unit
+# `terminal` / `unit_state` pair) instead of leaving a supervisor to re-derive
+# it from lifecycle rungs, and adds the bound that keeps the poll loop itself
+# from becoming the stall: a unit with neither a marker nor a summary row reads
+# `unknown` forever, so a wall clock of its own decides when a missing record
+# is chased rather than waited on. Both belong in the SKILL.md body --
+# they are read on every poll, and a supervisor that has already ended its turn
+# cannot be told afterwards which field it should have read; warranted growth.
+# 935543 -> 935940: #1495 adds the explicit post-composition advisory scan
+# before unattended handoff, including confirmation/error routing and the
+# no-permission boundary. The dispatching lane must read this before handoff;
+# warranted body guidance, re-derived from the full-profile producer.
+# #1513 adds the MCP tool-name compatibility output and its metadata-only
+# artifact guidance to harness-session-inventory. This owner-approved growth
+# names the audit command and keeps config-only, unsupported and ambiguous
+# names from becoming invocation evidence; re-derived from the full-profile
+# skill_context_cost_payload() producer, not from accumulated deltas.
+# 953281 -> 953716: #1510 gives `loop` one recovery note naming the native
+# `omh_loop` tool, its eight lifecycle actions, and the `omh loop` fallback for
+# a host without the plugin. The lane reads it at the moment it chooses how to
+# reach loop state, before it spends a turn assembling shell arguments, so it
+# belongs in the SKILL.md body; warranted growth. Re-derived from the
+# full-profile skill_context_cost_payload() producer, never by adding deltas.
+# 953716 -> 953938: #1559 gives `memory-sync` one pointer to the source-recovery
+# procedure. The procedure itself is a reference file, measured outside this
+# budget, because recovering from one wrong source is rare and multi-step and no
+# ordinary interview should pay for it; only the pointer is charged here, and a
+# reference nothing points at is an orphan rather than a delivered note. The
+# budget had zero headroom, so the smallest reachable form still needs this
+# entry. Re-derived from the full-profile skill_context_cost_payload() producer.
+# 953938 -> 954701: #1574 hardens the evaluation lane on two skills. Two of the
+# three edits are reference files, measured outside this budget: the
+# corpus-hygiene checks in `llm-app-dev`'s `eval-harness.md` and the
+# judge-qualification procedure with its agreement thresholds in
+# `agent-evaluation`'s `self-evaluation-loops.md`. What is charged here is the
+# part a run cannot be told after it has already scored: `agent-evaluation`
+# gains the trajectory dimension, scored beside the outcome and never folded
+# into one total, so a run that reached the right answer with a search, an
+# approval, a tool, or a verification skipped or out of order scores lower on
+# it; and one safety rule saying that a judge with no agreement measured
+# against human labels is reported as unqualified rather than as a result,
+# which must be ungated because a judge is used while comparing executors and
+# the existing reference pointer fires only for self-evaluation. That body
+# carries +702 of the delta; the remaining +61 extends the `llm-app-dev`
+# pointer to name the hygiene checks, because a reference nothing points at is
+# an orphan rather than a delivered section. The budget had zero headroom.
+# Re-derived from the full-profile skill_context_cost_payload() producer,
+# never by adding deltas.
+#
+# 953938 -> 954233: #1581/#1582/#1583 add twelve trigger phrases across three
+# skills -- three overflow phrasings on `context-budget-review`, four English
+# and three Korean continuous-watch phrasings on `automation-blueprint` (the
+# Korean through its trigger pack), and two memory-provider comparison
+# phrasings on `external-connector-readiness`. Trigger lists render into the
+# SKILL.md body because that is where a lane states what it answers to,
+# and a phrase
+# the router scores but the body does not print is a lane nobody can tell you
+# how to reach. Each phrase is a wording the router previously missed, not a
+# restatement; warranted growth. Re-derived from the full-profile
+# skill_context_cost_payload() producer, never by adding the deltas.
+# Rebased onto #1574's 954701: the two deltas are independent, so the combined
+# value is re-derived here rather than either side's number being kept.
+# 953938 -> 963825: #1564 adds `application-threat-model`, the one new skill the
+# owner approved a ratchet for. Its nearest neighbour does not merely miss an
+# application threat-model request: `security-safety-review` emits
+# `threat_surface_map/v1` over the agent's own prompts, tools, and credentials,
+# so the request came back as a confident wrong artifact rather than a miss, in
+# the domain where that costs most. The body carries only what must hold whether
+# or not a reference is open -- the boundary against the sibling, the closed
+# decision vocabulary, the no-exploit-code rule, and the unverified-control
+# default. The derivation detail (the six STRIDE prompts per boundary, the
+# asset/loss table, the per-control test shapes) is
+# `skills/omh-application-threat-model/references/threat-model-method.md`,
+# measured outside this budget, and moving it cut the body by 532 chars. The
+# budget had zero headroom, so the smallest reachable form still needs this
+# entry. Re-derived from the full-profile skill_context_cost_payload() producer,
+# never by adding deltas.
+# 963825 -> 964022: the same issue gives `security-safety-review` the reciprocal
+# boundary. Without it the collision is closed in one direction only: the new
+# lane declines the agent surface, while the lane that owns the agent surface
+# would still answer an application request with `threat_surface_map/v1`.
+# 965080 -> 976281: #1563 adds `live-incident-response`, the skill that owns an
+# incident while it is still open. The catalog had the pieces spread across four
+# retrospective or release-shaped lanes and no live composite, so
+# `support-operations` handed an active outage to `reliability-review` -- a
+# postmortem lane -- while the outage was still running. The body carries only
+# what must hold whether or not a reference is open: the boundary against the
+# three siblings, the append-only timeline rule, the prepared-versus-observed
+# split for paging and customer sends, and the rule that recovery is an
+# observation of a named signal rather than a mitigation being applied. The
+# method detail (the severity ladder, the four roles, the three timeline entry
+# types and their fields, the communication ledger, handover and closing) is
+# `skills/omh-live-incident-response/references/incident-command-method.md`,
+# 6,192 bytes measured outside this budget. The remaining growth is the three
+# reciprocal `do_not_use_when` lines in `reliability-review`,
+# `support-operations`, and `deploy-and-monitor`, without which the collision is
+# closed in one direction only, plus the new lane name on the
+# automation_and_status skills' Workflow Lane lines. Re-derived from the
+# full-profile skill_context_cost_payload() producer, never by adding deltas.
+# 976281 -> 977002: three `Completion Checklist` lines and two `## First Steps`
+# headings, from one cause. `quality_bar` is a `SkillDefinition` field and
+# `_skill_metadata_block` renders every field it holds under
+# `## Catalog Metadata`, near the bottom of the body under a heading that tells
+# the reader the block is bookkeeping -- so a behavioural directive whose only
+# carrier is that field is reached, if at all, after the run it governs has
+# begun. `ultrawork` and `ralplan` had their todo-initialization there and
+# nothing anywhere else in either document; a real `ultrawork` run performed a
+# large task with the HUD checklist empty start to finish. Their directives
+# moved to the new `opening_steps` field (unchanged text, new section), and
+# each gained a checklist line so a run cannot read as complete while the plan
+# was never declared. Sweeping all 126 rendered bodies for `omh_*` directives
+# living only inside the metadata span then found the same shape twice more:
+# `ulw-maestro` is told to close with the localized `omh_run_summary` text with
+# a `Completion Checklist` silent about the close, and `ultrawork` is told to
+# route every Hermes-native lane with `omh_delegate_route` with a checklist
+# silent about routing -- so a run could omit the summary, or dispatch every
+# lane unrouted, and pass its own completion contract. Both are the two halves
+# of one user report ("declares no todo AND calls no agent"). Each is one line
+# restating an obligation the quality bar already carries; no new behavior text
+# anywhere. Re-derived from the full-profile skill_context_cost_payload()
+# producer, never by adding deltas.
+#
+# 976281 -> 976809: `context-budget-review` gains the one output, one artifact
+# expectation, and one quality bar that make a must-keep mismatch nameable
+# (#1572). A digest comparison could previously say only that something
+# changed, so the rule that a pack recording no classes reports the comparison
+# unavailable -- never zero items -- has to hold whether or not any reference is
+# open. Re-derived from the full-profile skill_context_cost_payload() producer,
+# never by adding deltas.
+# 976809 -> 977424: `automation-blueprint` gains the output and the one quality
+# bar that make "keep watching this for me" a choice among four surfaces rather
+# than whichever lane the sentence happened to reach (#1570). The body carries
+# only what must hold whether or not a reference is open: that one of cron,
+# heartbeat, loop, and native goal is recommended, that the other three are
+# named as rejected, and that a recommendation with no stop condition is not an
+# answer -- what ends each surface is the only thing separating them. The
+# comparison table, the four retry axes, and the silence rule are
+# `skills/omh-automation-blueprint/references/recurring-surface-choice.md`,
+# measured outside this budget. Re-derived from the full-profile
+# skill_context_cost_payload() producer, never by adding deltas.
+# 977424 -> 978537: `external-connector-readiness` gains the output, two safety
+# rules, and one quality bar that let a person compare memory providers on
+# their own material (#1573). It folds into this skill rather than a new one
+# because a provider is a connector with a declared posture and the
+# `connector_trial_manifest/v1` pattern already exists; a second trial shape
+# would drift from it. The body carries only what must hold whether or not a
+# reference is open: one corpus and one query set across candidates, a
+# dimension nobody measured reported as `not_observed` rather than zero, and a
+# rollback proven by running it. The trial procedure, the three dimensions and
+# their reporters, and the four migration steps are
+# `skills/omh-external-connector-readiness/references/memory-provider-trial.md`,
+# measured outside this budget. Re-derived from the full-profile
+# skill_context_cost_payload() producer, never by adding deltas.
+# 978537 -> 979647: `verification-gate` gains the output, the never-infer
+# safety rule, and the one quality bar that move a generated-path edit from
+# after the byte gate to before it (#1575). It folds here rather than becoming
+# a general engineering skill because a generic skill cannot know which files
+# are generated without a repo-declared map, and would pay a full SKILL.md
+# body for a filename heuristic. The body carries the asymmetry that makes the
+# heuristic wrong: a false positive redirects correct work, a miss costs one
+# regeneration, so a repository declaring no map reports `map_not_declared`.
+# The declaration sources, the five row fields, and the generator-plus-output
+# shape that is correct rather than a violation are
+# `skills/omh-verification-gate/references/generated-artifact-provenance.md`,
+# measured outside this budget. Re-derived from the full-profile
+# skill_context_cost_payload() producer, never by adding deltas.
+# 979647 -> 980275: `refactor-plan` gains one quality bar and one widened
+# reconnaissance line for dependency and framework upgrades (#1576). It folds
+# here because the phased plan, per-phase verification, rollback point, files
+# table, and approval gate are already this skill's, and an upgrade is a
+# boundary-changing refactor whose direction was decided upstream. The body
+# carries only the four inputs an upgrade adds and the rule that a breaking
+# change nobody checked is a gap rather than a pass; the advisory, licence,
+# migration-guide, and lockfile procedures are
+# `skills/omh-refactor-plan/references/dependency-upgrade.md`, measured outside
+# this budget. Re-derived from the full-profile skill_context_cost_payload()
+# producer, never by adding deltas.
+# 980275 -> 981506: `backend` gains `consumer_impact_and_sunset/v1`, its
+# artifact expectation, one safety rule, one quality bar, and one final
+# checklist row (#1577). It folds here because splitting a contract from its
+# evolution across two skills is how the response shape and the deprecation
+# window drift apart. The body carries the rule a reader must not have to open
+# a reference to reach: an empty consumer list claims the search was complete,
+# so an unenumerable set is reported as `consumers_not_enumerable` with what
+# was searched. The enumeration sources, the per-change breakage grades, and
+# the window/path/date rules are
+# `skills/omh-backend/references/consumer-impact.md`, measured outside this
+# budget. Re-derived from the full-profile skill_context_cost_payload()
+# producer, never by adding deltas.
+# 981506 -> 982500: `security-safety-review` gains the output, its artifact
+# expectation, one safety rule, and one quality bar for replacing a live
+# credential (#1578). It folds here because the finding already lives in this
+# skill and the procedural scope is too narrow for a body ratchet of its own.
+# The body carries the two rules a reader must not have to open a reference to
+# reach: the five-step order, and that revocation is proven by a call that
+# fails with the old credential rather than by the revoke command's exit
+# status, which reports only that the request was accepted. The overlap
+# window, the what-breaks table, and the per-credential-type steps are
+# `skills/omh-security-safety-review/references/credential-rotation.md`,
+# measured outside this budget. Re-derived from the full-profile
+# skill_context_cost_payload() producer, never by adding deltas.
+# 982500 -> 983557: `legal-compliance-review` gains the redline output mode --
+# one artifact expectation, one safety rule, one quality bar -- plus the
+# triggers, which also reach the router's workflow registry (#1579). It folds
+# here because the authority-citation and counsel-hold machinery is what makes
+# a redline preparable at all, and duplicating it is how the two would drift.
+# The body carries the boundary that makes it foldable: proposed language is
+# preparation material for the person who will negotiate, never advice about
+# whether to accept a term, and an open counsel hold blocks a row rather than
+# producing a proposal. The row fields, the requires-a-playbook rule, and the
+# concession-order linkages are
+# `skills/omh-legal-compliance-review/references/negotiation-preparation.md`,
+# measured outside this budget. Re-derived from the full-profile
+# skill_context_cost_payload() producer, never by adding deltas.
+# 983557 -> 984191: `strategy-brief` gains one quality bar and one
+# `do_not_use_when` line for resourcing decisions (#1580). The framework was
+# already here -- options, tradeoffs, recommendation, decision note -- and the
+# failure was that the two sides were compared without either being a number,
+# so the body carries only the quantify-in-one-unit rule and the lag rule (a
+# gap that exists this quarter is not closed by a hire that ramps next
+# quarter). The worked figures, the three priced options, and the
+# unplanned-work caveat are `skills/omh-decide/references/capacity-planning.md`,
+# measured outside this budget. Re-derived from the full-profile
+# skill_context_cost_payload() producer, never by adding deltas.
+# 984912 -> 991599: `todo-checklist` (#1642). `omh_todo` is registered on every
+# session and no skill named it, so a user looking for `/omh-todo` found
+# nothing and only the two delivery engines mentioned the tool at all. The
+# SKILL.md body carries only what is wrong to discover late -- items are
+# declarations and never execution evidence, exactly one item active, and
+# `action=set` replaces the whole list so a partial write silently drops the
+# items left out. The shaping rules, the `blocked_reason` versus
+# `deferred_reason` distinction, and the when-not-to-declare guidance are in
+# `skills/omh-todo-checklist/references/checklist-discipline.md`, which loads on
+# demand and is counted outside this budget. Re-derived from the producer.
+# 991599 -> 991791: `ultrawork` gains one clause on its dependency-topology
+# quality bar pointing a lane that must outlive the session at
+# `references/kanban-lane.md`, and `agent-board` gains one `do_not_use_when`
+# line handing a multi-lane implementation back to `ultrawork`. The body
+# carries only the pointer and the boundary; the board create recipe, the
+# main-session-only rule, the readback discipline, the provenance words, and
+# the role table are `skills/ulw-work/references/kanban-lane.md`, measured
+# outside this budget. Re-derived from the full-profile
+# skill_context_cost_payload() producer, never by adding deltas.
+# 991791 -> 992659: the three sibling engines learn the board lane on the same
+# substrate, one quality-bar clause each (2026-09-17). `loop` gains the
+# pointer at `skills/ulw-loop/references/board-iteration.md` for an iteration
+# that must outlive the session, `ultraqa` the pointer at
+# `skills/ulw-qa/references/board-fanin.md` for a probe that must run in
+# Hermes-owned isolation, and `ralplan` the rule that the accepted plan lists
+# every lane in node-prompt shape with `depends_on`, so `ultrawork` can prepare
+# board rows from it without re-planning. The bodies carry only the pointers
+# and the lane shape; the builder/verifier chain, the `needs_input` stop rule,
+# the resume readback, the probe rows, the single fixer fan-in, and the
+# review-lane re-verification are in the two references, measured outside this
+# budget. Re-derived from the full-profile skill_context_cost_payload()
+# producer, never by adding deltas.
+# 992659 -> 978380: three strict-subset skills retire into a stronger sibling
+# (#1691). `performance-goal` folds into `ultraperf`, `best-practice-research`
+# into `web-research`, and `autoresearch-goal` into `research`; each target
+# already produced the retired skill's outputs and more, so the pair was two
+# SKILL.md bodies for one job. The retirement is an exposure change, not
+# a deletion: the contracts survive as workflow references and their triggers
+# fold into the target homes, which is why the fall is smaller than the three
+# bodies. This is a ratchet DOWN -- the budget was at 100% of its limit and
+# nothing could be added without a raise. Re-derived from the full-profile
+# skill_context_cost_payload() producer, never by subtracting the three body
+# sizes by hand.
+# 978380 -> 979758: seven existing skills gain one body pointer each at a new
+# reference file carrying a mechanism the body previously lacked (#1714).
+# `verification-gate` gains the requirement-to-task-to-evidence coverage map,
+# `deep-interview` the scored ambiguity taxonomy with its write-back target,
+# `ultrawork` the file-ownership manifest, `code-review` the five separately
+# run review lenses, `todo-checklist` the requirements-quality checklist with
+# its generator-may-not-tick rule, `ai-slop-cleaner` the prose lexicon, and
+# `plan` the project constitution. Every mechanism itself lives in
+# `skills/<name>/references/*.md`, measured outside this budget; what is paid
+# here is seven pointer lines saying when to open one. The `ultrawork` pointer
+# is deliberately the shortest of the seven: that body had 89 bytes of
+# per-skill headroom under STRUCTURE_LINT_SKILL_BODY_BYTE_CEILING, and
+# shortening one pointer was the cheaper move against raising a second
+# ratchet. Still below the pre-#1691 level of 992659. Re-derived from the
+# full-profile skill_context_cost_payload() producer, never by adding deltas.
+# 979758 -> 977649: fourteen skills the catalog declares no primary harness
+# for stop rendering one (#1690). Each paid about 150 bytes for a "Preferred
+# harness for this skill: `coding-handling`" line plus an `omh runtime record
+# --harness coding-handling` command nobody chose -- the renderer read the
+# routing fallback and wrote a coding handoff into the SKILL.md body of
+# skills that do no coding. This is a ratchet DOWN, and the budget stood at
+# 100% of its limit again, so it has to move for the saving to be real.
+# Re-derived from the full-profile skill_context_cost_payload() producer,
+# never by subtracting fourteen line lengths by hand.
+# 977649 -> 977846: `todo-checklist` names `action=advance` in its
+# quality bar and its recovery note, and its reference describes the
+# single-item write #1730 added. The sentence those lines replace -- "there is
+# no partial update" -- was true when written and is not now, and it is the
+# sentence that made a session re-send a ten-item list to tick one item. The
+# guard, the refusals, and the byte-equality with `action=set` live in
+# `skills/omh-todo-checklist/references/checklist-discipline.md`, measured
+# outside this budget, alongside the requirements-quality checklist #1714 put
+# there. Re-derived from the full-profile skill_context_cost_payload()
+# producer, never by adding deltas.
+# 977846 -> 977970: six trigger phrases and one replacement (#1688). Once a
+# one-word skill name stopped being credited four times over for a single
+# occurrence, the three sentences that had been carried by that inflation
+# needed the phrasing a person actually types: `plan` gains "make a plan",
+# "write a plan", and "write the plan"; `frontend` gains the locative "in /
+# on / to the frontend"; and `deep-interview` trades its bare `interview`
+# trigger -- every hiring loop and user study in the language -- for
+# "interview me". A raise, because the alternative was leaving three shipped
+# lanes reachable only through a scoring defect. Re-derived from the
+# full-profile skill_context_cost_payload() producer, never by counting the
+# added phrases by hand.
+# 977970 -> 977984: one trigger phrase (#1689). `live-incident-response`
+# carried "open incident" but not "incident open", the order people say it
+# in -- "we have an incident open right now" matched nothing it owns and the
+# sentence went to a browser lane. Fourteen characters for a shipped skill to
+# reach its own home turf. Re-derived from the full-profile
+# skill_context_cost_payload() producer.
+# 977984 -> 978520: one body section on `wiki`. The three artifacts that close
+# a long piece of work -- deep guide, ELI5 pass, quiz -- had no owner, and the
+# guidance itself is a reference file, which costs this budget nothing because
+# references load on demand. What is paid for here is the pointer alone: the
+# SKILL.md body has to say the three exist, name the level they share
+# with `paper-learning`, and name the one source that outlives the session --
+# the plan record -- or nothing ever reaches the reference. That last clause
+# is why the section is not shorter: only the plan record is persisted, so a
+# pointer saying "assemble from the records" without saying which would send
+# a writer looking for three stores that do not exist. Re-derived from the
+# full-profile skill_context_cost_payload() producer.
+# 978520 -> 978906: one 383-character quality-bar line on `ultraqa`. The
+# manual test guide -- the artifact written when a check cannot be automated
+# and a person has to try it by hand -- had no owner outside rendered
+# surfaces, which `visual-qa` scopes itself to. The guidance is a reference
+# file and costs this budget nothing; the pointer is the whole bill.
+#
+# What each clause buys, because a ratchet that records only that a line was
+# added is a ratchet nobody can re-examine. `prepared_not_observed` and
+# `visual-qa` are the two a reader needs WITHOUT opening the page: without
+# the first a writer reaches the reference believing the guide closes the
+# check it describes, and without the second they write one for a surface
+# `visual-qa` already owns. `observed_check_results/v1` names what a run has
+# to record instead, and replaced an enumeration of that row's fields -- the
+# page quotes the gate's own declaration now, so neither surface restates it.
+# The step shape and the four reasons are what makes the page worth opening
+# at all, and the phase id is how a `code-story` run finds it. A first draft
+# spelled the row's fields out and ran 469; this is that draft with the
+# restatement removed. Re-derived from the full-profile
+# skill_context_cost_payload() producer.
+# 978906 -> 979184: one quality-bar line on `todo-checklist`. The last phase
+# of a code story -- landing the change and reporting it -- had no owner, and
+# the skill holding the only durable record of what the story declared is the
+# one that can answer for it. The guidance is a reference file and costs this
+# budget nothing. What is paid for here is a pointer carrying three claims
+# rather than a name, because each is the thing a closer gets wrong: `done`
+# is a declaration, a `done` phase with a `blocked_reason` was skipped, and
+# OMH never sees the change land. A pointer reading "load the closing
+# reference" would be shorter and would let a close report be written without
+# ever opening it.
+#
+# The line costs 320 and the net is 278, because the same change also
+# REMOVED two trigger phrases from that skill's routing-signals line. They
+# were a chat trigger for closing a story, withdrawn after measurement:
+# `close the story` matches inside "close the story book", so the phrases
+# named this skill on prose while still missing four of the six natural
+# phrasings of the real request. Re-derived from the full-profile
+# skill_context_cost_payload() producer, which is why the step is 278 and
+# not the 320 the added line weighs. The step is what this entry owns:
+# rebasing past `ultraqa`'s raise moved both endpoints and left 278 alone.
+# 979184 -> 999772: every generated workflow skill's Runtime Evidence tail
+# gained one sentence beside its stop condition -- a stop or a decision the
+# user owns ends the turn by offering the next action as a question, never
+# by declaring what will not be done -- and the seven executing engines
+# carry the reworded follow-up authority and closing brief rules. The model
+# had been closing runs with "I will not merge or force-push here"; the
+# sentence is read at the stop, so it belongs in the SKILL.md body and
+# not in a reference. Re-derived from the full-profile producer.
+# 999772 -> 1000101: the Claude Opus 5.5 / GPT-6 Luna onboarding (2026-09-23).
+# Three bodies move and nothing else: `model-setup` names the new chain
+# members and lists Opus 5 and GPT-5.6 Luna among the superseded generations
+# a machine-level override keeps (+26); `model-optimization` replaces the
+# pre-2026-09-11 "existing entries stay as fall-through" rule with the
+# superseded-generation rule docs/MODEL-ONBOARDING.md already states, and
+# names four source labels where it named two (+141); `maestro` gains the
+# Claude Code `opus` alias caveat -- the version floor for Opus 5.5 and the
+# Foundry resolution to Opus 4.6, both from code.claude.com/docs/en/model-config
+# -- because that alias is the one the Maestro lane ships (+162). The three
+# add to 329, and the step is 329 because the raise above it left no unused
+# room. Re-derived from the full-profile skill_context_cost_payload() producer
+# after rebasing past that raise.
+# 1000101 -> 1029434: the tail sentence on every generated skill now also says
+# the reply is written in the user's own words and the host's own voice, with
+# OMH's record terms (surface, lane, wrapper, handoff, evidence boundary,
+# not_observed) kept to records and tool calls. Users were reading OMH's
+# internal vocabulary back in Hermes replies ("this is an evidence-bounded
+# surface"), and the host's SOUL.md, not a skill, owns the voice. The sentence
+# is read where the reply is written, so it stays in the SKILL.md body;
+# the substitution table lives in the rail reference, outside this budget.
+# Re-derived from the full-profile producer after rebasing past the
+# onboarding raise.
+# 1029434 -> 1029426: the GPT-6 Sol onboarding (2026-09-23). One body moves:
+# `model-setup` names GPT-6 Sol at the head of `deep` and in the shared final
+# order, lists GPT-5.6 Sol and GPT-5.6 Terra among the superseded generations
+# where it said "GPT-5.6 Sol behind Astra", and its dated-snapshot example
+# names a shape on a shipped base instead of a Terra id no chain names any
+# more (-8). The ratchet follows it down. Re-derived from the full-profile
+# skill_context_cost_payload() producer; skill_structure_lint_payload()
+# reports ok with no violation.
+# 1029426 -> 1029724: one body moves, `verification-gate` (#1788). It declared
+# `observed_check_results/v1` twice in its own body and the two disagreed: a
+# quality-bar line asking for command/source, freshness, exit status and scope,
+# and an artifact expectation asking for command, timestamp/source, exit
+# status, summary and a stale-output flag. Nothing could fail, because nothing
+# was derived; a consumer recorded whichever copy it happened to read and the
+# field that went missing was freshness, which is the gate's own guard against
+# reporting a stale output as evidence. The expectation now renders from
+# `src/evidence/observed_check_results.py` with a gloss on each field a reader
+# cannot infer (+207), and the quality-bar line points at it rather than
+# listing the fields a second time (+91). The glosses are what buys the second
+# half: a reader who meets `scope` as a bare word records the word, and the
+# whole failure this closes is consumers recording names they could not read.
+# Re-derived from the full-profile skill_context_cost_payload() producer;
+# skill_structure_lint_payload() reports ok, the body at 9207 of the 26800
+# per-skill byte ceiling.
+# What this limit is: the install footprint of the full profile's SKILL.md
+# bodies, each loaded on demand. Until 1044180 it was a zero-slack ratchet;
+# the last entry below turns it into a ceiling with headroom. Hermes sends a
+# skill's index line on every request (`SKILL_INDEX_CHAR_LIMIT` above) and
+# its body only when the model loads it -- about 8k chars per load, and a
+# loaded body stays in history until compaction.
+# 1029724 -> 1044180: six compact `jev-*` bodies (the contract, preset
+# tables, and shared rail are references outside this budget), one deference
+# line each on `ask` and `strategy-brief` (installed as `omh-decide`), and the
+# lane-mate "+N more" counts the six moved. Each Jev body carries the reply
+# rule every workflow body carries. Re-derived from the full-profile
+# skill_context_cost_payload() producer after rebasing past the GPT-6 Sol
+# onboarding, the per-turn budget split (#1843), and the
+# observed_check_results declaration (#1788).
+#
+# 1044180 -> 1150000: the limit stops being a zero-slack ratchet and becomes
+# an install-footprint CEILING with standing headroom (P5 of the 2026-09-23
+# skill-budget study). Every entry above is a commit that raised this number
+# to exactly the value the producer measured, so each new skill failed CI
+# until someone did; and the number cannot see a per-turn regression, because
+# a body is paid per load, not per request. The per-request budgets above
+# (`SKILL_INDEX_CHAR_LIMIT`, `SKILL_INDEX_LINE_CHAR_LIMIT`,
+# `PLUGIN_TOOL_SCHEMA_CHAR_LIMIT`, `PRE_LLM_CALL_CONTEXT_CHAR_LIMIT`, and
+# since the awareness section `PRE_LLM_CALL_CONTEXT_FALLBACK_CHAR_LIMIT`) stay
+# zero-slack ratchets and are what catch per-turn growth; they held through a
+# real skill addition (#1844, six `jev-*` skills) before this change. What a
+# single load costs stays bounded per skill by
+# STRUCTURE_LINT_SKILL_BODY_BYTE_CEILING (src/skills/structure_lint.py), and
+# repeated text across bodies is bounded by its own ceiling below.
+#
+# Headroom policy: the ceiling is the producer-measured total at the time it
+# was set (`FULL_PROFILE_SKILL_BODY_MEASURED_CHARS`) plus
+# `FULL_PROFILE_SKILL_BODY_HEADROOM_PERCENT`, rounded UP to the next multiple
+# of `FULL_PROFILE_SKILL_BODY_CEILING_STEP_CHARS`. `tests/test_efficiency.py`
+# fails when the literal below is not that derivation. Why 10%: measured on
+# 2026-09-24 the full profile is 130 bodies averaging 8,032 chars, and the
+# largest additions this ledger records are about 14k -- the six `jev-*`
+# bodies together (+14,456) and `live-incident-response` alone (about
+# +12.5k). The resulting 105,820 chars hold about thirteen average bodies, so
+# an ordinary skill does not need a raise, while a runaway pack -- twenty
+# generated bodies, or one long section pasted into every body -- still
+# fails. When it fails: re-measure with the full-profile
+# skill_context_cost_payload() producer, set the measured constant to that
+# value, apply the same policy, and write the reason here as one more
+# `old -> new` line. Never raise the literal without moving the measurement.
+# The measurement must come from the producer on the commit that sets it,
+# and `tests/test_efficiency.py` holds it as a floor: the test fails when the
+# producer reads below it, so an inflated measurement is visible and a change
+# that shrinks the pack re-measures and re-derives in the same commit.
+# 1044180 -> 1044170 (measured; the ceiling stays 1150000): the setup and
+# execution guidance rewrite (#1842) shortens five bodies -- maestro,
+# morning-brief, parallel-tools, ultrawork, websearch-setup -- by ten chars
+# net. The floor moves with the producer so later growth is measured from
+# here rather than from a number the pack no longer reaches.
+# 1044170 -> 1129901 (measured; the ceiling 1150000 -> 1250000): the new
+# `security-event-response`, `release-cut`, `agent-instructions`,
+# `iac-change` and `data-pipelines` bodies (#1694, #1693, #1713, #1566,
+# #1565) and their lane siblings' member lists took the pack to 1,129,901,
+# where `test_one_more_ordinary_lane_member_fits_every_body_budget` found
+# that the largest lane-mate copy (`ultrawork`, +26,322) no longer fits.
+# 1,129,901 plus 10%, rounded up to the next 50,000, is 1,250,000.
+# 1129901 -> 1225209 (measured; the ceiling 1250000 -> 1350000): stacked on
+# the research citation-ledger bodies (#2104, +9,204 over 2a8d3bca8) and the
+# review-contract bodies (#2105, +4,311), the first commit of the operator
+# skills' own Do-Not-Use and native-gate notes (#2106, c5a2c26a2, +8,374)
+# took the pack to 1,225,209, where
+# `test_one_more_ordinary_lane_member_fits_every_body_budget` found that the
+# largest lane-mate copy (`ultrawork`, +26,353) no longer fits. 1,225,209
+# plus 10%, rounded up to the next 50,000, is 1,350,000. That change's two
+# review commits added +1,749 and +940, so its merge (d56aa8e7a) reads
+# 1,227,898, above this measurement; the measurement was not re-taken there,
+# because a floor the producer reads above fires neither re-derive signal.
+# 1225209 -> 1325789 (measured; the ceiling 1350000 -> 1500000): main
+# 32878e25d reads 1,321,653, and the Vietnamese trigger pack (#2182) adds
+# 4,136 across the twenty routing-signal lines it joins, which took the pack
+# to 1,325,789, where `test_one_more_ordinary_lane_member_fits_every_body_budget`
+# found that the largest lane-mate copy (`ultrawork`, +26,506) no longer fits.
+# 1,325,789 plus 10%, rounded up to the next 50,000, is 1,500,000.
+# 1325789 -> 1325671 (measured; the ceiling stays 1500000): the #2187 review
+# drops three `vi` phrases that another skill wins on main too, 118 chars.
+# 1325671 -> 1336920 (measured; the ceiling stays 1500000): the new `dag-ulw`
+# body (+11,249), merged over the Vietnamese pack. Its own measurement on
+# 32878e25d (1,332,345) and this pack's (1,325,671) each raised the ceiling to
+# 1,500,000; together they read 1,336,920, whose 10% still rounds to it.
+FULL_PROFILE_SKILL_BODY_MEASURED_CHARS = 1336920
+FULL_PROFILE_SKILL_BODY_HEADROOM_PERCENT = 10
+FULL_PROFILE_SKILL_BODY_CEILING_STEP_CHARS = 50000
+FULL_PROFILE_SKILL_BODY_CHAR_LIMIT = 1500000
+FULL_PROFILE_SKILL_BODY_REVIEWED_EXCEPTION_CHARS = 0
+# Repeated bytes: characters of full-profile SKILL.md `##` sections that are
+# byte-identical to the same section in another skill -- the second and later
+# copies, the `repeated` figure the full-profile skill_context_cost_payload()
+# producer reports (`src/skills/context_cost.py`). Shared text belongs once in
+# a reference; every copy in a body is paid on every load of that body.
+# Measured on 2026-09-24: 104,214 of 1,044,180 chars (9.98%). Across the #1844
+# merge (d326252b^1 -> d326252b) the six `jev-*` skills moved it by +3,190.
+#
+# Why this is a ceiling and not a zero-slack ratchet: nearly all of these
+# bytes are rail sections the renderer stamps on every body from shared
+# inputs -- `## Workflow Lane` (one body per lane), and the shared lines of
+# `## Completion Checklist`, `## Recovery Notes`, `## Do Not Use When`, and
+# `## Runtime Evidence`. A new skill that joins an existing lane carries its
+# own copy and its author cannot avoid it: rendering a copy of every ordinary
+# catalog member (no artifact contracts, no progressive disclosure) with its
+# skill-specific sections made unique adds a median of about 1,370 repeated
+# chars and at most about 2,580 (re-read from the producer for the C2
+# loadable-names change). A zero-slack figure would have made every new skill
+# raise this constant, which is the churn the footprint ceiling above
+# removes. So it takes the same policy: the measurement plus
+# `FULL_PROFILE_SKILL_BODY_HEADROOM_PERCENT`, rounded UP to the next multiple
+# of `FULL_PROFILE_SKILL_BODY_REPEATED_CEILING_STEP_CHARS` (10,000, about a
+# tenth of the measurement). On that tree the producer reads 112,977; with
+# `data-share-review` and `spend-gate` added it reads 113,986, so the 6,014
+# chars left under 120,000 hold about four median lane members, while a
+# renderer change that stamps one more shared sentence longer than about 41
+# chars into every one of the 144 bodies, or a few skills that copy other
+# skills' own sections, still fails.
+#
+# The measurement is also a floor: `tests/test_per_turn_budgets.py` fails when
+# the producer reads below `FULL_PROFILE_SKILL_BODY_REPEATED_MEASURED_CHARS`,
+# so a change that moves repeated text into references lowers the measurement
+# and re-derives the ceiling in the same commit, and the slack it frees is not
+# left to be spent later without review. The same test fails when one more
+# worst-case ordinary member would not fit, which is the signal to re-measure
+# and re-derive before the next skill needs a raise. Re-derive it the same way
+# as the footprint and record the reason as one more `old -> new` line.
+# `src/skills/duplicate_content.py` is not the producer: it reports repeats
+# ACROSS surface kinds (primer, router snippet, body, reference), and today
+# carries none that are not allowlisted.
+# 120,000 -> 130,000: the reply rule on every body's tail now says the host
+# persona owns the reply language, tone, speech level, and sentence endings,
+# progress updates included, with the user's language only where the persona
+# sets none (miku, 2026-09-30: 13 of 17 interim lines in English). Measured
+# 117,742; one worst-case ordinary lane member (+2,547) no longer fit under
+# 120,000, which is the re-derive signal above. 117,742 plus 10%, rounded up
+# to the next 10,000, is 130,000.
+# 130,000 -> 130,000 (measurement 117,742 -> 117,463): `plan` now carries
+# its own completion checklist (the planning default plus a `Review Focus`
+# line, #2049), so that section is no longer byte-identical to another
+# skill's. 117,463 plus 10%, rounded up to the next 10,000, is still 130,000.
+# 130,000 -> 130,000 (measurement 117,463 -> 116,542): `web-research`,
+# `research-brief`, and `research` now carry their own completion checklists
+# (the research default plus a line naming the citation check), so that
+# section is no longer byte-identical to another skill's in those three
+# bodies. 116,542 plus 10%, rounded up to the next 10,000, is still 130,000.
+# 130,000 -> 130,000 (measurement 116,542 -> 114,677): six feature-surface
+# operator skills state their own Do-Not-Use instead of the shape's three
+# shared lines, and `github-event-ops` carries its own recovery notes, so
+# those sections are no longer byte-identical to another skill's. 114,677
+# plus 10%, rounded up to the next 10,000, is still 130,000.
+# 130,000 -> 130,000 (measurement 114,677 -> 114,094): `deliverable-package`
+# states its own Do-Not-Use instead of the feature-surface shape's three
+# shared lines, and `ultraqa` its own instead of the catalog's two fallback
+# lines, so neither section is byte-identical to another skill's any more.
+# 114,094 plus 10%, rounded up to the next 10,000, is still 130,000.
+# 130,000 -> 130,000 (measurement 114,094 -> 111,593): `run-efficiency`,
+# `ops-observability-card`, and `toolbelt-readiness` state their own
+# Do-Not-Use instead of the feature-surface shape's three shared lines, and
+# `cancel` and `skill` carry their own Why, Do-Not-Use, examples, checklist,
+# and recovery notes instead of the operator defaults, so those sections are
+# no longer byte-identical to another skill's. 111,593 plus 10%, rounded up to
+# the next 10,000, is still 130,000.
+# 130,000 -> 120,000 (measurement 111,593 -> 109,048): seven more
+# feature-surface skills (`memory-sync`, `external-connector-readiness`,
+# `prompt-import-readiness`, `instinct-ledger`, `skill-scout`, `skill-health`,
+# `workflow-learning`) state their own Do-Not-Use instead of the shape's three
+# shared lines, so those sections are no longer byte-identical to another
+# skill's. 109,048 plus 10%, rounded up to the next 10,000, is 120,000.
+# 120,000 -> 120,000 (measurement 109,048 -> 108,465): every byte of the drop
+# is `## Do Not Use When`. `wiki` and `content-operator` each gained a line
+# handing one request to the Hermes-bundled skill that shares its job, so
+# their sections stop being copies of a shared boundary, and `plan`'s, which
+# only `wiki`'s matched, stops having a twin. 108,465 plus 10%, rounded up
+# to the next 10,000, is still 120,000.
+# 120,000 -> 120,000 (reading 108,465 -> 112,977; the measurement stays
+# 108,465): the router skill's reference pointers in the shared
+# `## Workflow Lane`, `## Runtime Evidence`, and `## Structural Code Search`
+# sections became `skill_view(name='omh-routing', file_path=...)` calls
+# (b2e27ad1b, #2116), longer in every copy: +3,968, +512, and +32. The
+# reading sits above the floor and one worst-case ordinary lane member still
+# fits under 120,000, so neither re-derive signal fired and the measurement
+# was not moved. `data-share-review` (#2118, +497) and `spend-gate` (#2121,
+# +512) then took the reading to 113,986.
+# Three compact science bodies and their shared lane/evidence rails cross the
+# ceiling: reading 122343; plus 10%, rounded up to 10000, derives 140000.
+FULL_PROFILE_SKILL_BODY_REPEATED_MEASURED_CHARS = 122343
+FULL_PROFILE_SKILL_BODY_REPEATED_CEILING_STEP_CHARS = 10000
+FULL_PROFILE_SKILL_BODY_REPEATED_CHAR_LIMIT = 140000
+
+
+@dataclass(frozen=True)
+class ReleaseSelection:
+    channel: str
+    version: str
+    package_url: str
+    source_label: str
+    artifact_kind: str = "repository-archive"
+
+
+def release_tag_for(version: str) -> str:
+    return version if version.startswith("v") else f"v{version}"
+
+
+def release_wheel_name(release_version: str) -> str:
+    return f"oh_my_hermes-{release_version}-py3-none-any.whl"
+
+
+def repository_archive_url(tag: str) -> str:
+    return f"{REPOSITORY_ARCHIVE_ROOT}/tags/{tag}.zip"
+
+
+def package_url_for(channel: str, version: str = "", package_url: str = "") -> ReleaseSelection:
+    if channel not in RELEASE_CHANNELS:
+        raise ValueError(f"unsupported release channel: {channel}")
+    if package_url:
+        return ReleaseSelection(channel, version, package_url, "custom-url", "custom-url")
+    if channel == "stable":
+        if not version:
+            raise ValueError("stable channel requires --version or OMH_VERSION")
+        tag = release_tag_for(version)
+        release_version = tag[1:]
+        if RELEASE_WHEEL_VERSION_RE.fullmatch(release_version):
+            wheel_url = f"{RELEASE_ASSET_ROOT}/{tag}/{release_wheel_name(release_version)}"
+            return ReleaseSelection(channel, version, wheel_url, tag, "release-wheel")
+        return ReleaseSelection(channel, version, repository_archive_url(tag), tag, "repository-archive")
+    if channel == "preview":
+        # Preview tracks branch `main`, and GitHub publishes release assets per
+        # tag only, so there is no slim artifact to point at here. The branch
+        # archive stays, labelled with what it costs, rather than inventing an
+        # endpoint the release workflow does not produce.
+        return ReleaseSelection(channel, version, f"{REPOSITORY_ARCHIVE_ROOT}/heads/main.zip", "main", "repository-archive")
+    return ReleaseSelection(channel, version, "local", "local", "local")
+
+
+REPOSITORY_URL = "https://github.com/rlaope/oh-my-hermes"
+COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def release_from_direct_url(record: object) -> ReleaseSelection | None:
+    """The release an installed distribution came from, read from its PEP 610 record.
+
+    pip and uv write `direct_url.json` beside the package they installed from
+    a URL, naming exactly what they fetched. The curl and PowerShell
+    installers, a SHA-pinned archive, and `pip`/`uv tool install git+...` all
+    leave one, so `omh setup` can record the artifact that is actually
+    installed instead of a channel nobody asked for.
+
+    Only this repository's own artifact shapes are recognized, each mapped
+    by what it is: a release wheel or tag archive is `stable`, the `main`
+    archive or a commit is `preview` (an unreleased revision, which is what
+    `omh update` on preview tracks). Anything else, a local file, a fork, a
+    mirror, returns None rather than a guessed channel.
+    """
+    if not isinstance(record, dict):
+        return None
+    url = str(record.get("url") or "")
+    vcs = record.get("vcs_info")
+    if isinstance(vcs, dict):
+        commit = str(vcs.get("commit_id") or "")
+        if vcs.get("vcs") != "git" or url.removesuffix(".git") != REPOSITORY_URL or not COMMIT_SHA_RE.fullmatch(commit):
+            return None
+        requested = str(vcs.get("requested_revision") or "")
+        if requested.startswith("v") and RELEASE_WHEEL_VERSION_RE.fullmatch(requested[1:]):
+            return ReleaseSelection("stable", requested[1:], f"git+{url}@{requested}", requested, "git")
+        return ReleaseSelection("preview", "", f"git+{url}@{commit}", commit, "git")
+    if not isinstance(record.get("archive_info"), dict):
+        return None
+    tag, _, wheel = url.removeprefix(f"{RELEASE_ASSET_ROOT}/").partition("/")
+    if url.startswith(f"{RELEASE_ASSET_ROOT}/") and tag.startswith("v") and wheel == release_wheel_name(tag[1:]):
+        return ReleaseSelection("stable", tag[1:], url, tag, "release-wheel")
+    tag = url.removeprefix(f"{REPOSITORY_ARCHIVE_ROOT}/tags/").removesuffix(".zip")
+    if url == repository_archive_url(tag) and tag.startswith("v") and "/" not in tag:
+        return ReleaseSelection("stable", tag[1:], url, tag, "repository-archive")
+    if url == f"{REPOSITORY_ARCHIVE_ROOT}/heads/main.zip":
+        return ReleaseSelection("preview", "", url, "main", "repository-archive")
+    commit = url.removeprefix(f"{REPOSITORY_URL}/archive/").removesuffix(".zip")
+    if url == f"{REPOSITORY_URL}/archive/{commit}.zip" and COMMIT_SHA_RE.fullmatch(commit):
+        return ReleaseSelection("preview", "", url, commit, "repository-archive")
+    return None
+
+
+def release_artifact_note(selection: ReleaseSelection) -> str:
+    """Say what the resolved artifact is and what downloading it costs."""
+    if selection.artifact_kind == "release-wheel":
+        return f"release wheel, {RELEASE_WHEEL_APPROX_SIZE}"
+    if selection.artifact_kind == "repository-archive":
+        return (
+            f"full repository archive, {RELEASE_ARCHIVE_APPROX_SIZE} "
+            "including assets, tests, and site; this download can take minutes"
+        )
+    return ""
+
+
+def missing_release_asset_hint(selection: ReleaseSelection) -> str:
+    """Name the fallback when a stable version has no published wheel asset.
+
+    Releases before the wheel-publishing workflow existed carry no asset, and
+    v1.0.3 through v1.0.5 carry none either. pip reports those as a bare 404
+    against a URL nobody typed, so the failure has to name the archive that
+    does exist for the same tag.
+    """
+    if selection.artifact_kind != "release-wheel":
+        return ""
+    tag = selection.source_label
+    return (
+        f"if {tag} has no published wheel asset, install from the full repository archive instead: "
+        f"--package-url {repository_archive_url(tag)}"
+    )
+
+
+@dataclass(frozen=True)
+class HermesSmokeStep:
+    name: str
+    command: tuple[str, ...]
+    phase: str
+    mutates_profile: bool
+    required: bool = True
+    proof_boundary: str = ""
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "command": list(self.command),
+            "phase": self.phase,
+            "mutates_profile": self.mutates_profile,
+            "required": self.required,
+            "proof_boundary": self.proof_boundary,
+        }
+
+
+@dataclass(frozen=True)
+class ReleaseChecklistItem:
+    item_id: str
+    title: str
+    command: str
+    phase: str
+    required: bool
+    mutates_profile: bool
+    evidence_required: str
+    proof_boundary: str
+    requires_release_authority: bool = False
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "id": self.item_id,
+            "title": self.title,
+            "command": self.command,
+            "phase": self.phase,
+            "required": self.required,
+            "observed": False,
+            "mutates_profile": self.mutates_profile,
+            "requires_release_authority": self.requires_release_authority,
+            "evidence_required": self.evidence_required,
+            "proof_boundary": self.proof_boundary,
+        }
+
+
+@dataclass(frozen=True)
+class ReleaseQualityEvidence:
+    skill_content: dict[str, object]
+    parity: dict[str, object]
+    grounded_score: dict[str, object]
+    chat_cards: Mapping[str, object]
+    route_hints: Mapping[str, object]
+    context_briefs: dict[str, object]
+    routing_precision: Mapping[str, object]
+    native_competition: dict[str, object]
+    localized_chat_copy: dict[str, object]
+    router_fast_path: dict[str, object]
+    common_request_coverage: Mapping[str, object]
+    hermes_ux: dict[str, object]
+    checklist: dict[str, object]
+    documentation_claims: DocumentationClaimReport
+
+
+def release_readiness_checklist(
+    *,
+    version: str = __version__,
+    omh_command: str = "omh",
+) -> dict[str, object]:
+    release_version = _normalize_release_version(version)
+    tag = f"v{release_version}"
+    wheel = f"dist/oh_my_hermes-{release_version}-py3-none-any.whl"
+    omh_display = _shell_word(omh_command or "omh")
+    items = [
+        ReleaseChecklistItem(
+            "unit_tests",
+            "Run the full unittest suite",
+            "PYTHONPATH=tests uv run python -m unittest discover -s tests -v",
+            "local-quality",
+            True,
+            False,
+            "All tests pass locally or in CI.",
+            "Unit tests prove local contracts only; they do not prove Hermes loaded the installed skills.",
+        ),
+        ReleaseChecklistItem(
+            "plugin_compat_matrix",
+            "Verify bundled plugin Hermes compatibility",
+            "PYTHONPATH=tests uv run python -m unittest tests.test_plugin_distribution.PluginHermesAdmissionTests -v",
+            "contract-quality",
+            True,
+            False,
+            "The declared range and tested matrix agree; admission rejects unsupported hosts and admits supported hosts.",
+            "Real-host tests require Hermes; a skipped host fixture is not runtime loading evidence.",
+        ),
+        ReleaseChecklistItem(
+            "compileall",
+            "Compile Python sources",
+            "uv run python -m compileall -q src tests",
+            "local-quality",
+            True,
+            False,
+            "compileall exits successfully.",
+            "Syntax/import compilation is local source evidence only.",
+        ),
+        ReleaseChecklistItem(
+            "docs_workflows_check",
+            "Check generated workflow docs",
+            "uv run python -m omh.cli docs workflows --check",
+            "contract-quality",
+            True,
+            False,
+            "Generated workflow docs match catalog data.",
+            "This proves generated references are in sync, not that Hermes selected a workflow in chat.",
+        ),
+        ReleaseChecklistItem(
+            "harness_validate",
+            "Validate harness catalog contracts",
+            "uv run python -m omh.cli harness validate",
+            "contract-quality",
+            True,
+            False,
+            "Harness catalog validation exits successfully.",
+            "Harness validation proves local schemas and metadata, not runtime execution.",
+        ),
+        ReleaseChecklistItem(
+            "documentation_claims",
+            "Audit enrolled documentation claims",
+            "uv run python -m omh.cli docs claims --check --json",
+            "contract-quality",
+            True,
+            False,
+            "Selected deterministic claims are supported in an observed documentation_claim_audit/v1 report.",
+            "This checklist prepares the command, not its result. Generated drift is separate evidence; optional model judgments never block release.",
+        ),
+        ReleaseChecklistItem(
+            "documentation_navigation",
+            "Check public documentation structure",
+            "uv run python -m omh.cli docs navigation --check",
+            "contract-quality",
+            True,
+            False,
+            "Every in-scope page is reachable from a declared root or classified with a reason, every local target resolves, and navigation roots are unique, in an observed documentation_navigation_audit/v1 report.",
+            "Structure only. A reachable page is not evidence that its content is current or usable, and this is a separate evidence class from generated-artifact equality and from the semantic claim audit.",
+        ),
+        ReleaseChecklistItem(
+            "source_checkout_command_smoke",
+            "Check source-checkout console command importability",
+            'uv run --no-editable omh recommend "risky refactor" --limit 1 --json',
+            "local-quality",
+            True,
+            False,
+            "The source checkout can build/install the package non-editably and run the `omh` console script.",
+            "This proves console-script importability for the local checkout only; it does not prove Hermes chat visibility, plugin load, executor work, review, CI, merge, or delivery.",
+        ),
+        ReleaseChecklistItem(
+            "use_case_demo_cards",
+            "Check G1-G10 use-case demo cards",
+            "uv run python -m omh.cli cases demo --all --json",
+            "contract-quality",
+            True,
+            False,
+            "Use-case demo card collection renders all ten G1-G10 cards with route, action, wrapper card, and evidence boundary metadata.",
+            "Use-case demo cards prove wrapper-renderable projections only; they do not prove cron, connector, file, memory, executor, review, CI, merge, or delivery work happened.",
+        ),
+        ReleaseChecklistItem(
+            "use_case_artifact_bundle",
+            "Check G1-G10 use-case artifact bundle",
+            "uv run python -m omh.cli cases artifact --all --json",
+            "contract-quality",
+            True,
+            False,
+            "Use-case artifact bundle renders all ten G1-G10 prepared artifacts with route, operator-step, proof-surface, wrapper-card, and evidence-boundary metadata.",
+            "Use-case artifacts prove prepared runbook projection only; they do not prove runtime execution, connector invocation, delivery, file generation, memory mutation, executor dispatch, review, CI, merge, or billing evidence.",
+        ),
+        ReleaseChecklistItem(
+            "use_case_replay",
+            "Replay G1-G10 natural-language use-case fixtures",
+            "uv run python -m omh.cli cases replay --json",
+            "contract-quality",
+            True,
+            False,
+            "Use-case replay passes deterministic English and Korean operator fixtures for every G1-G10 application case.",
+            "Use-case replay proves deterministic recommendation routing for synthetic fixtures only; it does not prove live Hermes chat behavior or any runtime execution.",
+        ),
+        ReleaseChecklistItem(
+            "use_case_readiness",
+            "Check G1-G10 use-case readiness rollup",
+            "uv run python -m omh.cli cases readiness --json",
+            "contract-quality",
+            True,
+            False,
+            "Use-case readiness reports catalog, demo-card, artifact-bundle, and replay gates as passing while separating optional local artifact-store state.",
+            "Use-case readiness proves deterministic local use-case contracts only; it does not prove live Hermes chat behavior, connector work, executor work, review, CI, merge, delivery, or billing evidence.",
+        ),
+        ReleaseChecklistItem(
+            "grounded_score",
+            "Check grounded routing score",
+            "uv run python -m omh.cli demo grounded-score --json",
+            "contract-quality",
+            True,
+            False,
+            "Grounded score reports every representative operator scenario at 10/10.",
+            "Grounded score proves deterministic local route, response-kind, next-action, playbook, and boundary checks only; it does not prove live Hermes chat rendering, executor work, review, CI, merge, delivery, or plugin-load evidence.",
+        ),
+        ReleaseChecklistItem(
+            "chat_card_coverage",
+            "Check wrapper chat card coverage",
+            "uv run python -m omh.cli demo chat-card-coverage --json",
+            "contract-quality",
+            True,
+            False,
+            "Chat card coverage reports all dedicated workflow cards passing with generic ack count 0.",
+            "Chat card coverage proves deterministic local wrapper-card contracts only; it does not prove live Hermes chat rendering, platform delivery, executor work, review, CI, merge, or plugin-load evidence.",
+        ),
+        ReleaseChecklistItem(
+            "route_hint_alignment",
+            "Check route and awareness hint alignment",
+            "uv run python -m omh.cli demo route-hint-alignment --json",
+            "contract-quality",
+            True,
+            False,
+            "Route hint alignment reports every representative grounded-score and chat-card scenario with a primary plugin awareness hint that matches the selected workflow.",
+            "Route hint alignment proves deterministic local router/hint agreement only; it does not prove live Hermes chat rendering, platform delivery, executor work, review, CI, merge, or plugin-load evidence.",
+        ),
+        ReleaseChecklistItem(
+            "context_brief_coverage",
+            "Check Hermes context brief coverage",
+            "uv run python -m omh.cli demo context-brief-coverage --json",
+            "contract-quality",
+            True,
+            False,
+            "Context brief coverage reports every representative first-turn context case with metadata-only OMH mental model, route hint or picker hint, generic-tool checkpoint, and evidence boundary.",
+            "Context brief coverage proves deterministic local Hermes-facing context only; it does not prove live Hermes chat rendering, plugin load, platform delivery, generic tool invocation, executor work, review, CI, merge, or delivery.",
+        ),
+        ReleaseChecklistItem(
+            "routing_precision",
+            "Check routing precision boundaries",
+            "uv run python -m omh.cli demo routing-precision --json",
+            "contract-quality",
+            True,
+            False,
+            "Routing precision reports ordinary direct-answer and file-lookup prompts with overroute count 0, plus expected OMH prompts with missed intervention count 0.",
+            "Routing precision proves deterministic local over-intervention and missed-intervention guards only; it does not prove live Hermes chat rendering, platform delivery, source retrieval, file inspection, executor work, review, CI, merge, or plugin-load evidence.",
+        ),
+        ReleaseChecklistItem(
+            "native_competition",
+            "Check native-skill competition boundaries",
+            "uv run python -m omh.cli demo native-competition --json",
+            "contract-quality",
+            True,
+            False,
+            "Native competition reports all generated-frontmatter pairwise cases passing with no ties.",
+            "Native competition is a deterministic local lexical heuristic; it does not prove live Hermes picker ranking or installed native inventory.",
+        ),
+        ReleaseChecklistItem(
+            "localized_chat_copy",
+            "Check localized chat-card framing",
+            "uv run python -m omh.cli demo localized-chat-copy --json",
+            "contract-quality",
+            True,
+            False,
+            "Localized chat copy reports common non-English operator prompts with expected locale, card kind, next action, and no English catalog fallback.",
+            "Localized chat copy proves deterministic local copy framing only; it does not prove live Hermes chat rendering, translation service quality, platform delivery, source retrieval, executor work, review, CI, merge, or plugin-load evidence.",
+        ),
+        ReleaseChecklistItem(
+            "router_fast_path",
+            "Check router fast-path quality",
+            "uv run python -m omh.cli demo router-fast-path --json",
+            "contract-quality",
+            True,
+            False,
+            "Router fast-path quality reports high-frequency chat turns with explicit fast-path markers and no route or next-action drift.",
+            "Router fast-path quality proves deterministic local fast-path route markers only; it does not prove wall-clock latency, live Hermes chat rendering, platform delivery, executor work, review, CI, merge, or plugin-load evidence.",
+        ),
+        ReleaseChecklistItem(
+            "common_request_coverage",
+            "Check common Hermes-agent request coverage",
+            "uv run python -m omh.cli demo common-request-coverage --json",
+            "contract-quality",
+            True,
+            False,
+            "Common request coverage reports the curated ordinary Hermes-agent request corpus at or above the 95% target.",
+            "Common request coverage proves deterministic local routing breadth only; it does not prove live Hermes chat rendering, external plugin telemetry, connector work, executor work, review, CI, merge, delivery, or market-share evidence.",
+        ),
+        ReleaseChecklistItem(
+            "hermes_ux_quality",
+            "Check Hermes-facing UX quality rollup",
+            "uv run python -m omh.cli demo hermes-ux-quality --json",
+            "contract-quality",
+            True,
+            False,
+            "Hermes UX quality reports routing score, dedicated chat-card coverage, route-hint alignment, context-brief coverage, routing precision, native-skill competition, localized chat copy, router fast-path quality, and common request coverage as passing in one user-facing rollup.",
+            "Hermes UX quality proves deterministic local routing, card, hint, context, precision, native-competition, localized-copy, fast-path, and common-request contracts only; it does not prove live Hermes chat rendering, picker ranking, platform delivery, plugin load, generic tool invocation, executor work, review, CI, merge, or delivery.",
+        ),
+        ReleaseChecklistItem(
+            "product_readiness",
+            "Check product readiness rollup",
+            f"{omh_display} release product-readiness --version {release_version} --json",
+            "contract-quality",
+            True,
+            False,
+            "Product readiness reports skill-content, G1-G10 use-case, grounded score, wrapper chat card coverage, route hint alignment, context brief coverage, routing precision, native-skill competition, localized chat copy, router fast-path quality, common request coverage, Hermes UX quality, parity, and release checklist gates as passing.",
+            "Product readiness proves deterministic local package and product contracts only; it does not prove live Hermes chat behavior, connector work, executor work, review, CI, merge, delivery, or billing evidence.",
+        ),
+        ReleaseChecklistItem(
+            "release_evidence_bundle",
+            "Write the local release evidence bundle",
+            f"{omh_display} release evidence-bundle --version {release_version} --write --json",
+            "evidence-packaging",
+            True,
+            False,
+            "A local `omh_release_evidence_bundle/v2` artifact is written with checklist, product readiness, skill content, use-case readiness, grounded score, chat card coverage, route hint alignment, context brief coverage, routing precision, native-skill competition, localized chat copy, router fast-path quality, common request coverage, Hermes UX quality, and parity snapshots.",
+            "The evidence bundle packages local deterministic evidence only; it is not live Hermes runtime use, connector execution, executor dispatch, review, CI, merge, delivery, or release publication evidence.",
+        ),
+        ReleaseChecklistItem(
+            "stable_install_dry_run",
+            "Dry-run stable install metadata",
+            (
+                "uv run python -m omh.cli --omh-home /tmp/omh-smoke --hermes-home /tmp/hermes-smoke "
+                f"install --dry-run --channel stable --version {release_version}"
+            ),
+            "install-plan",
+            True,
+            False,
+            "Dry-run payload names the stable channel, version, source ref, and package URL.",
+            "Dry-run install is not evidence that files were written or Hermes reloaded.",
+        ),
+        ReleaseChecklistItem(
+            "stable_setup_dry_run",
+            "Dry-run stable setup metadata",
+            (
+                "uv run python -m omh.cli --omh-home /tmp/omh-smoke --hermes-home /tmp/hermes-smoke "
+                f"setup --dry-run --channel stable --version {release_version}"
+            ),
+            "install-plan",
+            True,
+            False,
+            "Dry-run setup shows the managed skill and Hermes registration plan.",
+            "Dry-run setup does not mutate Hermes and is not native runtime-load evidence.",
+        ),
+        ReleaseChecklistItem(
+            "probe_smoke",
+            "Run local capability probe",
+            "uv run python -m omh.cli --omh-home /tmp/omh-smoke --hermes-home /tmp/hermes-smoke probe",
+            "local-quality",
+            True,
+            False,
+            "Capability probe exits successfully.",
+            "Probe output is local capability evidence, not observed Hermes chat behavior.",
+        ),
+        ReleaseChecklistItem(
+            "release_smoke_plan",
+            "Render Hermes release smoke plan",
+            "uv run python -m omh.cli release hermes-smoke",
+            "release-smoke",
+            True,
+            False,
+            "Release smoke plan renders with plan-only evidence boundaries.",
+            "Plan mode does not touch the current Hermes profile.",
+        ),
+        ReleaseChecklistItem(
+            "installed_command_path",
+            "Check installed omh command is on PATH",
+            f"command -v {omh_display}",
+            "installed-command",
+            True,
+            False,
+            "The shell resolves the installed OMH command before any nested smoke uses it.",
+            "PATH resolution proves command discoverability only; it does not prove console-script importability.",
+        ),
+        ReleaseChecklistItem(
+            "installed_command_help",
+            "Check installed omh command help",
+            f"{omh_display} --help",
+            "installed-command",
+            True,
+            False,
+            "Installed command prints help successfully.",
+            "This proves console-script importability only.",
+        ),
+        ReleaseChecklistItem(
+            "skill_content_smoke",
+            "Check installed command package skill content",
+            f"{omh_display} release skill-content-smoke --json",
+            "installed-command",
+            True,
+            False,
+            "Skill content smoke reports ok=true for router awareness, generated workflow context rails, bundled role context, all-skill awareness lane coverage, full capability manifest context, playbook capability context, standalone plugin capability fallback coverage, G1-G10 use-case demo cards, G1-G10 use-case artifact bundles, G1-G10 natural-language use-case replay, bounded prompt context budgets, and bounded capability payload budgets.",
+            "This proves the installed OMH command package can render expected skill guidance; it does not prove Hermes loaded or selected it in chat.",
+        ),
+        ReleaseChecklistItem(
+            "installed_command_smoke",
+            "Observe installed command smoke without Hermes mutation",
+            (
+                f"{omh_display} --omh-home /tmp/omh-smoke --hermes-home /tmp/hermes-smoke "
+                f"release hermes-smoke --install-path setup --omh-command {omh_display} --include-command-smoke"
+            ),
+            "installed-command",
+            True,
+            False,
+            "Nested installed_command_smoke is mode=live, observed=true, ok=true, and includes installed skill content smoke.",
+            "This observes the installed OMH command path and generated skill guidance while keeping the outer Hermes profile smoke plan-only.",
+        ),
+        ReleaseChecklistItem(
+            "build_artifacts",
+            "Build sdist and wheel",
+            "uv build",
+            "package-build",
+            True,
+            False,
+            "sdist and wheel are built without packaging warnings or errors.",
+            "Build output proves package construction, not install success.",
+        ),
+        ReleaseChecklistItem(
+            "wheel_install",
+            "Install the built wheel into an isolated venv",
+            (
+                "python3 -m venv /tmp/omh-wheel-smoke && "
+                f"/tmp/omh-wheel-smoke/bin/python -m pip install --upgrade {wheel}"
+            ),
+            "package-build",
+            True,
+            False,
+            "The isolated venv installs the built wheel successfully.",
+            "Wheel install is isolated package evidence, not target Hermes profile evidence.",
+        ),
+        ReleaseChecklistItem(
+            "wheel_command_smoke",
+            "Run the wheel-installed command smoke",
+            (
+                "/tmp/omh-wheel-smoke/bin/omh --omh-home /tmp/omh-wheel-home --hermes-home /tmp/hermes-wheel-home "
+                "release hermes-smoke --install-path setup --omh-command /tmp/omh-wheel-smoke/bin/omh --include-command-smoke"
+            ),
+            "package-build",
+            True,
+            False,
+            "Wheel-installed command smoke reports nested installed_command_smoke ok=true.",
+            "This still does not mutate a real Hermes profile.",
+        ),
+        ReleaseChecklistItem(
+            "wheel_setup_dry_run",
+            "Run wheel-installed setup dry-run for the stable release",
+            (
+                "/tmp/omh-wheel-smoke/bin/omh --omh-home /tmp/omh-wheel-home --hermes-home /tmp/hermes-wheel-home "
+                f"setup --dry-run --channel stable --version {release_version}"
+            ),
+            "package-build",
+            True,
+            False,
+            "Wheel-installed setup dry-run renders the stable bootstrap plan successfully.",
+            "The setup dry-run does not install skills, reload Hermes, or mutate a target profile.",
+        ),
+        ReleaseChecklistItem(
+            "installer_smoke",
+            "Run the install.sh smoke in an isolated temp home",
+            f"{omh_display} release install-smoke --live --repo-root \"$PWD\" --install-script \"$PWD/install.sh\"",
+            "installer",
+            True,
+            False,
+            "install_script_smoke reports ok=true after install.sh creates a temp venv/bin command without running setup or doctor, then proves the installed command can render release smoke.",
+            "Install script smoke mutates only its isolated temp HOME/venv/bin unless --work-dir points elsewhere; it is not live Hermes runtime-use evidence.",
+        ),
+        ReleaseChecklistItem(
+            "live_tap_smoke",
+            "Run exactly one live Hermes tap smoke before tagging",
+            f"{omh_display} release hermes-smoke --live --install-path tap --target-confirmed",
+            "manual-release-candidate",
+            True,
+            True,
+            "Hermes CLI install/list/check/inspect commands succeed for the target profile.",
+            "This mutates the target Hermes profile and still does not prove later chat selection without wrapper evidence.",
+            True,
+        ),
+        ReleaseChecklistItem(
+            "tag_and_publish",
+            "Tag and publish only after all required evidence is attached",
+            f'git tag -a {tag} -m "Release {tag}" && git push origin {tag}',
+            "release-authority",
+            False,
+            False,
+            "Maintainer explicitly approves tag/release publication after local and live evidence are recorded.",
+            "This checklist does not create tags, GitHub releases, or production artifacts by itself.",
+            True,
+        ),
+        ReleaseChecklistItem(
+            "machine_sync_after_cut",
+            "Sync each machine to the published release and confirm the version it reports",
+            f"{omh_display} update && {omh_display} --version && {omh_display} doctor",
+            "post-release-sync",
+            False,
+            True,
+            (
+                f"The installed command reports {release_version}, doctor passes, and the OMH TUI banner (bare `omh`) "
+                f"shows v{release_version} once it is reopened."
+            ),
+            (
+                "Tagging and publishing move the tag and the package registries only; no installed machine changes until it "
+                "updates itself. Every version an operator sees -- `omh --version`, the plugin manifest, and the OMH TUI "
+                "banner -- is the installed version, never the newest published tag. Never hand-copy files into "
+                "~/.hermes/plugins to close the gap: that drifts from the install manifests and makes the next update "
+                "refuse."
+            ),
+        ),
+    ]
+    return {
+        "schema_version": RELEASE_CHECKLIST_SCHEMA,
+        "mode": "plan",
+        "ok": True,
+        "observed": False,
+        "version": release_version,
+        "tag": tag,
+        "proof_boundary": (
+            "This checklist is a deterministic release plan. It does not run commands, create tags, publish GitHub releases, "
+            "or prove Hermes runtime use until the listed evidence is observed separately."
+        ),
+        "items": [item.to_payload() for item in items],
+        "required_item_count": sum(1 for item in items if item.required),
+        "manual_authority_item_count": sum(1 for item in items if item.requires_release_authority),
+        "recommended_next_action": (
+            "Run the required local gates, record one live Hermes smoke from the target profile, then request explicit "
+            "release authority before tagging or publishing."
+        ),
+    }
+
+
+def product_readiness_report(
+    *,
+    version: str = __version__,
+    omh_command: str = "omh",
+    paths: OmhPaths | None = None,
+) -> dict[str, object]:
+    release_version = _normalize_release_version(version)
+    resolved_paths = paths or OmhPaths(omh_home=Path("~/.omh").expanduser(), hermes_home=Path("~/.hermes").expanduser())
+    evidence = _build_release_quality_evidence(release_version=release_version, omh_command=omh_command)
+    return _product_readiness_report_from_evidence(
+        release_version=release_version,
+        omh_command=omh_command,
+        evidence=evidence,
+        paths=resolved_paths,
+    )
+
+
+def _build_release_quality_evidence(*, release_version: str, omh_command: str) -> ReleaseQualityEvidence:
+    skill_content = skill_content_smoke()
+    parity = build_parity_matrix()
+    grounded_score = build_grounded_score_demo()
+    chat_cards = build_chat_card_coverage_demo()
+    route_hints = build_route_hint_alignment_demo(
+        grounded_score=grounded_score,
+        chat_card_coverage=chat_cards,
+    )
+    context_briefs = build_context_brief_coverage_demo()
+    routing_precision = build_routing_precision_demo()
+    native_competition = build_native_skill_competition_report()
+    localized_chat_copy = build_localized_chat_copy_demo()
+    router_fast_path = build_router_fast_path_demo()
+    common_request_coverage = build_common_request_coverage_demo()
+    hermes_ux = build_hermes_ux_quality_demo(
+        grounded_score=grounded_score,
+        chat_card_coverage=chat_cards,
+        route_hint_alignment=route_hints,
+        context_brief_coverage=context_briefs,
+        routing_precision=routing_precision,
+        native_competition=native_competition,
+        localized_chat_copy=localized_chat_copy,
+        router_fast_path=router_fast_path,
+        common_request_coverage=common_request_coverage,
+    )
+    checklist = release_readiness_checklist(version=release_version, omh_command=omh_command)
+    return ReleaseQualityEvidence(
+        skill_content=skill_content,
+        parity=parity,
+        grounded_score=grounded_score,
+        chat_cards=chat_cards,
+        route_hints=route_hints,
+        context_briefs=context_briefs,
+        routing_precision=routing_precision,
+        native_competition=native_competition,
+        localized_chat_copy=localized_chat_copy,
+        router_fast_path=router_fast_path,
+        common_request_coverage=common_request_coverage,
+        hermes_ux=hermes_ux,
+        checklist=checklist,
+        documentation_claims=documentation_claims_report(),
+    )
+
+
+def _product_readiness_report_from_evidence(
+    *,
+    release_version: str,
+    omh_command: str,
+    evidence: ReleaseQualityEvidence,
+    paths: OmhPaths,
+) -> dict[str, object]:
+    omh_display = _shell_word(omh_command)
+    skill_content = evidence.skill_content
+    parity = evidence.parity
+    grounded_score = evidence.grounded_score
+    chat_cards = evidence.chat_cards
+    route_hints = evidence.route_hints
+    context_briefs = evidence.context_briefs
+    routing_precision = evidence.routing_precision
+    native_competition = evidence.native_competition
+    localized_chat_copy = evidence.localized_chat_copy
+    router_fast_path = evidence.router_fast_path
+    common_request_coverage = evidence.common_request_coverage
+    hermes_ux = evidence.hermes_ux
+    checklist = evidence.checklist
+    use_case_readiness_payload = use_case_readiness(paths)
+    use_case_readiness_failures = _blocking_gate_messages(use_case_readiness_payload)
+    use_case_readiness_warnings = _warning_gate_messages(use_case_readiness_payload)
+    local_store_status = _release_local_store_status(use_case_readiness_payload)
+
+    checklist_items = checklist.get("items", [])
+    checklist_ids = {
+        str(item.get("id"))
+        for item in checklist_items
+        if isinstance(item, dict) and item.get("id")
+    }
+    required_checklist_ids = {
+        "unit_tests",
+        "plugin_compat_matrix",
+        "docs_workflows_check",
+        "documentation_claims",
+        "harness_validate",
+        "skill_content_smoke",
+        "use_case_readiness",
+        "grounded_score",
+        "chat_card_coverage",
+        "route_hint_alignment",
+        "context_brief_coverage",
+        "routing_precision",
+        "native_competition",
+        "localized_chat_copy",
+        "router_fast_path",
+        "common_request_coverage",
+        "hermes_ux_quality",
+        "product_readiness",
+        "release_evidence_bundle",
+        "installed_command_smoke",
+        "installer_smoke",
+        "live_tap_smoke",
+    }
+    missing_checklist_ids = sorted(required_checklist_ids - checklist_ids)
+
+    parity_summary = parity.get("summary", {}) if isinstance(parity.get("summary"), dict) else {}
+    parity_errors = []
+    for status_key in ("partial", "planned", "deferred"):
+        count = int(parity_summary.get(status_key, 0) or 0)
+        if count:
+            parity_errors.append(f"{status_key}: {count}")
+
+    grounded_score_errors = _grounded_score_errors(grounded_score)
+    chat_card_summary = chat_cards.get("summary", {}) if isinstance(chat_cards.get("summary"), Mapping) else {}
+    chat_card_errors = _chat_card_coverage_errors(chat_cards)
+    route_hint_summary = route_hints.get("summary", {}) if isinstance(route_hints.get("summary"), Mapping) else {}
+    route_hint_errors = _route_hint_alignment_errors(route_hints)
+    context_brief_summary = (
+        context_briefs.get("summary", {}) if isinstance(context_briefs.get("summary"), Mapping) else {}
+    )
+    context_brief_errors = _context_brief_coverage_errors(context_briefs)
+    routing_precision_summary = (
+        routing_precision.get("summary", {}) if isinstance(routing_precision.get("summary"), Mapping) else {}
+    )
+    routing_precision_gate_errors = routing_precision_errors(routing_precision)
+    native_competition_gate_errors = native_skill_competition_errors(native_competition)
+    localized_chat_copy_summary = (
+        localized_chat_copy.get("summary", {}) if isinstance(localized_chat_copy.get("summary"), Mapping) else {}
+    )
+    localized_chat_copy_gate_errors = localized_chat_copy_errors(localized_chat_copy)
+    router_fast_path_summary = (
+        router_fast_path.get("summary", {}) if isinstance(router_fast_path.get("summary"), Mapping) else {}
+    )
+    router_fast_path_gate_errors = router_fast_path_errors(router_fast_path)
+    common_request_summary = (
+        common_request_coverage.get("summary", {})
+        if isinstance(common_request_coverage.get("summary"), Mapping)
+        else {}
+    )
+    common_request_gate_errors = common_request_coverage_errors(common_request_coverage)
+    hermes_ux_summary = hermes_ux.get("summary", {}) if isinstance(hermes_ux.get("summary"), Mapping) else {}
+    hermes_ux_errors = hermes_ux_quality_errors(hermes_ux)
+    plugin_compat_errors = compat_matrix_drift()
+    gates = [
+        _product_readiness_gate(
+            "plugin_compat_matrix",
+            "Bundled plugin Hermes compatibility matrix",
+            "passed" if not plugin_compat_errors else "failed",
+            True,
+            "Declared runtime range compared with named tested-host entries.",
+            "PYTHONPATH=tests uv run python -m unittest tests.test_plugin_distribution.PluginHermesAdmissionTests -v",
+            plugin_compat_errors,
+            [],
+            "Local release-contract coherence only; this check does not observe Hermes loading or invocation.",
+        ),
+        _product_readiness_gate(
+            "skill_content",
+            "Installed package skill content",
+            "passed" if skill_content.get("ok") else "failed",
+            True,
+            (
+                f"{skill_content.get('skill_count')} skill surface(s), "
+                f"{skill_content.get('checked_marker_count')} marker(s), "
+                f"{len(skill_content.get('failed_checks', [])) if isinstance(skill_content.get('failed_checks'), list) else 0} failed marker(s)"
+            ),
+            "omh release skill-content-smoke --json",
+            _skill_content_product_errors(skill_content),
+            [],
+            str(skill_content.get("proof_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "use_cases",
+            "G1-G10 application use cases",
+            "passed" if use_case_readiness_payload.get("blocking_failures") == 0 else "failed",
+            True,
+            (
+                f"score {use_case_readiness_payload.get('score')}/100; "
+                f"blocking {use_case_readiness_payload.get('blocking_failures')}; "
+                f"warnings {use_case_readiness_payload.get('warning_count')}; "
+                f"local artifact store {local_store_status}"
+            ),
+            "omh cases readiness --json",
+            use_case_readiness_failures,
+            use_case_readiness_warnings,
+            str(use_case_readiness_payload.get("boundary", "")),
+        ),
+        _product_readiness_gate(
+            "grounded_score",
+            "Grounded routing score",
+            "passed" if not grounded_score_errors else "failed",
+            True,
+            _grounded_score_summary_text(grounded_score),
+            "omh demo grounded-score --json",
+            grounded_score_errors,
+            [],
+            str(grounded_score.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "chat_card_coverage",
+            "Wrapper chat card coverage",
+            "passed" if not chat_card_errors else "failed",
+            True,
+            (
+                f"{chat_card_summary.get('passing_count', 0)}/{chat_card_summary.get('case_count', 0)} "
+                f"dedicated workflow cards; generic ack {chat_card_summary.get('generic_ack_count', 0)}"
+            ),
+            "omh demo chat-card-coverage --json",
+            chat_card_errors,
+            [],
+            str(chat_cards.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "route_hint_alignment",
+            "Route and awareness hint alignment",
+            "passed" if not route_hint_errors else "failed",
+            True,
+            (
+                f"{route_hint_summary.get('aligned_count', 0)}/{route_hint_summary.get('case_count', 0)} "
+                f"route hints aligned; missing {route_hint_summary.get('missing_hint_count', 0)}; "
+                f"mismatches {route_hint_summary.get('mismatch_count', 0)}"
+            ),
+            "omh demo route-hint-alignment --json",
+            route_hint_errors,
+            [],
+            str(route_hints.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "context_brief_coverage",
+            "Hermes context brief coverage",
+            "passed" if not context_brief_errors else "failed",
+            True,
+            (
+                f"{context_brief_summary.get('passing_count', 0)}/{context_brief_summary.get('case_count', 0)} "
+                f"context brief cases passing; route hints {context_brief_summary.get('route_hint_count', 0)}; "
+                f"catalog picker hints {context_brief_summary.get('catalog_question_count', 0)}"
+            ),
+            "omh demo context-brief-coverage --json",
+            context_brief_errors,
+            [],
+            str(context_briefs.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "routing_precision",
+            "Routing precision boundaries",
+            "passed" if not routing_precision_gate_errors else "failed",
+            True,
+            (
+                f"{routing_precision_summary.get('passing_count', 0)}/{routing_precision_summary.get('case_count', 0)} "
+                f"negative-control cases; "
+                f"{routing_precision_summary.get('intervention_passing_count', 0)}/"
+                f"{routing_precision_summary.get('intervention_case_count', 0)} interventions; "
+                f"overroutes {routing_precision_summary.get('overroute_count', 0)}; "
+                f"catalog pickers {routing_precision_summary.get('catalog_picker_count', 0)}; "
+                f"generic ack {routing_precision_summary.get('generic_ack_count', 0)}; "
+                f"missed interventions {routing_precision_summary.get('missed_intervention_count', 0)}"
+            ),
+            "omh demo routing-precision --json",
+            routing_precision_gate_errors,
+            [],
+            str(routing_precision.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "native_competition",
+            "Native skill competition",
+            "passed" if not native_competition_gate_errors else "failed",
+            True,
+            (
+                f"{native_competition.get('passed_count', 0)}/{native_competition.get('case_count', 0)} "
+                "generated-frontmatter comparisons passing"
+            ),
+            "omh demo native-competition --json",
+            native_competition_gate_errors,
+            [],
+            str(native_competition.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "localized_chat_copy",
+            "Localized chat-card framing",
+            "passed" if not localized_chat_copy_gate_errors else "failed",
+            True,
+            (
+                f"{localized_chat_copy_summary.get('passing_count', 0)}/"
+                f"{localized_chat_copy_summary.get('case_count', 0)} localized card cases; "
+                f"locales {localized_chat_copy_summary.get('locale_count', 0)}"
+            ),
+            "omh demo localized-chat-copy --json",
+            localized_chat_copy_gate_errors,
+            [],
+            str(localized_chat_copy.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "router_fast_path",
+            "Router fast-path quality",
+            "passed" if not router_fast_path_gate_errors else "failed",
+            True,
+            (
+                f"{router_fast_path_summary.get('passing_count', 0)}/"
+                f"{router_fast_path_summary.get('case_count', 0)} fast-path cases; "
+                f"missing markers {router_fast_path_summary.get('missing_marker_count', 0)}; "
+                f"route mismatches {router_fast_path_summary.get('route_mismatch_count', 0)}"
+            ),
+            "omh demo router-fast-path --json",
+            router_fast_path_gate_errors,
+            [],
+            str(router_fast_path.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "common_request_coverage",
+            "Common Hermes-agent request coverage",
+            "passed" if not common_request_gate_errors else "failed",
+            True,
+            (
+                f"{common_request_summary.get('passing_count', 0)}/"
+                f"{common_request_summary.get('case_count', 0)} common request cases; "
+                f"coverage {common_request_summary.get('coverage_percent', 0)}%; "
+                f"target {common_request_coverage.get('target_percent', 0)}%; "
+                f"generic ack {common_request_summary.get('generic_ack_count', 0)}; "
+                f"popular plugin families {common_request_summary.get('popular_plugin_covered_family_count', 0)}/"
+                f"{common_request_summary.get('popular_plugin_family_count', 0)} "
+                f"({common_request_summary.get('popular_plugin_weighted_coverage_percent', 0)}%)"
+            ),
+            "omh demo common-request-coverage --json",
+            common_request_gate_errors,
+            [],
+            str(common_request_coverage.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "hermes_ux_quality",
+            "Hermes-facing UX quality",
+            "passed" if not hermes_ux_errors else "failed",
+            True,
+            (
+                f"{hermes_ux_summary.get('passing_gate_count', 0)}/{hermes_ux_summary.get('gate_count', 0)} "
+                f"UX gates passing; routing avg {hermes_ux_summary.get('grounded_score_average', 0)}; "
+                f"generic ack {hermes_ux_summary.get('chat_card_generic_ack_count', 0)}; "
+                f"route mismatches {hermes_ux_summary.get('route_hint_mismatch_count', 0)}; "
+                f"context {hermes_ux_summary.get('context_brief_passing_count', 0)}/"
+                f"{hermes_ux_summary.get('context_brief_cases', 0)}; "
+                f"localized {hermes_ux_summary.get('localized_chat_copy_passing_count', 0)}/"
+                f"{hermes_ux_summary.get('localized_chat_copy_cases', 0)}; "
+                f"fast paths {hermes_ux_summary.get('router_fast_path_passing_count', 0)}/"
+                f"{hermes_ux_summary.get('router_fast_path_cases', 0)}; "
+                f"common requests {hermes_ux_summary.get('common_request_passing_count', 0)}/"
+                f"{hermes_ux_summary.get('common_request_cases', 0)}"
+            ),
+            "omh demo hermes-ux-quality --json",
+            hermes_ux_errors,
+            [],
+            str(hermes_ux.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "parity_contracts",
+            "Common runtime parity contract coverage",
+            "passed" if not parity_errors else "failed",
+            True,
+            (
+                f"{parity_summary.get('available', 0)}/{parity_summary.get('capability_count', 0)} "
+                "capability axis/axes available"
+            ),
+            "omh probe --parity --json",
+            parity_errors,
+            [],
+            str(parity.get("claim_boundary", "")),
+        ),
+        _product_readiness_gate(
+            "release_checklist",
+            "Release checklist shape",
+            "passed" if not missing_checklist_ids and checklist.get("ok") else "failed",
+            True,
+            f"{checklist.get('required_item_count')} required release gate(s) indexed",
+            f"{omh_display} release checklist --version {release_version} --json",
+            [f"missing checklist id: {item_id}" for item_id in missing_checklist_ids],
+            [],
+            str(checklist.get("proof_boundary", "")),
+        ),
+    ]
+    claim_audit = evidence.documentation_claims
+    gates.append(_product_readiness_gate(
+        "documentation_claims", "Observed documentation claim audit",
+        "passed" if claim_audit["ok"] else "failed", True,
+        "Selected deterministic implementation facts; generated equality is a separate evidence class.",
+        "omh docs claims --check --json",
+        [row["id"] for row in claim_audit["claims"]
+         if not row["advisory"] and row["id"] in claim_audit["selection"] and row["state"] != "supported"],
+        [], claim_audit["claim_boundary"],
+    ))
+    blocking_failures = [gate for gate in gates if gate["blocking"] and gate["status"] != "passed"]
+    warnings = [
+        str(warning)
+        for gate in gates
+        for warning in gate.get("warnings", [])
+        if warning
+    ]
+    return {
+        "schema_version": PRODUCT_READINESS_SCHEMA,
+        "status": "ready" if not blocking_failures else "needs_attention",
+        "score": 100 if not blocking_failures else round(((len(gates) - len(blocking_failures)) / max(1, len(gates))) * 100),
+        "mode": "live",
+        "observed": True,
+        "version": release_version,
+        "blocking_failures": len(blocking_failures),
+        "warning_count": len(warnings),
+        "warnings": warnings,
+        "local_artifact_store": local_store_status,
+        "gates": gates,
+        "documentation_claims": claim_audit,
+        "next_actions": _product_readiness_next_actions(blocking_failures, warnings),
+        "boundary": (
+            "Product readiness proves deterministic local OMH package and product contracts only. "
+            "It does not run the release checklist, mutate Hermes, prove live Hermes chat selection, "
+            "run connectors, dispatch executors, review code, pass CI, merge, deliver messages, or spend provider budget."
+        ),
+    }
+
+
+def hermes_release_smoke_steps(
+    *,
+    install_path: str,
+    skill: str = DEFAULT_HERMES_SKILL,
+    tap: str = DEFAULT_HERMES_TAP,
+    omh_command: str = "omh",
+    omh_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+) -> list[HermesSmokeStep]:
+    if install_path not in INSTALL_PATHS:
+        raise ValueError(f"unsupported Hermes install path: {install_path}")
+    if not skill:
+        raise ValueError("Hermes smoke skill must not be empty")
+    if install_path == "tap" and not tap:
+        raise ValueError("Hermes smoke tap must not be empty for tap installs")
+    skill_name = _skill_name_for_hermes(skill)
+    tap_identifier = _tap_skill_identifier(tap=tap, skill=skill)
+    setup_command = _omh_scoped_command(
+        omh_command,
+        "setup",
+        omh_home=omh_home,
+        hermes_home=hermes_home,
+    )
+    doctor_command = _omh_scoped_command(
+        omh_command,
+        "doctor",
+        omh_home=omh_home,
+        hermes_home=hermes_home,
+    )
+    install_steps = (
+        [
+            HermesSmokeStep(
+                "tap_add",
+                ("hermes", "skills", "tap", "add", tap),
+                "install",
+                True,
+                proof_boundary="Registers the OMH GitHub tap in the current Hermes profile; this is setup evidence only.",
+            ),
+            HermesSmokeStep(
+                "skill_install",
+                ("hermes", "skills", "install", tap_identifier, "--yes"),
+                "install",
+                True,
+                proof_boundary=(
+                    "Installs the router skill by full GitHub identifier in the current Hermes profile; "
+                    "this does not prove chat usage."
+                ),
+            ),
+        ]
+        if install_path == "tap"
+        else [
+            HermesSmokeStep(
+                "omh_setup",
+                setup_command,
+                "install",
+                True,
+                proof_boundary="Bootstraps generated skills and skills.external_dirs for the current Hermes home.",
+            )
+        ]
+    )
+    check_steps = [
+        HermesSmokeStep(
+            "tap_list",
+            ("hermes", "skills", "tap", "list"),
+            "verify",
+            False,
+            proof_boundary="Shows configured taps; absence means tap install has not been observed.",
+        ),
+        HermesSmokeStep(
+            "skills_list",
+            ("hermes", "skills", "list", "--enabled-only"),
+            "verify",
+            False,
+            proof_boundary="Shows enabled Hermes skills; the OMH router should be visible after install/reload.",
+        ),
+        HermesSmokeStep(
+            "skill_check",
+            ("hermes", "skills", "check", skill_name),
+            "verify",
+            False,
+            proof_boundary="Runs Hermes skill validation for the OMH router skill.",
+        ),
+    ]
+    if install_path == "tap":
+        check_steps.append(
+            HermesSmokeStep(
+                "skill_inspect",
+                ("hermes", "skills", "inspect", tap_identifier),
+                "verify",
+                False,
+                proof_boundary="Prints Hermes-visible skill metadata/content for operator confirmation.",
+            )
+        )
+    else:
+        check_steps.append(
+            HermesSmokeStep(
+                "setup_doctor",
+                doctor_command,
+                "verify",
+                False,
+                proof_boundary=(
+                    "Checks OMH-managed local skill registration. Hermes v0.15.1 does not reliably inspect "
+                    "skills.external_dirs local skills by short name, so setup-path smoke uses list/check plus OMH doctor."
+                ),
+            )
+        )
+    return install_steps + check_steps
+
+
+def _skill_name_for_hermes(skill: str) -> str:
+    if "/" in skill:
+        return skill.rstrip("/").split("/")[-1]
+    # Hermes checks a skill by its frontmatter name, which is the display
+    # label the install step also uses; the canonical name names no skill.
+    return omh_skill_display_name(skill)
+
+
+def _normalize_release_version(version: str) -> str:
+    value = str(version or "").strip()
+    if value.startswith("v"):
+        value = value[1:]
+    if not value:
+        raise ValueError("release checklist version must not be empty")
+    if not RELEASE_VERSION_RE.fullmatch(value):
+        raise ValueError("release checklist version must be a tag-safe version like 1.0.0")
+    return value
+
+
+def _shell_word(value: str) -> str:
+    stripped = str(value or "").strip()
+    if not stripped:
+        raise ValueError("release checklist omh command must not be empty")
+    return shlex.quote(stripped)
+
+
+def _tap_skill_identifier(*, tap: str, skill: str) -> str:
+    if "/" in skill:
+        return skill
+    # The tap path is a real directory in the published repo, and those carry
+    # display labels, so a canonical name here would point at nothing.
+    return f"{tap.rstrip('/')}/skills/{omh_skill_display_name(skill)}"
+
+
+def hermes_release_smoke_plan(
+    *,
+    install_path: str = "tap",
+    skill: str = DEFAULT_HERMES_SKILL,
+    tap: str = DEFAULT_HERMES_TAP,
+    omh_command: str = "omh",
+    omh_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+    installed_command_smoke: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    target = _target_binding(omh_home=omh_home, hermes_home=hermes_home)
+    steps = hermes_release_smoke_steps(
+        install_path=install_path,
+        skill=skill,
+        tap=tap,
+        omh_command=omh_command,
+        omh_home=target["omh_home"],
+        hermes_home=target["hermes_home"],
+    )
+    command_smoke = (
+        dict(installed_command_smoke)
+        if installed_command_smoke is not None
+        else installed_command_smoke_plan(
+            omh_command=omh_command,
+            omh_home=target["omh_home"],
+            hermes_home=target["hermes_home"],
+        )
+    )
+    ok = bool(command_smoke.get("ok", True))
+    return {
+        "schema_version": HERMES_SMOKE_SCHEMA,
+        "mode": "plan",
+        "ok": ok,
+        "observed": False,
+        "install_path": install_path,
+        "skill": skill,
+        "tap": tap,
+        "target_binding": target,
+        "proof_boundary": (
+            "Plan mode does not touch the current Hermes profile and is not evidence that Hermes "
+            "installed, loaded, or used OMH. Run with --live against the target profile for observed smoke evidence."
+        ),
+        "steps": [step.to_payload() for step in steps],
+        "installed_command_smoke": command_smoke,
+        "first_use_status_smoke": first_use_status_smoke_plan(
+            omh_command=omh_command,
+            omh_home=target["omh_home"],
+            hermes_home=target["hermes_home"],
+        ),
+        "live_command": _live_smoke_command(install_path, target),
+    }
+
+
+def installed_command_smoke_plan(
+    *,
+    omh_command: str = "omh",
+    omh_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+) -> dict[str, object]:
+    target = _target_binding(omh_home=omh_home, hermes_home=hermes_home)
+    steps = [
+        HermesSmokeStep(
+            "installed_omh_help",
+            (omh_command, "--help"),
+            "verify",
+            False,
+            proof_boundary="Verifies the installed OMH console script is importable and runnable from the current PATH.",
+        ),
+        HermesSmokeStep(
+            "installed_omh_skill_content",
+            (omh_command, "release", "skill-content-smoke", "--json"),
+            "verify",
+            False,
+            proof_boundary=(
+                "Verifies the installed OMH command package can render router awareness and workflow context rails. "
+                "This is package-content evidence only, not Hermes runtime-load evidence."
+            ),
+        ),
+        HermesSmokeStep(
+            "installed_omh_setup_plan",
+            _omh_release_plan_command(
+                omh_command,
+                install_path="setup",
+                omh_home=target["omh_home"],
+                hermes_home=target["hermes_home"],
+            ),
+            "verify",
+            False,
+            proof_boundary=(
+                "Verifies the installed OMH console script can render the setup-path Hermes smoke plan. "
+                "This is still plan evidence, not live Hermes profile mutation."
+            ),
+        ),
+    ]
+    return {
+        "schema_version": INSTALLED_COMMAND_SMOKE_SCHEMA,
+        "mode": "plan",
+        "ok": True,
+        "observed": False,
+        "command_under_test": omh_command,
+        "target_binding": target,
+        "path_check": installed_command_path_check_plan(omh_command),
+        "proof_boundary": (
+            "Plan mode lists installed-command checks only. Run release hermes-smoke with "
+            "--include-command-smoke to observe PATH resolution and the installed OMH executable."
+        ),
+        "steps": [step.to_payload() for step in steps],
+    }
+
+
+# The budgets `skill_content_smoke` reports, as (name in `budget_metrics()`,
+# failure label in the smoke payload), in payload order.
+SKILL_CONTENT_SMOKE_AWARENESS_BUDGETS = (
+    ("awareness_primer_context_chars", "awareness_primer_context"),
+    ("awareness_primer_markdown_chars", "awareness_primer_markdown"),
+    ("awareness_workflow_context_chars_max", "workflow_context_rail"),
+)
+SKILL_CONTENT_SMOKE_ROLE_BUDGETS = (("role_context_chars_max", "role_context"),)
+SKILL_CONTENT_SMOKE_CAPABILITY_BUDGETS = (
+    ("full_capability_skill_section_chars", "full_capability_skill_section"),
+    ("full_capability_skill_item_chars_max", "full_capability_skill_item"),
+    ("standalone_capability_skill_section_chars", "standalone_capability_skill_section"),
+    ("standalone_capability_skill_item_chars_max", "standalone_capability_skill_item"),
+)
+SKILL_CONTENT_SMOKE_BUDGET_NAMES = frozenset(
+    name
+    for name, _label in (
+        SKILL_CONTENT_SMOKE_AWARENESS_BUDGETS
+        + SKILL_CONTENT_SMOKE_ROLE_BUDGETS
+        + SKILL_CONTENT_SMOKE_CAPABILITY_BUDGETS
+    )
+)
+
+
+def _smoke_threshold(metric: BudgetMetric) -> int:
+    """The same bar the ledger applies: the limit plus any reviewed exception.
+
+    The `oversized_*` lists name the items behind a ledger finding; comparing
+    them against the bare limit would list items the ledger itself accepted
+    the day one of these budgets carries an exception.
+    """
+    return metric.limit + metric.reviewed_exception
+
+
+def skill_content_smoke() -> dict[str, object]:
+    templates = {template.name: template.content for template in builtin_skill_templates()}
+    workflow_skill_names = set(templates) - {DEFAULT_HERMES_SKILL}
+    role_contexts = {role.id: role_file_markdown(role) for role in role_definitions()}
+    bundled_role_contexts = _bundled_role_contexts()
+    awareness = awareness_primer_payload()
+    lane_skill_names = _awareness_lane_skill_names(awareness)
+    catalog_skill_names = {definition.name for definition in builtin_definitions()}
+    missing_awareness_skills = sorted(workflow_skill_names - lane_skill_names)
+    unexpected_awareness_surfaces = sorted(lane_skill_names - catalog_skill_names - set(CONCEPTUAL_AWARENESS_SURFACES))
+    standalone_capability_skill_names = standalone_skill_capability_ids()
+    standalone_capability_items = standalone_skill_capability_items()
+    full_capability_items = skill_capabilities()
+    full_playbook_items = playbook_capabilities()
+    standalone_playbook_items = standalone_playbook_capability_items()
+    full_capability_skill_names = {
+        str(item.get("id") or "")
+        for item in full_capability_items
+        if str(item.get("id") or "")
+    }
+    missing_full_capability_skills = sorted(workflow_skill_names - full_capability_skill_names)
+    missing_standalone_capability_skills = sorted(workflow_skill_names - standalone_capability_skill_names)
+    unexpected_standalone_capability_skills = sorted(
+        standalone_capability_skill_names - catalog_skill_names - set(CONCEPTUAL_AWARENESS_SURFACES)
+    )
+    required_standalone_context_fields = {
+        "workflow_routing_hint",
+        "workflow_context_rule",
+        "chat_rule",
+        "fallback_rule",
+        "evidence_boundary",
+        "cross_lane_examples",
+    }
+    required_playbook_context_fields = {
+        "workflow_context_rule",
+        "chat_rule",
+        "fallback_rule",
+        "evidence_boundary",
+        "prepared_is_not",
+        "pipeline",
+        "primary_owner_role",
+        "stage_owners",
+        "available_wrapper_actions",
+        "first_stage",
+    }
+    missing_standalone_capability_context_skills = sorted(
+        str(item.get("id") or "")
+        for item in standalone_capability_items
+        if str(item.get("id") or "") in workflow_skill_names
+        and any(not item.get(field) for field in required_standalone_context_fields)
+    )
+    missing_full_capability_context_skills = sorted(
+        str(item.get("id") or "")
+        for item in full_capability_items
+        if str(item.get("id") or "") in workflow_skill_names
+        and any(not item.get(field) for field in required_standalone_context_fields)
+    )
+    missing_playbook_context_playbooks = sorted(
+        str(item.get("id") or "")
+        for item in full_playbook_items
+        if any(not item.get(field) for field in required_playbook_context_fields)
+    )
+    missing_standalone_playbook_context_playbooks = sorted(
+        str(item.get("id") or "")
+        for item in standalone_playbook_items
+        if any(not item.get(field) for field in required_playbook_context_fields)
+    )
+    required_playbook_ids = {
+        "request-to-handoff",
+        "safe-feature-change",
+        "feedback-triage",
+        "research-department",
+        "materials-processing",
+        "idea-to-deploy",
+    }
+    full_playbook_ids = {str(item.get("id") or "") for item in full_playbook_items}
+    standalone_playbook_ids = {str(item.get("id") or "") for item in standalone_playbook_items}
+    missing_required_playbook_capabilities = sorted(required_playbook_ids - full_playbook_ids)
+    missing_required_standalone_playbook_capabilities = sorted(required_playbook_ids - standalone_playbook_ids)
+    full_capability_skill_section_chars = len(json.dumps(full_capability_items, sort_keys=True, ensure_ascii=False))
+    standalone_capability_skill_section_chars = len(
+        json.dumps(standalone_capability_items, sort_keys=True, ensure_ascii=False)
+    )
+    use_case_demo_cards = demo_all_use_cases()
+    use_case_demo_failures = _use_case_demo_card_failures(use_case_demo_cards)
+    use_case_artifact_bundle = build_all_use_case_artifacts()
+    use_case_artifact_failures = _use_case_artifact_failures(use_case_artifact_bundle)
+    use_case_replay = replay_use_case_fixtures()
+    use_case_replay_failures = _use_case_replay_failures(use_case_replay)
+    use_case_readiness_payload = use_case_readiness(None)
+    use_case_readiness_failures = _blocking_gate_messages(use_case_readiness_payload)
+    use_case_readiness_warnings = _warning_gate_messages(use_case_readiness_payload)
+    max_full_capability_skill_chars = max(
+        (len(json.dumps(item, sort_keys=True, ensure_ascii=False)) for item in full_capability_items),
+        default=0,
+    )
+    max_standalone_capability_skill_chars = max(
+        (len(json.dumps(item, sort_keys=True, ensure_ascii=False)) for item in standalone_capability_items),
+        default=0,
+    )
+    primer_context_chars = len(turn_budget.render("primer"))
+    primer_markdown_chars = len(turn_budget.render("primer_markdown"))
+    workflow_context_chars = {
+        name: len(awareness_workflow_context_markdown(name))
+        for name in sorted(workflow_skill_names)
+    }
+    role_context_chars = {name: len(context) for name, context in role_contexts.items()}
+    missing_role_context_roles = sorted(
+        name
+        for name, context in role_contexts.items()
+        if any(marker not in context for marker in ROLE_CONTEXT_MARKERS)
+    )
+    missing_bundled_role_context_roles = sorted(
+        name
+        for name, context in bundled_role_contexts.items()
+        if any(marker not in context for marker in ROLE_CONTEXT_MARKERS)
+    )
+    missing_bundled_role_files = sorted(set(role_contexts) - set(bundled_role_contexts))
+    unexpected_bundled_role_files = sorted(set(bundled_role_contexts) - set(role_contexts))
+    stale_bundled_role_context_roles = sorted(
+        name
+        for name, context in role_contexts.items()
+        if bundled_role_contexts.get(name) is not None and bundled_role_contexts[name] != context
+    )
+    # The verdict is the budget ledger's (`drift_report()`); this smoke only
+    # names the failures the way its payload always has.
+    smoke_budgets = {
+        metric.name: metric
+        for metric in budget_metrics()
+        if metric.name in SKILL_CONTENT_SMOKE_BUDGET_NAMES
+    }
+    over_budget = {
+        item["name"]
+        for item in drift_report(
+            counts=(), budgets=tuple(smoke_budgets.values()), artifacts=(), include_tap_skills=False
+        )["drift"]
+    }
+    awareness_budget_failures = [
+        label for name, label in SKILL_CONTENT_SMOKE_AWARENESS_BUDGETS if name in over_budget
+    ]
+    role_context_budget_failures = [
+        label for name, label in SKILL_CONTENT_SMOKE_ROLE_BUDGETS if name in over_budget
+    ]
+    capability_budget_failures = [
+        label for name, label in SKILL_CONTENT_SMOKE_CAPABILITY_BUDGETS if name in over_budget
+    ]
+    oversized_awareness_contexts = (
+        [
+            name
+            for name, char_count in workflow_context_chars.items()
+            if char_count > _smoke_threshold(smoke_budgets["awareness_workflow_context_chars_max"])
+        ]
+        if "awareness_workflow_context_chars_max" in over_budget
+        else []
+    )
+    oversized_role_contexts = (
+        [
+            name
+            for name, char_count in role_context_chars.items()
+            if char_count > _smoke_threshold(smoke_budgets["role_context_chars_max"])
+        ]
+        if "role_context_chars_max" in over_budget
+        else []
+    )
+    checks: list[dict[str, object]] = []
+
+    def add_check(name: str, marker: str, ok: bool, *, scope: str) -> None:
+        checks.append(
+            {
+                "scope": scope,
+                "skill": name,
+                "marker": marker,
+                "ok": ok,
+            }
+        )
+
+    router = templates.get(DEFAULT_HERMES_SKILL, "")
+    for marker in ROUTER_CONTENT_MARKERS:
+        add_check(DEFAULT_HERMES_SKILL, marker, marker in router, scope="router_awareness")
+
+    missing_representative = [name for name in REPRESENTATIVE_CONTEXT_RAIL_SKILLS if name not in templates]
+    for name, content in sorted(templates.items()):
+        if name == DEFAULT_HERMES_SKILL:
+            continue
+        for marker in WORKFLOW_CONTEXT_MARKERS:
+            add_check(name, marker, marker in content, scope="workflow_context_rail")
+
+    failed_checks = [check for check in checks if not check["ok"]]
+    ok = (
+        not failed_checks
+        and not missing_representative
+        and not missing_awareness_skills
+        and not unexpected_awareness_surfaces
+        and not missing_full_capability_skills
+        and not missing_full_capability_context_skills
+        and not missing_playbook_context_playbooks
+        and not missing_required_playbook_capabilities
+        and not missing_standalone_capability_skills
+        and not unexpected_standalone_capability_skills
+        and not missing_standalone_capability_context_skills
+        and not missing_standalone_playbook_context_playbooks
+        and not missing_required_standalone_playbook_capabilities
+        and not missing_role_context_roles
+        and not missing_bundled_role_context_roles
+        and not missing_bundled_role_files
+        and not unexpected_bundled_role_files
+        and not stale_bundled_role_context_roles
+        and not awareness_budget_failures
+        and not role_context_budget_failures
+        and not capability_budget_failures
+        and not use_case_demo_failures
+        and not use_case_artifact_failures
+        and not use_case_replay_failures
+        and not use_case_readiness_failures
+    )
+    return {
+        "schema_version": SKILL_CONTENT_SMOKE_SCHEMA,
+        "mode": "live",
+        "ok": ok,
+        "observed": True,
+        "skill_count": len(templates),
+        "catalog_skill_count": len(catalog_skill_names),
+        "router_skill": DEFAULT_HERMES_SKILL,
+        "workflow_skill_count": max(len(templates) - 1, 0),
+        "non_installed_catalog_surface_count": len(catalog_skill_names - set(templates)),
+        "representative_skills": list(REPRESENTATIVE_CONTEXT_RAIL_SKILLS),
+        "missing_representative_skills": missing_representative,
+        "awareness_lane_skill_count": len(lane_skill_names),
+        "missing_awareness_lane_skills": missing_awareness_skills,
+        "unexpected_awareness_surfaces": unexpected_awareness_surfaces,
+        "allowed_conceptual_awareness_surfaces": list(CONCEPTUAL_AWARENESS_SURFACES),
+        "full_capability_skill_count": len(full_capability_skill_names),
+        "missing_full_capability_skills": missing_full_capability_skills,
+        "missing_full_capability_context_skills": missing_full_capability_context_skills,
+        "playbook_capability_count": len(full_playbook_items),
+        "standalone_playbook_capability_count": len(standalone_playbook_items),
+        "required_playbook_capability_ids": sorted(required_playbook_ids),
+        "missing_required_playbook_capabilities": missing_required_playbook_capabilities,
+        "missing_required_standalone_playbook_capabilities": missing_required_standalone_playbook_capabilities,
+        "missing_playbook_context_playbooks": missing_playbook_context_playbooks,
+        "missing_standalone_playbook_context_playbooks": missing_standalone_playbook_context_playbooks,
+        "standalone_capability_skill_count": len(standalone_capability_skill_names),
+        "missing_standalone_capability_skills": missing_standalone_capability_skills,
+        "unexpected_standalone_capability_skills": unexpected_standalone_capability_skills,
+        "missing_standalone_capability_context_skills": missing_standalone_capability_context_skills,
+        "role_context_count": len(role_contexts),
+        "missing_role_context_roles": missing_role_context_roles,
+        "bundled_role_context_count": len(bundled_role_contexts),
+        "missing_bundled_role_context_roles": missing_bundled_role_context_roles,
+        "missing_bundled_role_files": missing_bundled_role_files,
+        "unexpected_bundled_role_files": unexpected_bundled_role_files,
+        "stale_bundled_role_context_roles": stale_bundled_role_context_roles,
+        "required_role_context_markers": list(ROLE_CONTEXT_MARKERS),
+        "required_capability_context_fields": sorted(required_standalone_context_fields),
+        "required_standalone_capability_context_fields": sorted(required_standalone_context_fields),
+        "required_playbook_context_fields": sorted(required_playbook_context_fields),
+        "capability_context_char_limits": {
+            "full_skill_section": FULL_CAPABILITY_SKILL_SECTION_CHAR_LIMIT,
+            "full_skill_item": FULL_CAPABILITY_SKILL_ITEM_CHAR_LIMIT,
+            "standalone_skill_section": STANDALONE_CAPABILITY_SKILL_SECTION_CHAR_LIMIT,
+            "standalone_skill_item": STANDALONE_CAPABILITY_SKILL_ITEM_CHAR_LIMIT,
+        },
+        "full_capability_skill_section_chars": full_capability_skill_section_chars,
+        "max_full_capability_skill_chars": max_full_capability_skill_chars,
+        "standalone_capability_skill_section_chars": standalone_capability_skill_section_chars,
+        "max_standalone_capability_skill_chars": max_standalone_capability_skill_chars,
+        "capability_budget_failures": capability_budget_failures,
+        "use_case_demo_collection_schema": use_case_demo_cards.get("schema_version"),
+        "use_case_demo_card_count": len(use_case_demo_cards.get("cards", []))
+        if isinstance(use_case_demo_cards.get("cards"), list)
+        else 0,
+        "expected_use_case_demo_card_count": len(USE_CASES),
+        "use_case_demo_failures": use_case_demo_failures,
+        "use_case_artifact_collection_schema": use_case_artifact_bundle.get("schema_version"),
+        "use_case_artifact_count": len(use_case_artifact_bundle.get("artifacts", []))
+        if isinstance(use_case_artifact_bundle.get("artifacts"), list)
+        else 0,
+        "expected_use_case_artifact_count": len(USE_CASES),
+        "use_case_artifact_failures": use_case_artifact_failures,
+        "use_case_replay_schema": use_case_replay.get("schema_version"),
+        "use_case_replay_status": use_case_replay.get("status"),
+        "use_case_replay_total": use_case_replay.get("total"),
+        "use_case_replay_passed": use_case_replay.get("passed"),
+        "expected_use_case_replay_total": use_case_replay.get("expected_total"),
+        "use_case_replay_failures": use_case_replay_failures,
+        "use_case_readiness_schema": use_case_readiness_payload.get("schema_version"),
+        "use_case_readiness_status": use_case_readiness_payload.get("status"),
+        "use_case_readiness_score": use_case_readiness_payload.get("score"),
+        "use_case_readiness_blocking_failures": use_case_readiness_payload.get("blocking_failures"),
+        "use_case_readiness_warning_count": use_case_readiness_payload.get("warning_count"),
+        "use_case_readiness_failures": use_case_readiness_failures,
+        "use_case_readiness_warnings": use_case_readiness_warnings,
+        "use_case_readiness_boundary": use_case_readiness_payload.get("boundary"),
+        "awareness_context_char_limits": {
+            "primer_context": AWARENESS_PRIMER_CONTEXT_CHAR_LIMIT,
+            "primer_markdown": AWARENESS_PRIMER_MARKDOWN_CHAR_LIMIT,
+            "workflow_context": AWARENESS_WORKFLOW_CONTEXT_CHAR_LIMIT,
+            "role_context": ROLE_CONTEXT_CHAR_LIMIT,
+        },
+        "awareness_primer_context_chars": primer_context_chars,
+        "awareness_primer_markdown_chars": primer_markdown_chars,
+        "max_workflow_context_chars": max(workflow_context_chars.values(), default=0),
+        "max_role_context_chars": max(role_context_chars.values(), default=0),
+        "oversized_awareness_contexts": oversized_awareness_contexts,
+        "awareness_budget_failures": awareness_budget_failures,
+        "oversized_role_contexts": oversized_role_contexts,
+        "role_context_budget_failures": role_context_budget_failures,
+        "checked_marker_count": len(checks),
+        "failed_checks": failed_checks,
+        "proof_boundary": (
+            "This validates generated skill guidance inside the current OMH command package. "
+            "It does not prove the target Hermes profile installed, loaded, selected, or used those skills in chat."
+        ),
+    }
+
+
+def _product_readiness_gate(
+    gate_id: str,
+    title: str,
+    status: str,
+    blocking: bool,
+    summary: str,
+    command: str,
+    errors: Sequence[object] | None,
+    warnings: Sequence[object] | None,
+    proof_boundary: str,
+) -> dict[str, object]:
+    return {
+        "id": gate_id,
+        "title": title,
+        "status": status,
+        "blocking": blocking,
+        "summary": summary,
+        "command": command,
+        "errors": [str(error) for error in errors or []],
+        "warnings": [str(warning) for warning in warnings or []],
+        "proof_boundary": proof_boundary,
+    }
+
+
+def _skill_content_product_errors(payload: Mapping[str, object]) -> list[str]:
+    keys = (
+        "failed_checks",
+        "missing_representative_skills",
+        "missing_awareness_lane_skills",
+        "unexpected_awareness_surfaces",
+        "missing_full_capability_skills",
+        "missing_full_capability_context_skills",
+        "missing_playbook_context_playbooks",
+        "missing_required_playbook_capabilities",
+        "missing_standalone_capability_skills",
+        "unexpected_standalone_capability_skills",
+        "missing_standalone_capability_context_skills",
+        "missing_standalone_playbook_context_playbooks",
+        "missing_required_standalone_playbook_capabilities",
+        "missing_role_context_roles",
+        "missing_bundled_role_context_roles",
+        "missing_bundled_role_files",
+        "unexpected_bundled_role_files",
+        "stale_bundled_role_context_roles",
+        "awareness_budget_failures",
+        "role_context_budget_failures",
+        "capability_budget_failures",
+        "use_case_demo_failures",
+        "use_case_artifact_failures",
+        "use_case_replay_failures",
+        "use_case_readiness_failures",
+    )
+    errors: list[str] = []
+    for key in keys:
+        values = payload.get(key, [])
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes)) and values:
+            errors.append(f"{key}: {len(values)}")
+    if not payload.get("ok"):
+        errors.append("skill_content_smoke_ok_false")
+    return errors
+
+
+def _chat_card_coverage_ready(payload: Mapping[str, object]) -> bool:
+    return not _chat_card_coverage_errors(payload)
+
+
+def _grounded_score_ready(payload: Mapping[str, object]) -> bool:
+    return not _grounded_score_errors(payload)
+
+
+def _route_hint_alignment_ready(payload: Mapping[str, object]) -> bool:
+    return not _route_hint_alignment_errors(payload)
+
+
+def _context_brief_coverage_ready(payload: Mapping[str, object]) -> bool:
+    return not _context_brief_coverage_errors(payload)
+
+
+def _grounded_score_summary_text(payload: Mapping[str, object]) -> str:
+    summary = payload.get("summary")
+    if not isinstance(summary, Mapping):
+        return "grounded score summary missing"
+    total = int(summary.get("scenario_count", 0) or 0)
+    minimum = summary.get("minimum_score", 0)
+    average = summary.get("average_score", 0)
+    maximum = summary.get("maximum_score", 0)
+    perfect_count = sum(
+        1
+        for scenario in _mapping_rows(payload.get("scenarios"))
+        if int(scenario.get("score", 0) or 0) == 10
+    )
+    return f"{perfect_count}/{total} scenarios at 10/10; min {minimum}, avg {average}, max {maximum}"
+
+
+def _grounded_score_errors(payload: Mapping[str, object]) -> list[str]:
+    errors: list[str] = []
+    summary = payload.get("summary")
+    if not isinstance(summary, Mapping):
+        return ["summary_missing"]
+    if not bool(summary.get("all_10")):
+        errors.append("not_all_grounded_scenarios_scored_10")
+    if str(summary.get("score_scale") or "") != "0_to_10":
+        errors.append(f"unexpected_score_scale: {summary.get('score_scale')}")
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, Sequence) or isinstance(scenarios, (str, bytes)):
+        errors.append("scenarios_not_sequence")
+        return errors
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping):
+            errors.append("scenario_not_mapping")
+            continue
+        score = int(scenario.get("score", 0) or 0)
+        if score == 10:
+            continue
+        scenario_id = str(scenario.get("id") or "unknown")
+        failed_checks = [
+            str(check.get("name", "unknown"))
+            for check in _mapping_rows(scenario.get("checks"))
+            if not bool(check.get("passed"))
+        ]
+        errors.append(f"{scenario_id}: score {score}/10 ({', '.join(failed_checks) or 'unknown check failure'})")
+    return errors
+
+
+def _chat_card_coverage_errors(payload: Mapping[str, object]) -> list[str]:
+    errors: list[str] = []
+    summary = payload.get("summary")
+    if not isinstance(summary, Mapping):
+        return ["summary_missing"]
+    if not bool(summary.get("all_passing")):
+        errors.append("not_all_card_coverage_cases_passed")
+    if int(summary.get("generic_ack_count", 0) or 0) != 0:
+        errors.append(f"generic_ack_count: {summary.get('generic_ack_count')}")
+    cases = payload.get("cases")
+    if not isinstance(cases, Sequence) or isinstance(cases, (str, bytes)):
+        errors.append("cases_not_sequence")
+        return errors
+    for case in cases:
+        if not isinstance(case, Mapping) or bool(case.get("passed")):
+            continue
+        case_id = str(case.get("id") or "unknown")
+        issues = case.get("issues")
+        if isinstance(issues, Sequence) and not isinstance(issues, (str, bytes)):
+            issue_text = ", ".join(str(issue) for issue in issues) or "unknown issue"
+        else:
+            issue_text = "unknown issue"
+        errors.append(f"{case_id}: {issue_text}")
+    return errors
+
+
+def _route_hint_alignment_errors(payload: Mapping[str, object]) -> list[str]:
+    errors: list[str] = []
+    summary = payload.get("summary")
+    if not isinstance(summary, Mapping):
+        return ["summary_missing"]
+    if not bool(summary.get("all_aligned")):
+        errors.append("not_all_route_hints_aligned")
+    if int(summary.get("missing_hint_count", 0) or 0):
+        errors.append(f"missing_hint_count: {summary.get('missing_hint_count')}")
+    if int(summary.get("mismatch_count", 0) or 0):
+        errors.append(f"mismatch_count: {summary.get('mismatch_count')}")
+    cases = payload.get("cases")
+    if not isinstance(cases, Sequence) or isinstance(cases, (str, bytes)):
+        errors.append("cases_not_sequence")
+        return errors
+    for case in cases:
+        if not isinstance(case, Mapping) or bool(case.get("aligned")):
+            continue
+        errors.append(
+            f"{case.get('corpus', 'unknown')}:{case.get('id', 'unknown')}: "
+            f"{', '.join(_string_list(case.get('issues'))) or 'unknown alignment failure'}"
+        )
+    return errors
+
+
+def _context_brief_coverage_errors(payload: Mapping[str, object]) -> list[str]:
+    errors: list[str] = []
+    summary = payload.get("summary")
+    if not isinstance(summary, Mapping):
+        return ["summary_missing"]
+    if not bool(summary.get("all_passing")):
+        errors.append("not_all_context_brief_cases_passed")
+    if int(summary.get("route_hint_count", 0) or 0) < 1:
+        errors.append("route_hint_count_zero")
+    if int(summary.get("catalog_question_count", 0) or 0) < 1:
+        errors.append("catalog_question_count_zero")
+    cases = payload.get("cases")
+    if not isinstance(cases, Sequence) or isinstance(cases, (str, bytes)):
+        errors.append("cases_not_sequence")
+        return errors
+    for case in cases:
+        if not isinstance(case, Mapping) or bool(case.get("passed")):
+            continue
+        case_id = str(case.get("id") or "unknown")
+        errors.append(f"{case_id}: {', '.join(_string_list(case.get('issues'))) or 'unknown context failure'}")
+    return errors
+
+
+def _mapping_rows(value: object) -> list[Mapping[str, object]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _blocking_gate_messages(payload: Mapping[str, object]) -> list[str]:
+    gates = payload.get("gates", [])
+    if not isinstance(gates, Sequence) or isinstance(gates, (str, bytes)):
+        return ["gates_not_sequence"]
+    messages = []
+    for gate in gates:
+        if not isinstance(gate, Mapping):
+            messages.append("gate_not_mapping")
+            continue
+        if gate.get("blocking") and gate.get("status") != "passed":
+            messages.append(f"{gate.get('id', 'unknown')}: {gate.get('summary', gate.get('status', 'failed'))}")
+    return messages
+
+
+def _warning_gate_messages(payload: Mapping[str, object]) -> list[str]:
+    gates = payload.get("gates", [])
+    if not isinstance(gates, Sequence) or isinstance(gates, (str, bytes)):
+        return []
+    messages = []
+    for gate in gates:
+        if not isinstance(gate, Mapping):
+            continue
+        if not gate.get("blocking") and gate.get("status") != "passed":
+            messages.append(f"{gate.get('id', 'unknown')}: {gate.get('status', 'warning')}")
+    return messages
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    return [str(item) for item in value]
+
+
+def _product_readiness_next_actions(blocking_failures: Sequence[Mapping[str, object]], warnings: Sequence[str]) -> list[str]:
+    if blocking_failures:
+        return [
+            "Fix blocking product readiness gates, then rerun `omh release product-readiness --json`.",
+            "Use the per-gate command to inspect the failing contract before tagging.",
+        ]
+    actions = [
+        "Write `omh release evidence-bundle --version <version> --write --json` and attach it to the release notes or PR.",
+        "Attach observed evidence for each required release checklist item before tagging or publishing.",
+        "Run one live Hermes tap smoke from the target profile before treating Hermes runtime visibility as observed.",
+        "Use `omh release product-readiness --json` when a wrapper or release note needs the full machine-readable payload.",
+    ]
+    if any(warning.startswith("local_artifact_store:") for warning in warnings):
+        actions.insert(0, "Optional: write local use-case artifacts with `omh cases artifact --all --write --json`.")
+    elif warnings:
+        actions.insert(0, "Review non-blocking warnings; they should be acknowledged but do not block local product readiness.")
+    return actions
+
+
+def require_notes_from_source(repo_root: Path, notes_file: Path, version: str) -> None:
+    """Refuse a notes file that is not the body ``release notes`` derives.
+
+    The comparison is against the published view of the section, bounded the
+    same way ``prepare_notes`` bounds it, not the raw section: a section over
+    the release-body limit is written trimmed, and comparing that file to the
+    untrimmed section refused every oversized release (v3.0.0's first run).
+    """
+    authored = extract_notes(read_bounded(repo_root / 'CHANGELOG.md', MAX_CHANGELOG_BYTES), version)
+    if read_notes(notes_file) != bound_release_body(authored, version):
+        raise ChangelogError('notes_source_mismatch')
+
+
+def release_evidence_bundle(
+    *,
+    version: str = __version__,
+    omh_command: str = "omh",
+    paths: OmhPaths | None = None,
+    write: bool = False,
+    repo_root: str | Path | None = None,
+    artifact: str | Path | None = None,
+    archive_digest: str = "",
+    artifact_digest: str = "",
+    runner: Callable[..., object] | None = None,
+    notes_file: str | Path | None = None,
+) -> dict[str, object]:
+    release_version = _normalize_release_version(version)
+    notes = notes_metadata(Path(notes_file), release_version) if notes_file is not None else None
+    if notes_file is not None:
+        if repo_root is None:
+            raise ChangelogError('notes_source_required')
+        require_notes_from_source(Path(repo_root), Path(notes_file), release_version)
+    resolved_paths = paths or OmhPaths(omh_home=Path("~/.omh").expanduser(), hermes_home=Path("~/.hermes").expanduser())
+    probe_kwargs: dict[str, object] = {}
+    if runner is not None:
+        probe_kwargs["runner"] = runner
+    source_identity = probe_source_identity(
+        repo_root,
+        archive_digest=archive_digest,
+        artifact_digest=artifact_digest,
+        **probe_kwargs,
+    )
+    source_identity["input_manifest"] = build_input_manifest(
+        source_identity=source_identity,
+        paths=resolved_paths,
+        artifact=artifact,
+        release_notes=notes,
+    )
+    quality_evidence = _build_release_quality_evidence(release_version=release_version, omh_command=omh_command)
+    checklist = quality_evidence.checklist
+    product = _product_readiness_report_from_evidence(
+        release_version=release_version,
+        omh_command=omh_command,
+        evidence=quality_evidence,
+        paths=resolved_paths,
+    )
+    skill_content = quality_evidence.skill_content
+    use_cases = use_case_readiness(resolved_paths)
+    grounded_score = quality_evidence.grounded_score
+    chat_cards = quality_evidence.chat_cards
+    route_hints = quality_evidence.route_hints
+    context_briefs = quality_evidence.context_briefs
+    routing_precision = quality_evidence.routing_precision
+    native_competition = quality_evidence.native_competition
+    localized_chat_copy = quality_evidence.localized_chat_copy
+    router_fast_path = quality_evidence.router_fast_path
+    common_request_coverage = quality_evidence.common_request_coverage
+    hermes_ux = quality_evidence.hermes_ux
+    parity = quality_evidence.parity
+    local_store_status = _release_local_store_status(use_cases)
+    required_status = {
+        "release_checklist": "passed" if checklist.get("ok") else "failed",
+        "product_readiness": "passed" if product.get("status") == "ready" else "failed",
+        "skill_content": "passed" if skill_content.get("ok") else "failed",
+        "use_case_readiness": "passed" if use_cases.get("blocking_failures") == 0 else "failed",
+        "grounded_score": "passed" if _grounded_score_ready(grounded_score) else "failed",
+        "chat_card_coverage": "passed" if _chat_card_coverage_ready(chat_cards) else "failed",
+        "route_hint_alignment": "passed" if _route_hint_alignment_ready(route_hints) else "failed",
+        "context_brief_coverage": "passed" if _context_brief_coverage_ready(context_briefs) else "failed",
+        "routing_precision": "passed" if not routing_precision_errors(routing_precision) else "failed",
+        "native_competition": "passed" if not native_skill_competition_errors(native_competition) else "failed",
+        "localized_chat_copy": "passed" if not localized_chat_copy_errors(localized_chat_copy) else "failed",
+        "router_fast_path": "passed" if not router_fast_path_errors(router_fast_path) else "failed",
+        "common_request_coverage": "passed" if not common_request_coverage_errors(common_request_coverage) else "failed",
+        "hermes_ux_quality": "passed" if not hermes_ux_quality_errors(hermes_ux) else "failed",
+        "parity_contracts": "passed" if _parity_contracts_ready(parity) else "failed",
+    }
+    blocking_failures = [
+        f"{gate_id}: {status}"
+        for gate_id, status in required_status.items()
+        if status != "passed"
+    ]
+    warnings = []
+    if local_store_status != "passed":
+        warnings.append(f"local_artifact_store: {local_store_status}")
+    identity_available = source_identity.get("identity_status") == "available"
+    if not identity_available:
+        warnings.append(
+            "source_identity: unavailable; pass --repo-root, --archive-digest, or --artifact-digest "
+            "so the bundle is bound to an immutable source revision"
+        )
+    if notes is None:
+        warnings.append('release_notes: not_recorded; regenerate from the immutable tag with --notes-file before publication')
+    publication_ready = not blocking_failures and identity_available and notes is not None and source_identity.get('dirty') is not True
+    grounded_score_summary = grounded_score.get("summary", {}) if isinstance(grounded_score.get("summary"), Mapping) else {}
+    chat_card_summary = chat_cards.get("summary", {}) if isinstance(chat_cards.get("summary"), Mapping) else {}
+    route_hint_summary = route_hints.get("summary", {}) if isinstance(route_hints.get("summary"), Mapping) else {}
+    context_brief_summary = (
+        context_briefs.get("summary", {}) if isinstance(context_briefs.get("summary"), Mapping) else {}
+    )
+    routing_precision_summary = (
+        routing_precision.get("summary", {}) if isinstance(routing_precision.get("summary"), Mapping) else {}
+    )
+    localized_chat_copy_summary = (
+        localized_chat_copy.get("summary", {}) if isinstance(localized_chat_copy.get("summary"), Mapping) else {}
+    )
+    router_fast_path_summary = (
+        router_fast_path.get("summary", {}) if isinstance(router_fast_path.get("summary"), Mapping) else {}
+    )
+    common_request_summary = (
+        common_request_coverage.get("summary", {})
+        if isinstance(common_request_coverage.get("summary"), Mapping)
+        else {}
+    )
+    hermes_ux_summary = hermes_ux.get("summary", {}) if isinstance(hermes_ux.get("summary"), Mapping) else {}
+    payload: dict[str, object] = {
+        "schema_version": RELEASE_EVIDENCE_BUNDLE_SCHEMA,
+        "mode": "live",
+        "observed": True,
+        "written": False,
+        "version": release_version,
+        "tag": f"v{release_version}",
+        "created_at": utc_now(),
+        "status": "ready" if not blocking_failures and (identity_available or not write) else "needs_attention",
+        "publication_ready": publication_ready,
+        "blocking_failures": blocking_failures,
+        "warnings": warnings,
+        "source_identity": source_identity,
+        "summary": {
+            "release_checklist_required_items": checklist.get("required_item_count"),
+            "product_readiness_status": product.get("status"),
+            "product_readiness_score": product.get("score"),
+            "skill_content_ok": skill_content.get("ok"),
+            "use_case_readiness_status": use_cases.get("status"),
+            "use_case_readiness_score": use_cases.get("score"),
+            "grounded_score_perfect": sum(
+                1
+                for scenario in _mapping_rows(grounded_score.get("scenarios"))
+                if int(scenario.get("score", 0) or 0) == 10
+            ),
+            "grounded_score_total": grounded_score_summary.get("scenario_count"),
+            "grounded_score_average": grounded_score_summary.get("average_score"),
+            "chat_card_coverage_passing": chat_card_summary.get("passing_count"),
+            "chat_card_coverage_total": chat_card_summary.get("case_count"),
+            "chat_card_generic_ack_count": chat_card_summary.get("generic_ack_count"),
+            "route_hint_alignment_aligned": route_hint_summary.get("aligned_count"),
+            "route_hint_alignment_total": route_hint_summary.get("case_count"),
+            "route_hint_missing_count": route_hint_summary.get("missing_hint_count"),
+            "route_hint_mismatch_count": route_hint_summary.get("mismatch_count"),
+            "context_brief_coverage_passing": context_brief_summary.get("passing_count"),
+            "context_brief_coverage_total": context_brief_summary.get("case_count"),
+            "context_brief_route_hint_count": context_brief_summary.get("route_hint_count"),
+            "context_brief_catalog_question_count": context_brief_summary.get("catalog_question_count"),
+            "routing_precision_passing": routing_precision_summary.get("passing_count"),
+            "routing_precision_total": routing_precision_summary.get("case_count"),
+            "routing_precision_overroute_count": routing_precision_summary.get("overroute_count"),
+            "routing_precision_catalog_picker_count": routing_precision_summary.get("catalog_picker_count"),
+            "routing_precision_generic_ack_count": routing_precision_summary.get("generic_ack_count"),
+            "routing_precision_intervention_passing": routing_precision_summary.get("intervention_passing_count"),
+            "routing_precision_intervention_total": routing_precision_summary.get("intervention_case_count"),
+            "routing_precision_missed_intervention_count": routing_precision_summary.get("missed_intervention_count"),
+            "native_competition_passing_cases": native_competition.get("passed_count"),
+            "native_competition_total_cases": native_competition.get("case_count"),
+            "localized_chat_copy_passing": localized_chat_copy_summary.get("passing_count"),
+            "localized_chat_copy_total": localized_chat_copy_summary.get("case_count"),
+            "localized_chat_copy_locale_count": localized_chat_copy_summary.get("locale_count"),
+            "router_fast_path_passing": router_fast_path_summary.get("passing_count"),
+            "router_fast_path_total": router_fast_path_summary.get("case_count"),
+            "router_fast_path_missing_marker_count": router_fast_path_summary.get("missing_marker_count"),
+            "common_request_coverage_passing": common_request_summary.get("passing_count"),
+            "common_request_coverage_total": common_request_summary.get("case_count"),
+            "common_request_coverage_percent": common_request_summary.get("coverage_percent"),
+            "common_request_coverage_target": common_request_coverage.get("target_percent"),
+            "common_request_generic_ack_count": common_request_summary.get("generic_ack_count"),
+            "popular_plugin_family_covered": common_request_summary.get("popular_plugin_covered_family_count"),
+            "popular_plugin_family_total": common_request_summary.get("popular_plugin_family_count"),
+            "popular_plugin_weighted_coverage_percent": common_request_summary.get(
+                "popular_plugin_weighted_coverage_percent"
+            ),
+            "hermes_ux_quality_score": hermes_ux.get("score"),
+            "hermes_ux_quality_passing_gates": hermes_ux_summary.get("passing_gate_count"),
+            "hermes_ux_quality_total_gates": hermes_ux_summary.get("gate_count"),
+            "local_artifact_store": local_store_status,
+            "parity_available": (parity.get("summary") or {}).get("available")
+            if isinstance(parity.get("summary"), Mapping)
+            else None,
+            "parity_capability_count": (parity.get("summary") or {}).get("capability_count")
+            if isinstance(parity.get("summary"), Mapping)
+            else None,
+        },
+        "evidence": {
+            "release_checklist": checklist,
+            "documentation_claims": quality_evidence.documentation_claims,
+            "product_readiness": product,
+            "skill_content": skill_content,
+            "use_case_readiness": use_cases,
+            "grounded_score": grounded_score,
+            "chat_card_coverage": chat_cards,
+            "route_hint_alignment": route_hints,
+            "context_brief_coverage": context_briefs,
+            "routing_precision": routing_precision,
+            "native_competition": native_competition,
+            "localized_chat_copy": localized_chat_copy,
+            "router_fast_path": router_fast_path,
+            "common_request_coverage": common_request_coverage,
+            "hermes_ux_quality": hermes_ux,
+            "parity_contracts": parity,
+        },
+        "claims": [
+            "deterministic_local_package_contracts_checked",
+            "release_checklist_indexed",
+            "product_readiness_rollup_ready",
+            "skill_content_smoke_ready",
+            "g1_to_g10_use_case_readiness_ready",
+            "grounded_score_ready",
+            "chat_card_coverage_ready",
+            "route_hint_alignment_ready",
+            "context_brief_coverage_ready",
+            "routing_precision_ready",
+            "native_competition_ready",
+            "localized_chat_copy_ready",
+            "router_fast_path_ready",
+            "common_request_coverage_ready",
+            "hermes_ux_quality_ready",
+            "parity_contract_matrix_ready",
+            "source_revision_bound",
+            "input_manifest_digest_recorded",
+        ],
+        "not_evidence_for": [
+            "live_hermes_chat_selection",
+            "connector_execution",
+            "executor_dispatch",
+            "implementation",
+            "review",
+            "ci",
+            "merge",
+            "delivery",
+            "billing_or_provider_budget",
+            "github_release_publication",
+        ],
+        "next_actions": _release_evidence_next_actions(blocking_failures, local_store_status),
+        "boundary": (
+            "A release evidence bundle packages deterministic local OMH evidence and optional local artifact-store state, "
+            "bound to the recorded source revision and declared input digests. It proves evidence provenance for the "
+            "recorded revision; it does not prove deployment, adoption, or runtime behavior outside the executed gates, "
+            "and it does not mutate Hermes, run live profile smoke, call connectors, dispatch executors, review code, "
+            "pass CI, merge, deliver messages, publish GitHub releases, or prove provider billing/quota truth."
+        ),
+    }
+    if notes is not None:
+        payload['release_notes'] = notes
+    if write:
+        artifact_path = resolved_paths.release_evidence_dir / f"{release_version}.json"
+        payload["written"] = True
+        payload["artifact_path"] = str(artifact_path)
+        # The persisted bundle names its artifact by basename only: the file is
+        # meant to be attached to release PRs and published as a release asset,
+        # so the maintainer's absolute home path must not leak into it. The
+        # absolute path stays in the returned (stdout) payload only.
+        persisted = dict(payload)
+        persisted["artifact_path"] = artifact_path.name
+        atomic_write_json(artifact_path, persisted, private=True)
+        _write_release_evidence_index(resolved_paths, persisted)
+    else:
+        payload["artifact_path"] = str(resolved_paths.release_evidence_dir / f"{release_version}.json")
+    return payload
+
+
+def _release_evidence_next_actions(blocking_failures: Sequence[str], local_store_status: str) -> list[str]:
+    if blocking_failures:
+        return [
+            "Fix blocking bundle gates, then rerun `omh release evidence-bundle --write --json`.",
+            "Inspect the nested evidence payload for the failing gate before tagging.",
+        ]
+    actions = [
+        "Attach this bundle to the release PR or release notes as local deterministic evidence.",
+        "Run the required CI and live Hermes smoke separately; this bundle does not observe those remote/runtime gates.",
+    ]
+    if local_store_status != "passed":
+        actions.insert(0, "Run `omh cases artifact --all --write --json` if you want the optional local use-case artifact store populated.")
+    return actions
+
+
+def _release_local_store_status(use_case_payload: Mapping[str, object]) -> str:
+    gates = use_case_payload.get("gates", [])
+    if not isinstance(gates, Sequence) or isinstance(gates, (str, bytes)):
+        return "unknown"
+    for gate in gates:
+        if isinstance(gate, Mapping) and gate.get("id") == "local_artifact_store":
+            return str(gate.get("status") or "unknown")
+    return "missing"
+
+
+def _parity_contracts_ready(payload: Mapping[str, object]) -> bool:
+    summary = payload.get("summary")
+    if not isinstance(summary, Mapping):
+        return False
+    for key in ("partial", "planned", "deferred"):
+        if int(summary.get(key, 0) or 0) != 0:
+            return False
+    return int(summary.get("available", 0) or 0) == int(summary.get("capability_count", 0) or 0)
+
+
+def _write_release_evidence_index(paths: OmhPaths, payload: Mapping[str, object]) -> None:
+    version = str(payload.get("version") or "")
+    artifact_path = str(payload.get("artifact_path") or "")
+    existing, _ = read_json_object_result(paths.release_evidence_index_path)
+    entries = []
+    if existing and isinstance(existing.get("entries"), list):
+        entries = [entry for entry in existing["entries"] if isinstance(entry, dict) and entry.get("version") != version]
+    source_identity = payload.get("source_identity")
+    if not isinstance(source_identity, Mapping):
+        source_identity = {}
+    entries.append(
+        {
+            "version": version,
+            "tag": payload.get("tag"),
+            "status": payload.get("status"),
+            "created_at": payload.get("created_at"),
+            "artifact_path": artifact_path,
+            "schema_version": payload.get("schema_version"),
+            "commit_sha": source_identity.get("commit_sha"),
+            "tree_sha": source_identity.get("tree_sha"),
+        }
+    )
+    entries.sort(key=lambda entry: str(entry.get("created_at") or ""))
+    index = {
+        "schema_version": "omh_release_evidence_index/v1",
+        "latest_version": version,
+        "latest_artifact_path": artifact_path,
+        "count": len(entries),
+        "entries": entries,
+    }
+    atomic_write_json(paths.release_evidence_index_path, index, private=True)
+
+
+def _use_case_demo_card_failures(payload: Mapping[str, object]) -> list[str]:
+    failures: list[str] = []
+    if payload.get("schema_version") != "omh_use_case_demo_collection/v1":
+        failures.append("collection_schema")
+    cards = payload.get("cards", [])
+    if not isinstance(cards, Sequence) or isinstance(cards, (str, bytes)):
+        return failures + ["cards_not_sequence"]
+    if len(cards) != len(USE_CASES):
+        failures.append("card_count")
+    expected_goals = [case.goal for case in USE_CASES]
+    observed_goals: list[str] = []
+    for index, card in enumerate(cards):
+        if not isinstance(card, Mapping):
+            failures.append(f"card_{index}_not_mapping")
+            continue
+        goal = str(card.get("goal") or "")
+        observed_goals.append(goal)
+        if card.get("schema_version") != "omh_use_case_demo_card/v1":
+            failures.append(f"{goal or index}_schema")
+        route = card.get("route")
+        wrapper_card = card.get("wrapper_card")
+        evidence = card.get("evidence")
+        actions = card.get("actions")
+        chat_surface = card.get("chat_surface")
+        if not isinstance(route, Mapping) or not route.get("primary_skill") or not route.get("next_action"):
+            failures.append(f"{goal or index}_route")
+        if not isinstance(wrapper_card, Mapping) or wrapper_card.get("component") != "omh_use_case_card":
+            failures.append(f"{goal or index}_wrapper_card")
+        if isinstance(wrapper_card, Mapping) and wrapper_card.get("status") != "prepared_not_observed":
+            failures.append(f"{goal or index}_wrapper_status")
+        if not isinstance(evidence, Mapping) or evidence.get("state") != "prepared_not_observed":
+            failures.append(f"{goal or index}_evidence_state")
+        boundary = str(evidence.get("claim_boundary") if isinstance(evidence, Mapping) else "")
+        if "not " not in boundary.casefold() or "evidence" not in boundary.casefold():
+            failures.append(f"{goal or index}_boundary")
+        if not isinstance(actions, Sequence) or isinstance(actions, (str, bytes)) or not actions:
+            failures.append(f"{goal or index}_actions")
+        elif isinstance(route, Mapping) and isinstance(actions[0], Mapping) and actions[0].get("id") != route.get("next_action"):
+            failures.append(f"{goal or index}_primary_action")
+        if not isinstance(chat_surface, Mapping) or not str(chat_surface.get("headline") or "").startswith("[omh] "):
+            failures.append(f"{goal or index}_chat_surface")
+    if observed_goals != expected_goals:
+        failures.append("goal_order")
+    return failures
+
+
+def _use_case_artifact_failures(payload: Mapping[str, object]) -> list[str]:
+    failures: list[str] = []
+    if payload.get("schema_version") != "omh_use_case_artifact_collection/v1":
+        failures.append("collection_schema")
+    artifacts = payload.get("artifacts", [])
+    if not isinstance(artifacts, Sequence) or isinstance(artifacts, (str, bytes)):
+        return failures + ["artifacts_not_sequence"]
+    if len(artifacts) != len(USE_CASES):
+        failures.append("artifact_count")
+    expected_goals = [case.goal for case in USE_CASES]
+    observed_goals: list[str] = []
+    for index, artifact in enumerate(artifacts):
+        if not isinstance(artifact, dict):
+            failures.append(f"artifact_{index}_not_mapping")
+            continue
+        goal = str(artifact.get("goal") or "")
+        observed_goals.append(goal)
+        for error in validate_use_case_artifact(artifact):
+            failures.append(f"{goal or index}: {error}")
+        steps = artifact.get("operator_steps", [])
+        if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
+            failures.append(f"{goal or index}_operator_steps")
+        elif not any(isinstance(step, Mapping) and step.get("kind") == "hermes_prompt" for step in steps):
+            failures.append(f"{goal or index}_missing_hermes_prompt_step")
+        proof_surfaces = artifact.get("proof_surfaces", [])
+        if not isinstance(proof_surfaces, Sequence) or isinstance(proof_surfaces, (str, bytes)):
+            failures.append(f"{goal or index}_proof_surfaces")
+        elif "omh cases validate --json" not in proof_surfaces:
+            failures.append(f"{goal or index}_missing_validate_surface")
+    if observed_goals != expected_goals:
+        failures.append("goal_order")
+    return failures
+
+
+def _use_case_replay_failures(payload: Mapping[str, object]) -> list[str]:
+    failures: list[str] = []
+    if payload.get("schema_version") != "omh_use_case_replay/v1":
+        failures.append("schema")
+    if payload.get("status") != "passed":
+        failures.append("status")
+    results = payload.get("results", [])
+    if not isinstance(results, Sequence) or isinstance(results, (str, bytes)):
+        return failures + ["results_not_sequence"]
+    expected_goals = {case.goal for case in USE_CASES}
+    covered_goals = {str(result.get("goal", "")) for result in results if isinstance(result, Mapping)}
+    if covered_goals != expected_goals:
+        failures.append("goal_coverage")
+    if len(results) < len(USE_CASES):
+        failures.append("fixture_count")
+    for index, result in enumerate(results):
+        if not isinstance(result, Mapping):
+            failures.append(f"result_{index}_not_mapping")
+            continue
+        if result.get("status") != "passed":
+            failures.append(f"{result.get('fixture_id', index)}_failed")
+        expected = result.get("expected", {})
+        observed = result.get("observed", {})
+        if not isinstance(expected, Mapping) or not isinstance(observed, Mapping):
+            failures.append(f"{result.get('fixture_id', index)}_route_shape")
+            continue
+        if expected.get("goal") != observed.get("goal"):
+            failures.append(f"{result.get('fixture_id', index)}_goal")
+        if expected.get("primary_skill") != observed.get("primary_skill"):
+            failures.append(f"{result.get('fixture_id', index)}_primary_skill")
+    return failures
+
+
+def _bundled_role_contexts() -> dict[str, str]:
+    try:
+        root = resources.files("omh.plugin_bundle.omh.references")
+    except (ModuleNotFoundError, FileNotFoundError):
+        return {}
+    contexts: dict[str, str] = {}
+    for path in root.iterdir():
+        if not path.is_file() or not path.name.startswith("role-") or path.name == "role-.md":
+            continue
+        role_id = path.name.removeprefix("role-").removesuffix(".md")
+        try:
+            contexts[role_id] = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return contexts
+
+
+def _awareness_lane_skill_names(payload: Mapping[str, object]) -> set[str]:
+    names: set[str] = set()
+    lanes = payload.get("lanes", [])
+    if not isinstance(lanes, Sequence) or isinstance(lanes, (str, bytes)):
+        return names
+    for lane in lanes:
+        if not isinstance(lane, Mapping):
+            continue
+        skills = lane.get("skills", [])
+        if not isinstance(skills, Sequence) or isinstance(skills, (str, bytes)):
+            continue
+        names.update(str(skill) for skill in skills)
+    return names
+
+
+def first_use_status_smoke_plan(
+    *,
+    omh_command: str = "omh",
+    omh_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+    message: str = DEFAULT_FIRST_USE_MESSAGE,
+) -> dict[str, object]:
+    target = _target_binding(omh_home=omh_home, hermes_home=hermes_home)
+    session_id = "<session_id>"
+    return {
+        "schema_version": FIRST_USE_STATUS_SMOKE_SCHEMA,
+        "mode": "plan",
+        "ok": True,
+        "observed": False,
+        "example_message": message,
+        "target_binding": target,
+        "proof_boundary": (
+            "This first-use smoke is fixture-backed guidance for wrapper/Hermes status UX. It does not prove "
+            "a live chat selected OMH unless the wrapper records that chat response."
+        ),
+        "steps": [
+            {
+                "name": "chat_session_start",
+                "command": list(
+                    _omh_scoped_command(
+                        omh_command,
+                        "chat",
+                        "session",
+                        "start",
+                        "--source",
+                        "hermes",
+                        "--source-event-id",
+                        "release-smoke-message",
+                        "--channel-ref",
+                        "release-smoke",
+                        message,
+                        omh_home=target["omh_home"],
+                        hermes_home=target["hermes_home"],
+                    )
+                ),
+                "phase": "verify",
+                "mutates_profile": False,
+                "required": True,
+                "expected": "Creates or resumes a metadata-only wrapper session and returns a status card without executor open/result actions.",
+                "proof_boundary": "Starting a wrapper session is routing/status evidence only; it is not execution evidence.",
+            },
+            {
+                "name": "chat_session_accept_plan",
+                "command": list(
+                    _omh_scoped_command(
+                        omh_command,
+                        "chat",
+                        "session",
+                        "accept-plan",
+                        session_id,
+                        omh_home=target["omh_home"],
+                        hermes_home=target["hermes_home"],
+                    )
+                ),
+                "phase": "verify",
+                "mutates_profile": False,
+                "required": True,
+                "expected": "Records explicit plan acceptance before any coding handoff can be prepared.",
+                "proof_boundary": "Plan acceptance is a wrapper decision; it is still not dispatch or execution evidence.",
+            },
+            {
+                "name": "chat_session_select_executor",
+                "command": list(
+                    _omh_scoped_command(
+                        omh_command,
+                        "chat",
+                        "session",
+                        "select-executor",
+                        session_id,
+                        "codex",
+                        omh_home=target["omh_home"],
+                        hermes_home=target["hermes_home"],
+                    )
+                ),
+                "phase": "verify",
+                "mutates_profile": False,
+                "required": True,
+                "expected": "Records the selected coding agent before backend open/attach actions become visible.",
+                "proof_boundary": "Executor selection is not executor dispatch; it only chooses the handoff target.",
+            },
+            {
+                "name": "chat_session_prepare_handoff",
+                "command": list(
+                    _omh_scoped_command(
+                        omh_command,
+                        "chat",
+                        "session",
+                        "prepare-handoff",
+                        session_id,
+                        message,
+                        omh_home=target["omh_home"],
+                        hermes_home=target["hermes_home"],
+                    )
+                ),
+                "phase": "verify",
+                "mutates_profile": False,
+                "required": True,
+                "expected": "Prepares the coding handoff while keeping dispatch/result/verification not observed.",
+                "proof_boundary": "A prepared handoff is not an observed executor open, result, review, CI, or merge.",
+            },
+            {
+                "name": "chat_session_status_after_handoff",
+                "command": list(
+                    _omh_scoped_command(
+                        omh_command,
+                        "chat",
+                        "session",
+                        "status",
+                        session_id,
+                        omh_home=target["omh_home"],
+                        hermes_home=target["hermes_home"],
+                    )
+                ),
+                "phase": "verify",
+                "mutates_profile": False,
+                "required": True,
+                "expected": "After plan acceptance, executor selection, and handoff preparation, status shows prepared handoff without observed dispatch/result.",
+                "proof_boundary": "Prepared handoff status remains prepared_not_observed until dispatch/result evidence is recorded.",
+            },
+        ],
+        "expected_status_boundary": {
+            "before_handoff": {
+                "executor_actions_visible": False,
+                "forbidden_action_ids": [
+                    "open_executor_session",
+                    "attach_executor_session",
+                    "record_executor_completed",
+                    "record_executor_blocked",
+                    "record_executor_cancelled",
+                    "record_executor_failed",
+                    "ask_hermes_verify",
+                ],
+            },
+            "after_handoff": {
+                "handoff": "prepared",
+                "dispatch": "not_observed",
+                "result": "not_observed",
+                "verification": "not_requested",
+            },
+        },
+    }
+
+
+def run_hermes_release_smoke(
+    *,
+    install_path: str = "tap",
+    skill: str = DEFAULT_HERMES_SKILL,
+    tap: str = DEFAULT_HERMES_TAP,
+    omh_command: str = "omh",
+    omh_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+    timeout_seconds: int = 30,
+    runner: Runner | None = None,
+    include_command_smoke: bool = False,
+) -> dict[str, object]:
+    if timeout_seconds < 1:
+        raise ValueError("Hermes smoke timeout must be at least one second")
+    target = _target_binding(omh_home=omh_home, hermes_home=hermes_home)
+    steps = hermes_release_smoke_steps(
+        install_path=install_path,
+        skill=skill,
+        tap=tap,
+        omh_command=omh_command,
+        omh_home=target["omh_home"],
+        hermes_home=target["hermes_home"],
+    )
+    execute = runner or subprocess_runner
+    command_smoke = (
+        run_installed_command_smoke(
+            omh_command=omh_command,
+            omh_home=target["omh_home"],
+            hermes_home=target["hermes_home"],
+            timeout_seconds=timeout_seconds,
+            runner=execute,
+        )
+        if include_command_smoke
+        else installed_command_smoke_plan(
+            omh_command=omh_command,
+            omh_home=target["omh_home"],
+            hermes_home=target["hermes_home"],
+        )
+    )
+    hermes_path = shutil.which("hermes")
+    if include_command_smoke and not bool(command_smoke.get("ok", False)):
+        return {
+            "schema_version": HERMES_SMOKE_SCHEMA,
+            "mode": "live",
+            "ok": False,
+            "observed": bool(command_smoke.get("observed", False)),
+            "install_path": install_path,
+            "skill": skill,
+            "tap": tap,
+            "target_binding": target,
+            "hermes_cli": {"found": bool(hermes_path), "path": hermes_path},
+            "results": [],
+            "installed_command_smoke": command_smoke,
+            "first_use_status_smoke": first_use_status_smoke_plan(
+                omh_command=omh_command,
+                omh_home=target["omh_home"],
+                hermes_home=target["hermes_home"],
+            ),
+            "failed_step": "installed_command_smoke",
+            "recommended_next_action": _hermes_smoke_next_action(False, "installed_command_smoke"),
+            "proof_boundary": (
+                "Installed command smoke failed before live Hermes profile mutation. No Hermes install, list, "
+                "check, or inspect command was run."
+            ),
+        }
+    results: list[dict[str, object]] = []
+    smoke_env = {"HERMES_HOME": str(target["hermes_home"])}
+    if not hermes_path:
+        return {
+            "schema_version": HERMES_SMOKE_SCHEMA,
+            "mode": "live",
+            "ok": False,
+            "observed": False,
+            "install_path": install_path,
+            "skill": skill,
+            "tap": tap,
+            "target_binding": target,
+            "hermes_cli": {"found": False, "path": None},
+            "results": [],
+            "installed_command_smoke": command_smoke,
+            "first_use_status_smoke": first_use_status_smoke_plan(
+                omh_command=omh_command,
+                omh_home=target["omh_home"],
+                hermes_home=target["hermes_home"],
+            ),
+            "failed_step": "hermes_cli",
+            "recommended_next_action": "Install Hermes Agent CLI or run this smoke from the target Hermes profile.",
+            "proof_boundary": "No Hermes CLI was observed, so no Hermes install, list, check, or inspect evidence exists.",
+        }
+    ok = True
+    failed_step = ""
+    for step in steps:
+        result = execute(step.command, timeout_seconds, smoke_env)
+        step_ok = result.returncode == 0
+        ok = ok and step_ok
+        results.append(
+            {
+                **step.to_payload(),
+                "returncode": result.returncode,
+                "ok": step_ok,
+                "environment": {"HERMES_HOME": smoke_env["HERMES_HOME"]},
+                "stdout_excerpt": bounded_text(result.stdout),
+                "stderr_excerpt": bounded_text(result.stderr),
+            }
+        )
+        if not step_ok and not failed_step:
+            failed_step = step.name
+            if step.required:
+                break
+    if include_command_smoke and not bool(command_smoke.get("ok", False)):
+        ok = False
+        if not failed_step:
+            failed_step = "installed_command_smoke"
+    return {
+        "schema_version": HERMES_SMOKE_SCHEMA,
+        "mode": "live",
+        "ok": ok,
+        "observed": bool(results),
+        "install_path": install_path,
+        "skill": skill,
+        "tap": tap,
+        "target_binding": target,
+        "hermes_cli": {"found": True, "path": hermes_path},
+        "results": results,
+        "installed_command_smoke": command_smoke,
+        "first_use_status_smoke": first_use_status_smoke_plan(
+            omh_command=omh_command,
+            omh_home=target["omh_home"],
+            hermes_home=target["hermes_home"],
+        ),
+        "failed_step": failed_step,
+        "recommended_next_action": _hermes_smoke_next_action(ok, failed_step),
+        "proof_boundary": (
+            "Live smoke observes Hermes CLI install/list/check/inspect command results only. "
+            "It still does not prove a later chat session selected OMH unless that session is observed separately."
+        ),
+    }
+
+
+def run_installed_command_smoke(
+    *,
+    omh_command: str = "omh",
+    omh_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+    timeout_seconds: int = 30,
+    runner: Runner | None = None,
+) -> dict[str, object]:
+    if timeout_seconds < 1:
+        raise ValueError("Installed command smoke timeout must be at least one second")
+    plan = installed_command_smoke_plan(omh_command=omh_command, omh_home=omh_home, hermes_home=hermes_home)
+    target = plan["target_binding"]
+    execute = runner or subprocess_runner
+    path_check = inspect_installed_command_path(omh_command)
+    if not bool(path_check["ok"]):
+        return {
+            "schema_version": INSTALLED_COMMAND_SMOKE_SCHEMA,
+            "mode": "live",
+            "ok": False,
+            "observed": False,
+            "command_under_test": omh_command,
+            "target_binding": target,
+            "path_check": path_check,
+            "results": [],
+            "failed_step": "installed_omh_path",
+            "recommended_next_action": _installed_command_smoke_next_action(
+                False,
+                "installed_omh_path",
+                command_under_test=omh_command,
+            ),
+            "proof_boundary": (
+                "Installed command smoke did not execute because the OMH command was not discoverable or "
+                "executable. PATH resolution is recorded separately in path_check."
+            ),
+        }
+    results: list[dict[str, object]] = []
+    ok = True
+    failed_step = ""
+    for raw_step in plan["steps"]:
+        step = HermesSmokeStep(
+            str(raw_step["name"]),
+            tuple(str(part) for part in raw_step["command"]),
+            str(raw_step["phase"]),
+            bool(raw_step["mutates_profile"]),
+            required=bool(raw_step["required"]),
+            proof_boundary=str(raw_step["proof_boundary"]),
+        )
+        result = execute(step.command, timeout_seconds, None)
+        step_ok = result.returncode == 0
+        ok = ok and step_ok
+        results.append(
+            {
+                **step.to_payload(),
+                "returncode": result.returncode,
+                "ok": step_ok,
+                "stdout_excerpt": bounded_text(result.stdout),
+                "stderr_excerpt": bounded_text(result.stderr),
+            }
+        )
+        if not step_ok and not failed_step:
+            failed_step = step.name
+            if step.required:
+                break
+    return {
+        "schema_version": INSTALLED_COMMAND_SMOKE_SCHEMA,
+        "mode": "live",
+        "ok": ok,
+        "observed": bool(results),
+        "command_under_test": omh_command,
+        "target_binding": target,
+        "path_check": path_check,
+        "results": results,
+        "failed_step": failed_step,
+        "recommended_next_action": _installed_command_smoke_next_action(
+            ok,
+            failed_step,
+            command_under_test=omh_command,
+        ),
+        "proof_boundary": (
+            "Installed command smoke observes the OMH console script, generated skill guidance, and plan rendering only. "
+            "It does not mutate Hermes or prove live chat usage."
+        ),
+    }
+
+
+def _target_binding(*, omh_home: str | Path | None = None, hermes_home: str | Path | None = None) -> dict[str, object]:
+    omh = expand_home(omh_home, "OMH_HOME", "~/.omh")
+    hermes = expand_home(hermes_home, "HERMES_HOME", "~/.hermes")
+    return {
+        "omh_home": str(omh),
+        "hermes_home": str(hermes),
+        "explicit_omh_home": omh_home is not None,
+        "explicit_hermes_home": hermes_home is not None,
+        "hermes_env_key": "HERMES_HOME",
+        "proof_boundary": "Live smoke binds Hermes CLI subprocesses to this HERMES_HOME; it does not prove another profile was checked.",
+    }
+
+def _omh_scoped_command(
+    omh_command: str,
+    *command_parts: str,
+    omh_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+) -> tuple[str, ...]:
+    command = list(_omh_base_command(omh_command, omh_home=omh_home, hermes_home=hermes_home))
+    command.extend(command_parts)
+    return tuple(command)
+
+
+def _omh_base_command(
+    omh_command: str,
+    *,
+    omh_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+) -> tuple[str, ...]:
+    command = [omh_command]
+    if omh_home is not None:
+        command.extend(["--omh-home", str(omh_home)])
+    if hermes_home is not None:
+        command.extend(["--hermes-home", str(hermes_home)])
+    return tuple(command)
+
+
+def _omh_release_plan_command(
+    omh_command: str,
+    *,
+    install_path: str,
+    omh_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+) -> tuple[str, ...]:
+    return (
+        *_omh_base_command(omh_command, omh_home=omh_home, hermes_home=hermes_home),
+        "release",
+        "hermes-smoke",
+        "--install-path",
+        install_path,
+        "--omh-command",
+        omh_command,
+    )
+
+
+def _live_smoke_command(install_path: str, target: Mapping[str, object]) -> list[str]:
+    command = ["omh"]
+    if target["explicit_omh_home"]:
+        command.extend(["--omh-home", str(target["omh_home"])])
+    if target["explicit_hermes_home"]:
+        command.extend(["--hermes-home", str(target["hermes_home"])])
+    command.extend(["release", "hermes-smoke", "--install-path", install_path, "--live"])
+    if not target["explicit_hermes_home"]:
+        command.append("--target-confirmed")
+    return command
+
+
+def _hermes_smoke_next_action(ok: bool, failed_step: str) -> str:
+    if ok:
+        return "Restart or refresh Hermes Agent if required, then try the first OMH Hermes prompt and record the observed response."
+    if failed_step == "tap_add":
+        return "Check Hermes tap support, network access, and whether the tap is already configured; rerun the smoke after repair."
+    if failed_step == "skill_install":
+        return (
+            "Check tap visibility and Hermes skill scan output, then rerun "
+            "`hermes skills install rlaope/oh-my-hermes/skills/omh-routing --yes`."
+        )
+    if failed_step == "omh_setup":
+        return "Run `omh setup` manually and inspect `omh doctor` for blocking setup checks."
+    if failed_step == "setup_doctor":
+        return "Run `omh doctor` manually and repair the OMH-managed skill registration reported there."
+    if failed_step == "installed_command_smoke":
+        return (
+            "Inspect installed_command_smoke.failed_step, then repair the installed `omh` command path, "
+            "console script importability, generated skill content, or setup plan rendering before rerunning "
+            "with --include-command-smoke."
+        )
+    if failed_step in {"tap_list", "skills_list", "skill_check", "skill_inspect"}:
+        return "Inspect the failing Hermes skills command output and confirm the target Hermes profile is the one OMH was installed into."
+    return "Inspect the failed Hermes release smoke step and rerun after repair."
+
+
+def _installed_command_smoke_next_action(
+    ok: bool,
+    failed_step: str,
+    *,
+    command_under_test: str = "omh",
+) -> str:
+    command = str(command_under_test or "omh").strip() or "omh"
+    if ok:
+        return (
+            f"Installed `{command}` command path is runnable; "
+            "continue with Hermes profile smoke or release tagging."
+        )
+    if failed_step == "installed_omh_path":
+        if path_check_kind(command) == "direct_path":
+            return f"Make {shlex.quote(command)} executable, or pass --omh-command with an executable OMH path."
+        return (
+            f"Install OMH so `command -v {shlex.quote(command)}` resolves, "
+            "or pass --omh-command with an executable OMH path."
+        )
+    if failed_step == "installed_omh_help":
+        return "Check PATH, package installation, and console-script importability for `omh`."
+    if failed_step == "installed_omh_skill_content":
+        return "Run `omh release skill-content-smoke --json` directly and inspect missing router awareness or workflow context rail markers."
+    if failed_step == "installed_omh_setup_plan":
+        return "Run `omh release hermes-smoke --install-path setup` directly and inspect the console-script error."
+    return "Inspect the failed installed command smoke step and rerun after repair."

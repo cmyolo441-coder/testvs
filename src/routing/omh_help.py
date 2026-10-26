@@ -1,0 +1,300 @@
+from __future__ import annotations
+
+from functools import lru_cache
+
+from .visual_qa_cues import contains_cue_phrase
+
+
+_OMH_MARKERS = ("omh", "oh-my-hermes", "oh my hermes", "오마이헤르메스")
+_OMH_DOCS_SELF_KNOWLEDGE_CUES = (
+    "omh-docs",
+    "product-docs",
+    "what is OMH",
+    "what is oh-my-hermes",
+    "how does OMH work",
+    "OMH documentation",
+    "oh-my-hermes documentation",
+    "OMH capability catalog",
+    "OMH skill catalog",
+    "OMH model routing",
+    "OMH memory system",
+    "OMH store local state",
+)
+_OMH_DOCS_NON_REQUEST_CUES = (
+    "do not use omh-docs",
+    "don't use omh-docs",
+    "do not use product-docs",
+    "don't use product-docs",
+    "not asking you to invoke",
+)
+
+
+@lru_cache(maxsize=4096)
+def is_omh_docs_question(message: str) -> bool:
+    """Return whether a message asks for source-backed knowledge about OMH itself."""
+
+    return contains_cue_phrase(message, _OMH_DOCS_SELF_KNOWLEDGE_CUES) and not contains_cue_phrase(
+        message,
+        _OMH_DOCS_NON_REQUEST_CUES,
+    )
+
+
+@lru_cache(maxsize=4096)
+def is_omh_intro_question(message: str) -> bool:
+    text = message.strip().lower()
+    if not text:
+        return False
+    if not any(marker in text for marker in _OMH_MARKERS):
+        return False
+    if is_omh_docs_question(message):
+        return False
+    if any(
+        marker in text
+        for marker in (
+            "status",
+            "doctor",
+            "health",
+            "install",
+            "setup",
+            "next",
+            "상태",
+            "설치",
+            "셋업",
+            "세팅",
+            "다음",
+        )
+    ):
+        return False
+    visual_output_markers = (
+        "image",
+        "photo",
+        "picture",
+        "poster",
+        "thumbnail",
+        "infographic",
+        "visual",
+        "card",
+        "이미지",
+        "사진",
+        "그림",
+        "포스터",
+        "썸네일",
+        "인포그래픽",
+        "카드",
+        "画像",
+        "写真",
+        "海报",
+        "图片",
+        "圖片",
+        "图",
+    )
+    if any(marker in text for marker in visual_output_markers):
+        return False
+    catalog_only_markers = (
+        "available",
+        "workflow",
+        "workflows",
+        "skill",
+        "skills",
+        "workflows available",
+        "skills available",
+        "commands available",
+        "deep-interview",
+        "ralplan",
+        "loop",
+        "ultrawork",
+        "list",
+        "menu",
+        "picker",
+        "명령어",
+        "스킬",
+        "워크플로",
+        "워크플로우",
+        "有哪些",
+        "可用",
+        "使える",
+    )
+    if any(marker in text for marker in catalog_only_markers):
+        return False
+    intro_markers = (
+        "what is",
+        "what are you",
+        "how do i use",
+        "how should i use",
+        "how to use",
+        "explain",
+        "overview",
+        "getting started",
+        "mental model",
+        "뭐야",
+        "무엇이야",
+        "어떻게 써",
+        "어떻게 사용",
+        "사용법",
+        "소개",
+        "설명",
+        "何ですか",
+        "使い方",
+        "是什么",
+        "怎么用",
+    )
+    if any(marker in text for marker in intro_markers):
+        return True
+    # "how does OMH work" asks for the mental model; "how does OMH <verb>
+    # <something>" asks about one mechanism, which the OMH docs lane answers
+    # from source, so only the bare "how does ... work" shape is an intro.
+    return "how does" in text and " work" in text
+
+
+@lru_cache(maxsize=4096)
+def is_omh_quickstart_question(message: str) -> bool:
+    text = message.strip().lower()
+    if not text:
+        return False
+    has_omh_marker = any(marker in text for marker in _OMH_MARKERS)
+    install_first_use_context = any(
+        marker in text
+        for marker in (
+            "after setup",
+            "after install",
+            "first run",
+            "first use",
+            "install",
+            "setup",
+            "설치",
+            "셋업",
+            "세팅",
+        )
+    ) and any(
+        marker in text
+        for marker in (
+            "what next",
+            "what should i do next",
+            "what do i do next",
+            "first run",
+            "first use",
+            "confusing",
+            "confused",
+            "처음",
+            "첫 실행",
+            "첫 사용",
+            "이제 뭐",
+            "뭘 해야",
+            "뭐 해야",
+            "헷갈",
+            "모르겠",
+        )
+    )
+    if not has_omh_marker and not install_first_use_context:
+        return False
+    troubleshooting_markers = (
+        "does not show",
+        "doesn't show",
+        "cannot see",
+        "can't see",
+        "not found",
+        "stale",
+        "failed",
+        "fails",
+        "error",
+        "안 보여",
+        "안보여",
+        "못 봐",
+        "못봐",
+        "안됨",
+        "안 돼",
+        "실패",
+        "오류",
+        "에러",
+    )
+    if any(marker in text for marker in troubleshooting_markers):
+        return False
+    update_health_markers = (
+        "update",
+        "업데이트",
+    )
+    update_health_questions = (
+        "did update work",
+        "update worked",
+        "update ok",
+        "version unchanged",
+        "same version",
+        "잘 된",
+        "잘된",
+        "잘 됐",
+        "잘됐",
+        "됐는지",
+        "되었는지",
+        "제대로",
+        "반영",
+        "버전",
+        "확인",
+    )
+    if any(marker in text for marker in update_health_markers) and any(
+        marker in text for marker in update_health_questions
+    ):
+        return False
+    quickstart_markers = (
+        "quickstart",
+        "getting started",
+        "first use",
+        "what next",
+        "what should i do next",
+        "what do i do next",
+        "next action",
+        "after setup",
+        "after install",
+        "installed correctly",
+        "setup next",
+        "next step",
+        "처음",
+        "첫 실행",
+        "첫 사용",
+        "퀵스타트",
+        "다음 액션",
+        "다음 단계",
+        "이제 뭐",
+        "뭘 해야",
+        "뭐 해야",
+        "뭐라고 말",
+        "헷갈",
+        "모르겠",
+        "설치됐",
+        "설치 되었",
+        "설치 완료",
+    )
+    return any(marker in text for marker in quickstart_markers)
+
+
+@lru_cache(maxsize=4096)
+def is_omh_status_question(message: str) -> bool:
+    text = message.strip().lower()
+    if not text:
+        return False
+    if not any(marker in text for marker in _OMH_MARKERS):
+        return False
+    catalog_markers = (
+        "what can",
+        "what does",
+        "available",
+        "workflows",
+        "skills",
+        "commands",
+        "뭐 할",
+        "뭘 도와",
+        "명령어",
+        "스킬",
+        "워크플로",
+    )
+    status_markers = (
+        "status",
+        "health",
+        "상태",
+        "정상",
+        "확인",
+        "헬스",
+        "진단",
+    )
+    if any(marker in text for marker in catalog_markers) and not any(marker in text for marker in status_markers):
+        return False
+    return any(marker in text for marker in status_markers)

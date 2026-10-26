@@ -1,0 +1,10485 @@
+from __future__ import annotations
+
+import re
+
+from dataclasses import dataclass
+from functools import lru_cache
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import TYPE_CHECKING
+
+from ..plugin_bundle.omh.hermes_session_commands import (
+    LOOP_NORTH_STAR_PHRASES,
+    LOOP_NORTH_STAR_TOKENS,
+    LOOP_PRODUCT_GOAL_PHRASES,
+    LOOP_PRODUCT_GOAL_TOKENS,
+    LOOP_REPEATED_IMPROVEMENT_PHRASES,
+    LOOP_REPEATED_IMPROVEMENT_TOKENS,
+    LOOP_TIMER_NONE,
+    LOOP_TIMERS_ANSWERED_DIRECTLY,
+)
+from .executor_cues import (
+    CODING_DELIVERY_REQUEST_PHRASES,
+    CODING_DELIVERY_REQUEST_TOKENS,
+    PI_FAMILY_CODING_AGENT_PHRASES,
+    SUBSTRING_NAMED_CODING_AGENT_PHRASES,
+    contains_boundary_phrase,
+)
+from .intent import classify_omh_quality_intent
+from .reference_regions import executable_routing_text
+from .jev_addressing import jev_addressed_skill
+from .localization import normalized_phrase, phrase_is_spoken, routing_terms, routing_tokens
+from .materials_cues import OFFICE_FILE_MATERIAL_PHRASES
+from ..plugin_bundle.omh.dag_ulw_cues import DAG_ULW, asks_about_dag_ulw, dag_ulw_control, declines_dag_ulw, invokes_dag_ulw
+from ..plugin_bundle.omh.invocation_cues import invoked_instruction
+from ..coding.pi_family_interop import PI_DISTRIBUTION_HOST, RUNTIME_SHORT_NAME
+from ..plugin_bundle.omh.name_report_cues import about_the_skill
+from ..plugin_bundle.omh.request_lead import after_courtesy
+from ..plugin_bundle.omh.spend_signals import (
+    SPEND_EVERYDAY_SENSE_ANCHORS,
+    SPEND_EVERYDAY_SENSE_PHRASES,
+    spend_gate_named_as_command,
+    spend_phrase_continues_a_request,
+)
+from .missed_route import has_normalized_missed_omh_workflow_context
+from .omh_help import is_omh_docs_question
+from .visual_qa_cues import BROWSER_VISUAL_QA_PHRASES, CUSTOMER_SYMPTOM_REPORT_PHRASES
+
+if TYPE_CHECKING:
+    from .query import RoutingQuery
+    from .recommend import _RawMessageKey
+
+
+ROUTE_ACTIONS = ("dispatch", "clarify", "fallback")
+CONFIDENCE_LEVELS = ("low", "medium", "high")
+EXPLICIT_INVOCATION_PREFIXES = ("$", "/", "./", "@")
+_EXPLICIT_SKILL_ALIASES = {
+    "ohmy": "oh-my-hermes",
+    "paper-explainer": "paper-learning",
+    "source-acquisition": "source-finder",
+    "source-intake": "source-finder",
+    "ulw": "ultrawork",
+}
+_PREFIXED_SKILL_ALIASES = {
+    "omh": "meta-router",
+    "ohmy": "oh-my-hermes",
+    "skills": "oh-my-hermes",
+    "paper-explainer": "paper-learning",
+    "source-acquisition": "source-finder",
+    "source-intake": "source-finder",
+    "ulw": "ultrawork",
+}
+# A prefixed alias with no task remainder is a picker request, not a
+# meta-routing request; bare forms keep their pre-meta-router owner.
+_PREFIXED_BARE_SKILL_ALIASES = {
+    "omh": "oh-my-hermes",
+}
+
+_CONFIDENCE_RANK = {name: index for index, name in enumerate(CONFIDENCE_LEVELS, start=1)}
+
+
+def _normalized_token_set(values: set[str]) -> frozenset[str]:
+    tokens: set[str] = set()
+    for value in values:
+        normalized = normalized_phrase(value)
+        if normalized:
+            tokens.add(normalized)
+        tokens.update(routing_tokens(value, stopwords=set()))
+    return frozenset(tokens)
+
+
+_SCHEDULED_OPS_STRONG_TOKENS = _normalized_token_set(
+    {
+        "cron",
+        "automate",
+        "automation",
+        "recurring",
+        "repeat",
+        "자동화",
+        "정기",
+        "반복",
+    }
+)
+# The strong tokens that name scheduling itself rather than describing a
+# thing that happens more than once.
+_SCHEDULED_OPS_EXPLICIT_TOKENS = _normalized_token_set({"cron", "automate", "automation", "자동화", "정기"})
+_SCHEDULED_OPS_CADENCE_TOKENS = _normalized_token_set(
+    {
+        "daily",
+        "weekly",
+        "monthly",
+        "매일",
+        "아침마다",
+        "매주",
+        "매월",
+    }
+)
+_SCHEDULED_OPS_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "check",
+        "checks",
+        "remind",
+        "reminder",
+        "monitor",
+        "monitoring",
+        "watch",
+        "watchdog",
+        "digest",
+        "report",
+        "reports",
+        "notify",
+        "notification",
+        "deliver",
+        "delivery",
+        "slack",
+        "discord",
+        "telegram",
+        "email",
+        "competitor",
+        "news",
+        "source",
+        "sources",
+        "changed",
+        "changes",
+        "silent",
+        "silently",
+        "헬스체크",
+        "감시",
+        "확인",
+        "보고",
+        "리포트",
+        "요약",
+        "알림",
+        "슬랙",
+        "디스코드",
+        "텔레그램",
+        "이메일",
+        "경쟁사",
+        "뉴스",
+        "변화",
+        "조용히",
+    }
+)
+_RESEARCH_DEPARTMENT_STRONG_TOKENS = _normalized_token_set(
+    {
+        "research",
+        "competitor",
+        "competitors",
+        "market",
+        "industry",
+        "paper",
+        "papers",
+        "notebooklm",
+        "obsidian",
+        "vault",
+        "리서치",
+        "조사",
+        "경쟁사",
+        "시장",
+        "산업",
+        "논문",
+        "옵시디언",
+    }
+)
+_RESEARCH_DEPARTMENT_SUPPORT_TOKENS = _normalized_token_set(
+    {
+        "collect",
+        "synthesize",
+        "synthesis",
+        "news",
+        "source",
+        "sources",
+        "brief",
+        "briefing",
+        "digest",
+        "뉴스",
+        "출처",
+        "자료",
+        "브리핑",
+        "요약",
+    }
+)
+_RESEARCH_DEPARTMENT_PHRASES = (
+    "research department",
+    "research ops",
+    "research operations",
+    "scout analyst briefer",
+    "collect ai agent news",
+    "collect news synthesize brief",
+    "collect news, synthesize",
+    "collect, synthesize, and brief",
+    "daily research",
+    "weekly research",
+    "competitor research",
+    "market research",
+    "source inbox",
+    "briefing status",
+    "notebooklm",
+    "obsidian vault",
+    "knowledge store research summary",
+    "knowledge storage research summary",
+    "notebooklm knowledge store",
+    "notebooklm knowledge storage",
+    "market news daily briefing",
+    "daily market news briefing",
+    "리서치 부서",
+    "리서치 부서 만들어",
+    "리서치 운영",
+    "경쟁사 리서치",
+    "시장 리서치",
+    "시장 뉴스 매일 브리핑",
+    "매일 브리핑하도록 리서치",
+    "아침마다 시장 리서치",
+    "아침마다 리서치 요약",
+    "지식저장소 리서치 요약",
+    "지식 저장소 리서치 요약",
+    "notebooklm이랑 지식저장소",
+    "수집 합성 브리핑",
+)
+_RESEARCH_DEPARTMENT_SETUP_PHRASES = (
+    "knowledge store",
+    "knowledge storage",
+    "knowledge base",
+    "knowledge summarizer",
+    "synthesis tool",
+    "source inbox",
+    "research inbox",
+    "markdown folder",
+    "note vault",
+    "obsidian",
+    "notebooklm",
+    "지식 저장소",
+    "지식저장소",
+    "지식 요약 도구",
+    "지식요약 도구",
+    "요약 도구",
+    "마크다운 폴더",
+    "노트 저장소",
+    "옵시디언",
+)
+_PAPER_LEARNING_PAPER_TOKENS = _normalized_token_set(
+    {
+        "paper",
+        "papers",
+        "arxiv",
+        "doi",
+        "research paper",
+        "논문",
+    }
+)
+_PAPER_LEARNING_EXPLANATION_TOKENS = _normalized_token_set(
+    {
+        "explain",
+        "explainer",
+        "explanation",
+        "summarize",
+        "summaries",
+        "summary",
+        "walkthrough",
+        "understand",
+        "teach",
+        "learn",
+        "learning",
+        "easy",
+        "moderate",
+        "expert",
+        "technical",
+        "details",
+        "설명",
+        "해설",
+        "이해",
+        "쉽게",
+        "난이도",
+        "전문가급",
+        "내용",
+        "줄이지",
+        "요약",
+        "resumen",
+        "resumir",
+        "explicar",
+        "説明",
+        "要約",
+        "解释",
+        "解釋",
+        "总结",
+        "總結",
+    }
+)
+_PAPER_LEARNING_PHRASES = (
+    "paper-learning",
+    "paper learning",
+    "paper-explainer",
+    "paper explainer",
+    "paper explanation",
+    "paper summary",
+    "paper summaries",
+    "summarize this paper",
+    "summarize the attached paper",
+    "explain this paper",
+    "explain this arxiv paper",
+    "explain the attached paper",
+    "understand this paper",
+    "understand this paper pdf",
+    "understand this research paper",
+    "teach me this paper",
+    "teach me this research paper",
+    "learn this paper",
+    "learn this paper pdf",
+    "resumen de paper",
+    "resumen de paper pdf",
+    "resumen de artículo",
+    "resumen de articulo",
+    "resumir paper",
+    "explicar paper",
+    "paper walkthrough",
+    "research paper explanation",
+    "research paper summary",
+    "arxiv paper explain",
+    "pdf paper explain",
+    "pdf paper summary",
+    "paper pdf explanation",
+    "paper pdf summary",
+    "without dropping details",
+    "very easy paper explanation",
+    "moderate paper explanation",
+    "expert paper explanation",
+    "논문 설명",
+    "논문 해설",
+    "논문 요약",
+    "논문 쉽게 설명",
+    "논문 이해",
+    "논문 pdf 이해",
+    "논문 이해하고 싶",
+    "논문 pdf 이해하고 싶",
+    "논문 아주 쉽게",
+    "논문 적당한 난이도",
+    "논문 전문가급",
+    "이 논문 설명해줘",
+    "이 논문 요약해줘",
+    "이 논문 pdf 설명해줘",
+    "이 논문 pdf 요약해줘",
+    "논문 pdf 쉽게 설명",
+    "논문 pdf 요약",
+    "논문 내용 줄이지 말고",
+    "論文pdfを説明",
+    "論文pdfを要約",
+    "論文を説明",
+    "論文を要約",
+    "解释论文pdf",
+    "解釋論文pdf",
+    "总结论文pdf",
+    "總結論文pdf",
+    "解释这篇论文",
+    "解釋這篇論文",
+)
+_PAPER_LEARNING_EXPORT_PHRASES = (
+    "pdf to ppt",
+    "pdf into ppt",
+    "convert pdf",
+    "export pdf",
+    "export a pdf",
+    "make a pdf",
+    "make ppt",
+    "make a ppt",
+    "make a deck",
+    "create a ppt",
+    "create a deck",
+    "as a deck",
+    "as a pdf",
+    "package it as a pdf",
+    "turn into ppt",
+    "turn into a deck",
+    "render qa",
+    "pdf를 ppt",
+    "pdf를 ppt로",
+    "pdf로 만들",
+    "ppt로 만들",
+    "파일 생성",
+    "파일 변환",
+)
+_PAPER_LEARNING_VALIDATION_PHRASES = (
+    "verify citations",
+    "validate citations",
+    "citation check",
+    "external citation check",
+    "check the citations",
+    "verify the claims",
+    "validate the claims",
+    "fact check",
+    "fact-check",
+    "proof review",
+    "math proof review",
+    "reproduce the benchmark",
+    "인용 확인",
+    "인용 검증",
+    "주장 검증",
+    "팩트체크",
+    "증명 검토",
+    "재현해",
+)
+# `jit-learn` owns one decision: what is worth learning right now for this
+# person's live problem. The cue sets stay multi-word or intent-bearing on
+# purpose: a bare "learn" belongs to `workflow-learning`, `paper-learning`, and
+# `curriculum-design` at least as much as it belongs here.
+_JIT_LEARN_PHRASES = (
+    "jit-learn",
+    "jit learn",
+    "just-in-time learning",
+    "just in time learning",
+    "what should i learn next",
+    "what should i learn now",
+    "what should i learn first",
+    "what do i need to learn next",
+    "what do i need to learn now",
+    "what to learn next",
+    "what to learn now",
+    "learn next to solve",
+    "learn now to solve",
+    "highest leverage thing to learn",
+    "highest-leverage thing to learn",
+    "highest payoff thing to learn",
+    "highest-payoff thing to learn",
+    "most useful thing to learn",
+    "worth learning right now",
+    # Korean cues carry the immediate-learning intent, matching the catalog's
+    # own multi-word triggers. Bare `학습 주제` and `학습 목표` are the ordinary
+    # nouns for "learning topic" and "learning objective", which a curriculum,
+    # syllabus, or course-design request uses just as naturally.
+    "지금 배워야",
+    "지금 뭘 배워야",
+    "뭘 배워야",
+    "무엇을 배워야",
+    "도움 되는 학습 주제",
+    "도움되는 학습 주제",
+    "당장 적용할 학습 목표",
+)
+# Sibling boundary, checked before any positive cue. A sequenced curriculum is
+# `curriculum-design`'s decision even when the request also names a learning
+# topic or objective. Korean tokens keep their particles (`커리큘럼을`,
+# `교육과정을`), so this has to match on the phrase, not the token set.
+# Shared with the awareness route-hint surface so the router and the hint hook
+# cannot drift apart on where jit-learn stops and curriculum-design begins.
+# `omh.plugin_bundle.omh.awareness` imports this; keep it importable and public.
+JIT_LEARN_CURRICULUM_EXCLUSION_PHRASES = (
+    "curriculum",
+    "syllabus",
+    "커리큘럼",
+    "교육과정",
+    "교육 과정",
+    "강의계획",
+    "강의 계획",
+)
+_JIT_LEARN_LEARNING_TOKENS = _normalized_token_set(
+    {
+        "learn",
+        "learning",
+        "study",
+        "upskill",
+        "배우",
+        "배워야",
+        "학습",
+        "공부",
+    }
+)
+_JIT_LEARN_IMMEDIACY_PHRASES = (
+    "right now",
+    "learn now",
+    "learn next",
+    "need to learn",
+    "i need to learn",
+    "have to learn",
+    "before friday",
+    "by friday",
+    "this week",
+    "next week",
+    "before the",
+    "before our",
+    "before my",
+    "in time for",
+    "current blocker",
+    "my blocker",
+    "stuck on",
+    "blocking me",
+    "immediately applicable",
+    "apply this week",
+    "지금",
+    "당장",
+    "이번 주",
+    "바로 적용",
+    "막혀",
+)
+# The four requested brief sections, plus the generic "resource" wording people
+# use for the same ask. Two distinct kinds must appear so a single "book" or
+# "course" mention does not pull a curriculum or source-inventory request here.
+_JIT_LEARN_RESOURCE_TOKEN_GROUPS = (
+    _normalized_token_set({"book", "books", "책", "도서"}),
+    _normalized_token_set({"podcast", "podcasts", "팟캐스트"}),
+    _normalized_token_set({"creator", "creators", "크리에이터"}),
+    _normalized_token_set({"course", "courses", "강의", "강좌"}),
+)
+_JIT_LEARN_APPLICATION_PHRASES = (
+    "so i can",
+    "so that i can",
+    "to solve",
+    "to diagnose",
+    "to decide",
+    "to unblock",
+    "to fix",
+    "apply",
+    "적용",
+    "해결",
+    "판단",
+)
+_JIT_LEARN_INCIDENT_ARTIFACT_PHRASES = (
+    "incident report",
+    "incident postmortem",
+    "postmortem report",
+)
+_JIT_LEARN_INCIDENT_INVESTIGATION_TOKENS = _normalized_token_set(
+    {"study", "investigate", "review", "analyze", "examine"}
+)
+_JIT_LEARN_INCIDENT_LESSON_PHRASES = (
+    "learn from the incident",
+    "learn from incident",
+    "learn from the postmortem",
+    "learn from postmortem",
+)
+_SOURCE_FINDER_ACTION_TOKENS = _normalized_token_set(
+    {
+        "find",
+        "discover",
+        "collect",
+        "gather",
+        "candidate",
+        "candidates",
+        "intake",
+        "acquisition",
+        "download",
+        "downloadable",
+        "lookup",
+        "찾아",
+        "찾아줘",
+        "찾아서",
+        "후보",
+        "수집",
+        "자료",
+        "출처",
+        "소스",
+    }
+)
+_SOURCE_FINDER_KIND_TOKENS = _normalized_token_set(
+    {
+        "paper",
+        "papers",
+        "pdf",
+        "arxiv",
+        "doi",
+        "dataset",
+        "datasets",
+        "data",
+        "benchmark",
+        "github",
+        "repo",
+        "repos",
+        "repository",
+        "repositories",
+        "oss",
+        "open-source",
+        "presentation",
+        "presentations",
+        "presentation deck",
+        "presentation materials",
+        "slides",
+        "deck",
+        "docs",
+        "documentation",
+        "spec",
+        "specs",
+        "rfc",
+        "links",
+        "link",
+        "논문",
+        "pdf",
+        "데이터셋",
+        "데이터",
+        "깃허브",
+        "github",
+        "저장소",
+        "레포",
+        "오픈소스",
+        "소스",
+        "프레젠테이션",
+        "프리젠테이션",
+        "발표자료",
+        "슬라이드",
+        "문서",
+        "스펙",
+        "링크",
+    }
+)
+_SOURCE_FINDER_PHRASES = (
+    "source-finder",
+    "source finder",
+    "source acquisition",
+    "source intake",
+    "source candidates",
+    "source candidate",
+    "find source candidates",
+    "find source candidate",
+    "find source links",
+    "find source material",
+    "find papers and datasets",
+    "find datasets and repos",
+    "find papers",
+    "find paper pdf",
+    "find paper pdf link",
+    "find arxiv link",
+    "find arxiv paper",
+    "find datasets",
+    "find dataset links",
+    "find dataset link",
+    "find github repos",
+    "find github repositories",
+    "find github oss",
+    "github oss repo",
+    "github oss repos",
+    "find oss repos",
+    "find open source repos",
+    "open source repo",
+    "open source repos",
+    "find presentations",
+    "find presentation materials",
+    "find public slides",
+    "find docs and specs",
+    "public presentation materials",
+    "public presentation",
+    "public presentations",
+    "public dataset",
+    "public datasets",
+    "presentation materials",
+    "downloadable sources",
+    "paper pdf link",
+    "arxiv link",
+    "pdf link",
+    "dataset link",
+    "dataset links",
+    "소스 후보",
+    "자료 후보",
+    "출처 후보",
+    "논문 pdf 링크",
+    "arxiv 링크",
+    "arxiv 링크 찾아",
+    "arxiv 링크 찾아서",
+    "pdf 링크",
+    "데이터셋 링크",
+    "공개 데이터셋",
+    "논문 데이터셋 찾아",
+    "논문과 데이터셋",
+    "깃허브 oss",
+    "github oss",
+    "깃허브 저장소 찾아",
+    "레포 찾아",
+    "저장소 찾아",
+    "오픈소스 저장소 찾아",
+    "공개 발표자료 찾아",
+    "공개 프레젠테이션 자료",
+    "공개된 프레젠테이션 자료",
+    "프레젠테이션 자료 찾아",
+    "프리젠테이션 자료 찾아",
+    "문서 스펙 찾아",
+    "자료 출처 찾아",
+    "자료 출처 찾아줘",
+    "자료 출처 찾아서",
+    "자료 출처 찾아줘 데이터셋",
+    "자료 출처 찾아줘 데이터셋이랑 깃허브",
+    "데이터셋이랑 깃허브",
+    "데이터셋과 깃허브",
+)
+_SOURCE_FINDER_EXCLUSION_PHRASES = (
+    "find current citations",
+    "current citations",
+    "citation check",
+    "verify citations",
+    "source backed synthesis",
+    "source-backed synthesis",
+    "summarize what the sources say",
+    "official docs",
+    "official documentation",
+    "official guide",
+    "official guidance",
+    "upstream guidance",
+    "best practice",
+    "best practices",
+    "best practice docs",
+    "current api",
+    "current version",
+    "latest version",
+    "fact check",
+    "fact-check",
+    "latest news",
+    "current evidence",
+)
+_VISUAL_SUMMARY_MODALITY_TOKENS = _normalized_token_set(
+    {
+        "visual",
+        "image",
+        "photo",
+        "vertical",
+        "infographic",
+        "poster",
+        "one-pager",
+        "onepager",
+        "graphic",
+        "thumbnail",
+        "이미지",
+        "이미지로",
+        "이미지를",
+        "사진",
+        "사진으로",
+        "그림",
+        "그림으로",
+        "세로",
+        "썸네일",
+        "인포그래픽",
+        "포스터",
+        "画像",
+        "ビジュアル",
+        "海报",
+        "海報",
+        "图",
+        "图像",
+        "圖片",
+        "图片",
+    }
+) - {"one", "pager"}
+_VISUAL_SUMMARY_CARD_TOKENS = _normalized_token_set(
+    {"card", "poster", "one-pager", "카드", "포스터", "海报", "海報"}
+) - {"one", "pager"}
+_VISUAL_SUMMARY_CAPABILITY_TOKENS = _normalized_token_set(
+    {
+        "make",
+        "create",
+        "generate",
+        "support",
+        "supports",
+        "feature",
+        "features",
+        "generation",
+        "capability",
+        "capabilities",
+        "available",
+        "help",
+        "does",
+        "can",
+        "기능",
+        "만들어줘",
+        "만들어",
+        "생성해줘",
+        "생성",
+        "지원",
+        "가능",
+        "있어",
+        "있나요",
+        "できる",
+        "支持",
+        "功能",
+    }
+)
+_VISUAL_SUMMARY_SHORT_REQUEST_PHRASES = frozenset(
+    normalized_phrase(phrase)
+    for phrase in (
+        "make an image",
+        "create an image",
+        "generate an image",
+        "make a thumbnail",
+        "create a thumbnail",
+        "generate a thumbnail",
+        "이미지 만들어줘",
+        "이미지 생성해줘",
+        "이미지 생성해 줘",
+        "예쁜 이미지 만들어줘",
+        "이미지를 만들어줘",
+        "이미지를 생성해줘",
+        "썸네일 만들어줘",
+        "썸네일 생성해줘",
+        "썸네일로 만들어줘",
+        "사진 만들어줘",
+        "사진 생성해줘",
+        "사진을 만들어줘",
+        "사진을 생성해줘",
+        "generate a photo",
+        "make a photo",
+        "create a photo",
+    )
+)
+# A card on a work board is a work item, not an image card: "review the PR
+# linked on the kanban card" asks for a review, and `review` beside `card` is
+# otherwise this guard's image-card shape. Matched as spoken phrases, so
+# `board card` is not found inside "dashboard card" or "storyboard card".
+_WORK_ITEM_CARD_PHRASES = ("kanban card", "board card", "task card", "trello card", "jira card", "칸반 카드")
+# Nor is a card that pays, or the card spend-gate shows before a payment: "pay
+# with my card for the summary report", "review the pre-spend card before I
+# confirm". A bare "my card" is not one: "a share card summarizing my card game
+# stats" is an image card. "with my card" pays only where a request may go on
+# after it (`spend_phrase_continues_a_request`), not before a noun: "a share
+# card with my card collection highlights" is an image card too.
+_PAYMENT_CARD_PHRASES = ("use my card", "my credit card", "my debit card", "my saved card", "pre-spend card")
+_VISUAL_SUMMARY_NON_VISUAL_WORK_TOKENS = _normalized_token_set(
+    {
+        "classifier",
+        "component",
+        "debug",
+        "fix",
+        "failure",
+        "failures",
+        "bug",
+        "error",
+        "errors",
+        "upload",
+        "uploads",
+        "asset",
+        "assets",
+        "processing",
+        "worker",
+        "workers",
+        "service",
+        "process",
+        "daemon",
+        "파이썬",
+        "python",
+        "script",
+        "스크립트",
+        "스크립트로",
+        "컴포넌트",
+    }
+)
+_VISUAL_SUMMARY_OUTPUT_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "summary",
+        "announcement",
+        "briefing",
+        "triage",
+        "review",
+        "release",
+        "meeting",
+        "notes",
+        "pr",
+        "pull",
+        "request",
+        "explain",
+        "explainer",
+        "explanation",
+        "feature",
+        "workflow",
+        "cron",
+        "automation",
+        "shareable",
+        "share",
+        "shared",
+        "sharing",
+        "research",
+        "news",
+        "competitor",
+        "요약",
+        "설명",
+        "소개",
+        "기능",
+        "안내",
+        "설명해줘",
+        "설명해",
+        "공유",
+        "공유할",
+        "공유용",
+        "워크플로우",
+        "브리핑",
+        "발표",
+        "트리아지",
+        "회의",
+        "회의록",
+        "리서치",
+        "뉴스",
+        "경쟁사",
+        "作成",
+        "要約",
+        "概要",
+        "説明",
+        "发布",
+        "發布",
+        "说明",
+        "說明",
+        "摘要",
+        "总结",
+    }
+)
+_VISUAL_SUMMARY_PHRASES = (
+    "img-summary",
+    "img summary",
+    "visual-summary",
+    "visual summary",
+    "visual prompt card",
+    "image card",
+    "edit this image",
+    "image edit",
+    "image summary card",
+    "summary image",
+    "summary card",
+    "thumbnail",
+    "release thumbnail",
+    "thumbnail card",
+    "explainer image",
+    "feature explainer image",
+    "feature explanation image",
+    "product explainer image",
+    "product explainer card",
+    "infographic",
+    "one-page infographic",
+    "one-page visual",
+    "visual one-pager",
+    "poster explaining",
+    "explainer poster",
+    "summary poster",
+    "release poster",
+    "shareable poster",
+    "pr poster",
+    "pull request poster",
+    "workflow image",
+    "workflow card",
+    "workflow poster",
+    "shareable image",
+    "shareable card",
+    "shareable visual",
+    "explain this as an image",
+    "make an image explaining",
+    "image explaining the cron feature",
+    "make an image explaining the cron feature",
+    "make a visual summary of this pr",
+    "visual summary of this pr",
+    "이미지 생성",
+    "이미지 생성해줘",
+    "이미지 만들어",
+    "이미지로 요약",
+    "이미지로 정리",
+    "이미지로 정리해줘",
+    "예쁜 이미지",
+    "예쁜 이미지로",
+    "회의록 예쁜 이미지",
+    "회의록을 예쁜 이미지",
+    "이미지 카드",
+    "요약 이미지",
+    "요약 카드",
+    "썸네일",
+    "썸네일 만들어",
+    "썸네일 생성",
+    "썸네일로 만들어",
+    "세로 카드",
+    "회의록 이미지",
+    "회의록 세로 카드",
+    "picture card",
+    "meeting notes picture card",
+    "pr reviewer image card",
+    "make a poster explaining",
+    "vertical card",
+    "vertical summary image",
+    "vertical image card",
+    "pr summary card",
+    "pull request card",
+    "issue triage card",
+    "bug triage card",
+    "news briefing card",
+    "competitor news briefing card",
+    "release announcement image",
+    "release notes image",
+    "release notes card",
+    "release notes thumbnail",
+    "release note image",
+    "release note card",
+    "release note thumbnail",
+    "release update card",
+    "release update announcement card",
+    "announcement card",
+    "update summary image",
+    "update summary card",
+    "instagram carousel",
+    "instagram card",
+    "card news",
+    "cardnews",
+    "회의록을 세로 요약 이미지",
+    "회의록 세로 요약 이미지",
+    "회의록을 공유용 카드",
+    "회의록 공유용 카드",
+    "pr 요약 카드",
+    "pr 요약 포스터",
+    "pr 리뷰어용 이미지 카드",
+    "github pr 리뷰어용 이미지 카드",
+    "깃허브 pr 리뷰어용 이미지 카드",
+    "이슈 트리아지 카드",
+    "경쟁사 뉴스 브리핑 카드",
+    "릴리즈 노트 발표 이미지",
+    "릴리즈 노트 발표 카드",
+    "릴리즈 노트 이미지",
+    "릴리즈 노트 이미지로",
+    "릴리즈 노트 이미지로 만들어",
+    "릴리즈 노트 이미지로 만들어줘",
+    "릴리즈 노트 카드",
+    "릴리즈 노트 썸네일",
+    "릴리즈 노트 썸네일로",
+    "릴리즈 노트 썸네일로 만들어",
+    "릴리즈 노트 포스터",
+    "릴리즈 노트를 announcement 카드",
+    "릴리즈 노트 announcement 카드",
+    "릴리즈 업데이트 announcement 카드",
+    "릴리즈 업데이트 발표 카드",
+    "릴리즈 업데이트를 발표 카드",
+    "릴리즈 업데이트를 발표 카드로",
+    "릴리즈 업데이트를 발표 카드로 만들어줘",
+    "업데이트 요약 이미지",
+    "업데이트 요약 카드",
+    "업데이트 카드",
+    "발표 카드",
+    "발표 카드로",
+    "세로 이미지 카드",
+    "세로 이미지로 요약",
+    "세로 이미지로 요약해줘",
+    "세로 이미지로 정리",
+    "세로 이미지로 정리해줘",
+    "세로 이미지로 만들어",
+    "세로 이미지로 만들어줘",
+    "이미지 카드",
+    "이미지로 요약",
+    "이미지로 요약해줘",
+    "회의록 이미지 카드",
+    "회의록을 세로 이미지 카드",
+    "회의록을 보기 좋은 세로 이미지로 요약",
+    "회의록을 보기 좋은 세로 이미지로 요약해줘",
+    "회의록을 보기 좋은 세로 이미지로 정리",
+    "회의록을 보기 좋은 세로 이미지로 정리해줘",
+    "설명 이미지",
+    "설명하는 인포그래픽",
+    "기능 설명 이미지",
+    "기능 소개 이미지",
+    "크론 기능 설명 이미지",
+    "크론 기능 설명 이미지 하나 만들어줘",
+    "크론 기능 설명 사진",
+    "크론 기능 설명 사진 하나 만들어줘",
+    "인포그래픽",
+    "인포그래픽 만들어줘",
+    "이미지 요약 카드",
+    "요약 이미지",
+    "요약 카드",
+    "카드뉴스",
+    "카드 뉴스",
+    "인스타 카드뉴스",
+    "인스타 카드뉴스처럼",
+    "요약을 인스타 카드뉴스",
+    "요약을 인스타 카드뉴스처럼",
+    "카드 이미지",
+    "공유용 이미지",
+    "안내 이미지",
+    "워크플로우 이미지",
+    "이미지로 설명",
+    "이미지 하나 만들어줘",
+    "사진처럼 만들어줘",
+    "사진처럼 만들어",
+    "설명 사진",
+    "요약 사진",
+    "사진 생성",
+    "사진 생성해줘",
+    "사진으로 정리",
+    "사진으로 정리해줘",
+    "pr 요약 사진",
+    "pr 요약을 사진처럼",
+    "pr 요약을 이미지가 아니라 사진처럼",
+    "pr 내용을 리뷰어에게 공유할 이미지 카드",
+    "pr 내용을 리뷰어에게 공유할 이미지 카드로 만들어줘",
+    "사진 카드",
+    "요약 포스터",
+    "공유용 카드",
+    "공유용 포스터",
+    "prの要約画像",
+    "要約画像",
+    "概要画像",
+    "説明画像",
+    "发布说明海报",
+    "發布說明海報",
+    "发布说明图",
+    "發布說明圖",
+    "总结海报",
+    "摘要海报",
+)
+_MISSED_WORKFLOW_RESEARCH_TOKENS = _normalized_token_set(
+    {
+        "research",
+        "researching",
+        "source",
+        "sources",
+        "web",
+        "search",
+        "리서치",
+        "조사",
+        "자료",
+        "출처",
+        "웹서치",
+        "검색",
+    }
+)
+_MISSED_WORKFLOW_OPERATING_RECORD_TOKENS = _normalized_token_set(
+    {
+        "meeting",
+        "minutes",
+        "notes",
+        "summary",
+        "summarize",
+        "decision",
+        "decisions",
+        "action",
+        "actions",
+        "회의",
+        "회의록",
+        "요약",
+        "정리",
+        "결정",
+        "액션",
+        "기록",
+    }
+)
+_PRODUCT_SHAPING_PHRASES = (
+    "where to start",
+    "do not know where to start",
+    "don't know where to start",
+    "dont know where to start",
+    "not sure where to start",
+    "improve our onboarding",
+    "improve onboarding",
+    "make onboarding smoother",
+    "make onboarding feel smoother",
+    "make the user experience smoother",
+    "make the product experience better",
+    "온보딩을 더 부드럽게",
+    "온보딩 개선",
+    "어디서 시작",
+    "어디부터 시작",
+)
+# Creation openers, kept to the shape rather than the noun. The indefinite
+# article is the whole signal: "build a X" introduces something, "build the X"
+# and "build this X" point at something already agreed. Verbs whose objects are
+# usually documents rather than software ("write a ...") are deliberately absent
+# - they belong to the materials lane, not the interview lane.
+_GREENFIELD_CREATION_PHRASES = (
+    "build a ",
+    "build an ",
+    "build me a ",
+    "build me an ",
+    "create a ",
+    "create an ",
+    "create me a ",
+    "make me a ",
+    "make me an ",
+    "develop a ",
+    "develop an ",
+    "i want a ",
+    "i want an ",
+    "i need a ",
+    "i need an ",
+    "i want to build",
+    "i want to make",
+    "let's build",
+    "lets build",
+    "let us build",
+    "let's make",
+    "lets make",
+    "let's create",
+    "lets create",
+    "from scratch",
+    "greenfield",
+    "new project",
+    "만들어줘",
+    "만들어 줘",
+    "만들고 싶",
+    "만들어보고 싶",
+    "개발해줘",
+    "새로 만들",
+    "처음부터",
+)
+# A question about how something is created is a request for an explanation,
+# not for the thing. These openers keep "how do I create a virtualenv in
+# Python?" - a negative-control case in ROUTING_PRECISION_CASES - answering
+# directly instead of opening an interview.
+_GREENFIELD_QUESTION_OPENERS = (
+    "how do i",
+    "how do you",
+    "how can i",
+    "how to",
+    "what is",
+    "what's the best way",
+    "whats the best way",
+    "어떻게 만들",
+    "어떻게 하면",
+    "뭐야",
+    "무엇인가",
+)
+# Any of these means the object already exists, so the request is an edit, a
+# copy, or a report on prior work - none of which need an interview.
+_GREENFIELD_EXISTING_REFERENT_PHRASES = (
+    "this file",
+    "this page",
+    "this component",
+    "this repo",
+    "this project",
+    "the existing",
+    "a copy of",
+    "a backup",
+    "a branch",
+    "a commit",
+    "a pr",
+    "a pull request",
+    "이 파일",
+    "이 프로젝트",
+    "기존",
+)
+# Creation vocabulary that belongs to a lane other than product shaping: a plan,
+# a report, a deck, or a test is a request OMH already routes precisely, and an
+# interview in front of it would be a detour.
+_GREENFIELD_OTHER_LANE_TOKENS = _normalized_token_set(
+    {
+        "plan",
+        "report",
+        "deck",
+        "slide",
+        "slides",
+        "pdf",
+        "spreadsheet",
+        "test",
+        "tests",
+        "commit",
+        "branch",
+        "pr",
+        "issue",
+        "ticket",
+        "계획",
+        "보고서",
+        "발표자료",
+        "테스트",
+    }
+)
+# A repo that was just initialized and nothing else has a fresh empty surface;
+# the caller genuinely does not know the next step, which one clarifying
+# interview answers - unlike a generic picker guessing among unrelated
+# workflows (ops review, research, code review) on the bare word "what".
+_GREENFIELD_POST_INIT_PHRASES = (
+    "just ran git init",
+    "i just ran git init",
+    "just did git init",
+    "just initialized the repo",
+    "just initialized this repo",
+    "just initialized a repo",
+    "git init, what now",
+    "git init what now",
+    "ran git init, now what",
+    "ran git init now what",
+)
+# Bootstrap-file nouns whose repo-file identity is unambiguous once tokenized.
+# Any two of these together with an add/create/set-up action name a full
+# "give me the starter files" request rather than a single-file edit -
+# `_direct_coding_task_guard_applies` already owns "add a toggle" style edits
+# on one named surface; this only fires alongside a concrete, multi-file
+# bootstrap ask so it cannot hijack "why does my .gitignore not work"
+# (troubleshooting), "explain what a LICENSE file is" (concept), or
+# "add this rule to .gitignore" (an edit naming exactly one file).
+_PROJECT_BOOTSTRAP_FILE_NOUN_TOKENS = _normalized_token_set(
+    {
+        "license",
+        "gitignore",
+        "readme",
+    }
+)
+_PROJECT_BOOTSTRAP_ACTION_PHRASES = (
+    "add a",
+    "add an",
+    "add the",
+    "create a",
+    "create an",
+    "set up",
+    "setup",
+    "generate a",
+    "make a",
+)
+# A generic "give me the standard files" ask names no file by noun, but
+# pairing a conventional-files phrase with an explicitly empty/new/bare repo
+# is as concrete as naming LICENSE/README/.gitignore outright.
+_PROJECT_BOOTSTRAP_GENERIC_FILE_PHRASES = (
+    "standard project files",
+    "standard repo files",
+    "standard repository files",
+    "boilerplate project files",
+    "project boilerplate files",
+)
+_PROJECT_BOOTSTRAP_EMPTY_REPO_PHRASES = (
+    "empty repo",
+    "empty repository",
+    "empty project",
+    "bare repo",
+    "bare repository",
+)
+_PRODUCT_SHAPING_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "onboarding",
+        "activation",
+        "conversion",
+        "funnel",
+        "ux",
+        "product",
+        "feature",
+        "experience",
+        "customer",
+        "user",
+        "users",
+        "온보딩",
+        "제품",
+        "기능",
+        "사용자",
+        "고객",
+        "경험",
+    }
+)
+_PRODUCT_SHAPING_UNCERTAINTY_TOKENS = _normalized_token_set(
+    {
+        "improve",
+        "improvement",
+        "better",
+        "smoother",
+        "smooth",
+        "start",
+        "where",
+        "unclear",
+        "vague",
+        "fuzzy",
+        "unknown",
+        "개선",
+        "부드럽게",
+        "어디",
+        "시작",
+        "모호",
+    }
+)
+_DEEP_INTERVIEW_PHRASES = (
+    "deep interview",
+    "run a deep interview",
+    "do a deep interview",
+    "start a deep interview",
+    "deep interview before planning",
+    "interview before planning",
+    "ask clarifying questions before planning",
+    "ask questions before planning",
+    "딥인터뷰",
+    "딥 인터뷰",
+    "계획 전에 인터뷰",
+    "계획 전에 질문",
+)
+_FEEDBACK_TRIAGE_PHRASES = (
+    "customer feedback",
+    "customer notes",
+    "customer reports",
+    "customers report",
+    "customers say",
+    "user feedback",
+    "user reports",
+    "users report",
+    "users say",
+    "app keeps crashing",
+    "keeps crashing after login",
+    "checkout is broken",
+    "checkout keeps failing",
+    "payment failures keep coming up",
+    "payment failure keeps coming up",
+    "what to build next from customer notes",
+    "decide what to build next from customer notes",
+    "decide what to build next from these customer notes",
+    "고객 피드백",
+    "고객 노트",
+    "고객 제보",
+    "사용자 제보",
+    "사용자 피드백",
+    "결제 실패 이슈",
+    "결제 실패가 자주",
+    "체크아웃이 깨",
+    "체크아웃 실패",
+    "로그인 후 크래시",
+)
+_FEEDBACK_TRIAGE_SOURCE_TOKENS = _normalized_token_set(
+    {
+        "customer",
+        "customers",
+        "user",
+        "users",
+        "feedback",
+        # `report`, `reports`, and `notes` name an artifact as often as a
+        # source of feedback ("build a weekly ops report"); the customer
+        # phrases in `_FEEDBACK_TRIAGE_PHRASES` still carry "customer notes".
+        "reported",
+        "signal",
+        "signals",
+        "고객",
+        "사용자",
+        "피드백",
+        "제보",
+        "노트",
+        "신호",
+    }
+)
+_FEEDBACK_TRIAGE_PRODUCT_TOKENS = _normalized_token_set(
+    {
+        "app",
+        "product",
+        "dashboard",
+        "checkout",
+        "payment",
+        "billing",
+        "refund",
+        "refunds",
+        "login",
+        "signup",
+        "onboarding",
+        "cart",
+        "subscription",
+        "앱",
+        "제품",
+        "체크아웃",
+        "결제",
+        "청구",
+        "로그인",
+        "가입",
+        "온보딩",
+    }
+)
+_FEEDBACK_TRIAGE_ISSUE_TOKENS = _normalized_token_set(
+    {
+        "bug",
+        "bugs",
+        "issue",
+        "issues",
+        "broken",
+        "breaks",
+        "crash",
+        "crashes",
+        "crashing",
+        "fail",
+        "fails",
+        "failed",
+        "failing",
+        "failure",
+        "failures",
+        "timeout",
+        "timeouts",
+        "500",
+        "500s",
+        "error",
+        "errors",
+        "problem",
+        "problems",
+        "버그",
+        "이슈",
+        "깨",
+        "고장",
+        "크래시",
+        "실패",
+        "에러",
+        "문제",
+    }
+)
+_FEEDBACK_TRIAGE_DECISION_TOKENS = _normalized_token_set(
+    {
+        "decide",
+        "choose",
+        "prioritize",
+        "rank",
+        # `build` and `next` left: they are what every plan says, not a
+        # decision about feedback.
+        "roadmap",
+        "investigate",
+        "reproduce",
+        "repro",
+        "triage",
+        "결정",
+        "선택",
+        "우선순위",
+        "로드맵",
+        "조사",
+        "재현",
+        "트리아지",
+    }
+)
+_WORKFLOW_LEARNING_PHRASES = (
+    "learn from this workflow",
+    "learn from this workflow run",
+    "learn from this run",
+    "record this as workflow learning",
+    "record this workflow learning",
+    "record this as a workflow learning trace",
+    "record this workflow learning trace",
+    "improve the skill next time",
+    "improve this skill next time",
+    "improve routing next time",
+    "make a regression case",
+    "add a regression case",
+    "why did this route",
+    "missed route",
+    "missed workflow",
+    "wrong route",
+    "wrong workflow",
+    "router chose the wrong workflow",
+    "router picked the wrong workflow",
+    "record why this request",
+    "future workflow behavior",
+    "improve this workflow next time",
+    "improve the workflow next time",
+    "make this workflow better next time",
+    "make the workflow better next time",
+    "remember this for next time",
+    "remember to do this better next time",
+    "make this task better next time",
+    "answer better next time",
+    "improve this answer next time",
+    "fix the skill next time",
+    "execution trace skill improvement",
+    "execution trace improvement proposal",
+    "workflow trace skill improvement",
+    "workflow trace 보고",
+    "workflow trace 보고 다음에",
+    "workflow trace 보고 다음에 스킬",
+    "workflow trace 보고 다음에 스킬 고칠",
+    "skill improvement proposal",
+    "trace 보고 다음에 스킬",
+    "trace 보고 스킬 개선",
+    "next time do this task better",
+    "workflow should learn",
+    "workflow went wrong",
+    "workflow that went wrong",
+    "workflow failed",
+    "weak workflow",
+    "route went wrong",
+    "routing went wrong",
+    "routing failed",
+    "router hardening",
+    "routing hardening",
+    "harden the router",
+    "harden routing",
+    "hermes should learn",
+    "why omh was not used",
+    "why did not use omh",
+    "did not use omh skills",
+    "didn't use omh skills",
+    "did not use oh my hermes",
+    "didn't use oh my hermes",
+    "oh my hermes skill was not used",
+    "oh-my-hermes skill was not used",
+    "omh should be the priority",
+    "oh my hermes should be the priority",
+    "coding agent was not used",
+    "which coding agent did you use",
+    "이번 실행 학습",
+    "이번 실행 trace",
+    "이번 실행 trace로 skill 개선",
+    "이번 실행 trace로 skill 개선 제안",
+    "이번 실행 트레이스",
+    "이번 실행 트레이스로 스킬 개선",
+    "트레이스 보고 다음에 스킬",
+    "트레이스 보고 스킬 개선",
+    "실행 기록 보고 다음에 스킬",
+    "이번 워크플로우 학습",
+    "워크플로우 개선",
+    "워크플로우를 개선",
+    "워크플로우 다음엔 더 잘",
+    "워크플로우 다음엔 더 잘하게",
+    "워크플로우 다음엔 더 잘하게 개선",
+    "워크플로우 다음에는 더 잘",
+    "다음 실행에서 더 잘",
+    "다음 실행에서 더 잘하게",
+    "다음 워크플로우에 반영",
+    "다음부터 이 작업 더 잘하게",
+    "다음부터 이 작업 더 잘하게 기억",
+    "다음부터 더 잘하게 기억",
+    "다음부터 이런 작업 더 잘하게",
+    "이 작업 더 잘하게 기억",
+    "답변 다음엔 더 잘하게",
+    "답변 다음에는 더 잘하게",
+    "다음엔 더 잘하게 스킬",
+    "다음에는 더 잘하게 스킬",
+    "스킬 고쳐줘",
+    "스킬 고쳐",
+    "스킬 수정해줘",
+    "스킬 개선 제안",
+    "skill 개선 제안",
+    "다음에 스킬 개선",
+    "라우팅 회귀",
+    "라우터 강화",
+    "라우팅 강화",
+    "회귀 케이스",
+    "omh 안 썼어",
+    "omh 안 썼",
+    "omh 안썼",
+    "omh 기능을 안 썼",
+    "omh 기능 안 썼",
+    "왜 omh를 안 썼",
+    "왜 omh 안 썼",
+    "왜 omh 안썼",
+    "oh my hermes스킬을 쓴거같진",
+    "omh 스킬을 쓴거같진",
+    "omh스킬을 쓴거같진",
+    "코딩에이전트로 돌렸",
+    "코딩 에이전트로 돌렸",
+    "어떤 코딩에이전트",
+    "어떤 코딩 에이전트",
+    "자체 메모리 업데이트보다는",
+    "omh자체가 우선순위",
+    "omh 자체가 우선순위",
+    "oh my hermes자체가 우선순위",
+    "oh my hermes 자체가 우선순위",
+    "hermes-agent스킬들을 부리",
+    "hermes-agent 스킬들을 부리",
+    "안 썼는데 다음엔",
+    "안 썼는데 다음에는",
+    "안 쓴 것 같은데 다음엔",
+    "안 쓴 것 같은데 다음에는",
+    "안 쓴 것 같아",
+    "안 쓴 것 같아 다음엔",
+    "안 쓴 것 같아 다음에는",
+    "안 쓰고 그냥 답했어",
+    "안썼는데 다음엔",
+    "안썼는데 다음에는",
+    "안쓴것같은데다음엔",
+    "안쓴것같은데다음에는",
+    "안쓴것같아",
+    "안쓴것같아다음엔",
+    "안쓴것같아다음에는",
+    "안쓰고그냥답했어",
+    "다음엔 쓰게 해줘",
+    "다음에는 쓰게 해줘",
+    "다음엔 쓰게 고쳐",
+    "다음에는 쓰게 고쳐",
+    "다음엔 쓰게 개선",
+    "다음에는 쓰게 개선",
+    "다음엔 보내줘",
+    "다음에는 보내줘",
+    "omh 안썼는지 개선",
+    "왜 omh 안썼는지 개선",
+    "omh 안 썼는지 학습",
+    "omh를 안 썼는지 학습",
+    "워크플로 누락",
+    "라우팅 누락",
+    "일반 답변으로 빠져",
+    "일반 답변으로 빠짐",
+    "omh가 자꾸 일반 답변",
+    "omh 기능을 모르는",
+    "omh 기능 모르",
+    "omh context를 못 보는",
+    "omh context 못 보는",
+    "omh 컨텍스트를 못 보는",
+    "omh 컨텍스트 못 보는",
+    "라우터가 잘못 고른",
+    "라우터가 잘못 골",
+    "지금 omh가 안 쓰여",
+    "omh가 안 쓰여",
+)
+_WORKFLOW_LEARNING_ACTION_TOKENS = _normalized_token_set(
+    {
+        "add",
+        "audit",
+        "case",
+        "candidate",
+        "eval",
+        "evaluate",
+        "export",
+        "fix",
+        "future",
+        "improve",
+        "improvement",
+        "missed",
+        "missing",
+        "next",
+        "propose",
+        "record",
+        "recorded",
+        "regression",
+        "replay",
+        "review",
+        "trace",
+        "why",
+        "개선",
+        "기록",
+        "누락",
+        "리뷰",
+        "왜",
+        "회귀",
+    }
+)
+_WORKFLOW_LEARNING_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "learn",
+        "learning",
+        "workflow",
+        "run",
+        "trace",
+        "skill",
+        "routing",
+        "route",
+        "regression",
+        "eval",
+        "audit",
+        "improve",
+        "improvement",
+        "candidate",
+        "next",
+        "future",
+        "missed",
+        "missing",
+        "학습",
+        "스킬",
+        "워크플로우",
+        "라우팅",
+        "회귀",
+        "개선",
+        "실행",
+        "누락",
+    }
+)
+_EXECUTOR_RUNTIME_READINESS_PHRASES = (
+    "executor-runtime-readiness",
+    "runtime readiness",
+    "codex readiness",
+    "claude code readiness",
+    "coding agent readiness",
+    "coding agent connection status",
+    "coding agent connection check",
+    "check the coding agent connection",
+    "check codex connection",
+    "check claude code connection",
+    "is codex connected",
+    "is claude code connected",
+    "is codex available",
+    "is claude code available",
+    "is codex installed",
+    "is claude code installed",
+    "use codex as my coding agent",
+    "use claude code as my coding agent",
+    "set codex as my coding agent",
+    "set claude code as my coding agent",
+    "codex as my coding agent",
+    "claude code as my coding agent",
+    "codex as default coding agent",
+    "claude code as default coding agent",
+    "ping codex",
+    "ping claude code",
+    "one-time coding agent check",
+    "one time coding agent check",
+    "first-use coding agent readiness",
+    "open in codex",
+    "open this in codex",
+    "open in claude code",
+    "open this in claude code",
+    "open a codex session",
+    "open codex session",
+    "open a claude code session",
+    "open claude code session",
+    "open directly in claude code",
+    "open directly in codex",
+    "codex session",
+    "claude code session",
+    "open a coding agent session",
+    "open a codex work session",
+    "open a claude code work session",
+    "attach codex session",
+    "attach existing codex session",
+    "attach claude code session",
+    "attach existing claude code session",
+    "resume codex session",
+    "resume claude code session",
+    "continue in codex",
+    "continue in claude code",
+    "can this task run in codex",
+    "can this run in codex",
+    "can this run in claude",
+    "run in codex or claude",
+    "run in codex, claude",
+    "codex or claude",
+    "codex and claude",
+    "codex vs claude",
+    "codex랑 claude",
+    "codex랑 claude code",
+    "codex와 claude",
+    "codex와 claude code",
+    "claude code 중",
+    "claude code로 넘길지 codex",
+    "codex로 넘길지 claude",
+    "런타임으로 넘겨",
+    "어떤 런타임",
+    "넘길지 codex",
+    "넘길지 claude",
+    "코덱스랑 클로드",
+    "코덱스와 클로드",
+    "코덱스 클로드",
+    "코딩 에이전트 연결 상태",
+    "코딩 에이전트 연결 확인",
+    "코딩 에이전트 codex로",
+    "코딩 에이전트 코덱스로",
+    "코딩 에이전트 claude code로",
+    "코딩 에이전트 클로드 코드로",
+    "코딩 에이전트 바꾸",
+    "코덱스를 코딩 에이전트",
+    "클로드 코드를 코딩 에이전트",
+    "코덱스 연결 확인",
+    "클로드 코드 연결 확인",
+    "코덱스 연결돼",
+    "코덱스 연결되",
+    "코덱스 설치돼",
+    "코덱스 설치되",
+    "코덱스 깔려",
+    "클로드 코드 연결돼",
+    "클로드 코드 연결되",
+    "클로드 코드 설치돼",
+    "클로드 코드 설치되",
+    "클로드 코드 깔려",
+    "claude code 연결돼",
+    "claude code 연결되",
+    "claude code 설치돼",
+    "claude code 설치되",
+    "claude code 깔려",
+    "codex 연결돼",
+    "codex 연결되",
+    "codex 설치돼",
+    "codex 설치되",
+    "codex 깔려",
+    "codex로 열어",
+    "코덱스로 열어",
+    "codex로 이 작업 시작",
+    "코덱스로 이 작업 시작",
+    "codex로 작업 시작",
+    "코덱스로 작업 시작",
+    "claude code로 이거 열",
+    "claude code로 이거 열어서",
+    "클로드 코드로 이거 열",
+    "클로드 코드로 이거 열어서",
+    "claude code로 이 작업 시작",
+    "클로드 코드로 이 작업 시작",
+    "claude code로 열어",
+    "클로드 코드로 열어",
+    "codex 세션 붙",
+    "코덱스 세션 붙",
+    "codex 세션 연결",
+    "코덱스 세션 연결",
+    "codex 세션 열어",
+    "codex 세션 켜",
+    "codex 세션 켜서",
+    "코덱스 세션 열어",
+    "코덱스 세션 켜",
+    "코덱스 세션 켜서",
+    "codex 작업 세션 열어",
+    "코덱스 작업 세션 열어",
+    "claude code 세션 열어",
+    "클로드 코드 세션 열어",
+    "claude code 작업 세션 열어",
+    "클로드 코드 작업 세션 열어",
+    "claude code로 바로 열어",
+    "claude code 바로 열어",
+    "클로드 코드로 바로 열어",
+    "클로드 코드 바로 열어",
+    "hermes가 직접 코딩",
+    "hermes한테 직접 코딩",
+    "hermes에게 직접 코딩",
+    "hermes한테 코딩",
+    "hermes에게 코딩",
+    "헤르메스가 직접 코딩",
+    "헤르메스한테 직접 코딩",
+    "헤르메스에게 직접 코딩",
+    "헤르메스한테 코딩",
+    "헤르메스에게 코딩",
+    "hermes 직접 코딩",
+    "claude code로 이어서",
+    "클로드 코드로 이어서",
+    "codex로 이어서",
+    "코덱스로 이어서",
+    "ping 한번",
+    "한번만 확인",
+    "안되면 물어",
+)
+_EXECUTOR_RUNTIME_READINESS_TOKENS = _normalized_token_set(
+    {
+        "codex",
+        "claude",
+        "runtime",
+        "executor",
+        "handoff",
+        "agent",
+        "omx",
+        RUNTIME_SHORT_NAME,
+        "omc",
+        "런타임",
+        "실행",
+        "위임",
+        "넘길",
+        "넘길지",
+        "정해",
+        "코덱스",
+        "클로드",
+    }
+)
+_EXECUTOR_READINESS_CHECK_TOKENS = _normalized_token_set(
+    {
+        "readiness",
+        "ready",
+        "connection",
+        "connect",
+        "configured",
+        "configure",
+        "installed",
+        "ping",
+        "check",
+        "fallback",
+        "first",
+        "one-time",
+        "once",
+        "준비",
+        "연결",
+        "확인",
+        "한번",
+        "한번만",
+        "안되면",
+        "물어",
+        "설정",
+    }
+)
+_TOOLBELT_READINESS_PHRASES = (
+    "toolbelt-readiness",
+    "tool readiness",
+    "connector readiness",
+    "credential readiness",
+    "credential check",
+    "credential missing",
+    "missing credential",
+    "missing api key",
+    "api key missing",
+    "missing connector",
+    "connector missing",
+    "tool not connected",
+    "external tool missing",
+    "image tool missing",
+    "image tool not connected",
+    "tool not attached",
+    "image tool not attached",
+    "image generation blocked",
+    "image generation setup",
+    "image generation connector",
+    "image generator connector",
+    "which image generator",
+    "which image tool",
+    "choose image tool",
+    "set up image tool",
+    "setup image tool",
+    "connect image tool",
+    "connect gpt image",
+    "gpt image tool",
+    "fal_key",
+    "fal key",
+    "FAL_KEY",
+    "mcp setup",
+    "mcp readiness",
+    "외부 도구",
+    "커넥터",
+    "자격증명",
+    "api 키",
+    "키가 없어",
+    "키 없어서",
+    "이미지 도구",
+    "이미지 생성 도구",
+    "도구가 안 붙",
+    "도구 안 붙",
+    "이미지 도구가 안 붙",
+    "이미지 생성이 막",
+    "이미지 생성 막",
+    "이미지 생성 연결",
+    "이미지 생성 연결체",
+    "이미지 생성 커넥터",
+    "이미지 생성할 외부 연결체",
+    "어떤걸로 연결",
+    "어떤 걸로 연결",
+    "이미지 도구 연결",
+    "이미지 도구 설정",
+    "gpt 이미지 도구",
+    "도구 연결",
+    "연결체",
+)
+_TOOLBELT_READINESS_TOKENS = _normalized_token_set(
+    {
+        "tool",
+        "tools",
+        "toolbelt",
+        "connector",
+        "connect",
+        "connected",
+        "credential",
+        "credentials",
+        "api",
+        "key",
+        "missing",
+        "blocked",
+        "unavailable",
+        "setup",
+        "configure",
+        "mcp",
+        "fal",
+        "gpt",
+        "generator",
+        "도구",
+        "외부",
+        "연결체",
+        "커넥터",
+        "연결",
+        "자격증명",
+        "키",
+        "없어",
+        "없어서",
+        "막히",
+        "설정",
+    }
+)
+# Trigger phrases that are also ordinary English, per skill, with the words
+# that mark the skill's own sense when they stand beside the phrase. A phrase
+# match is the strongest evidence the scorer has, and when the phrase is
+# everyday English the phrase alone cannot say which sense a sentence is in:
+# "my phone had a silent failure of the alarm", "how many harness sessions
+# does a sled dog need", "what is a weekly status review in a school parent
+# meeting", "is a camera gate at the driveway worth installing", "habits that
+# keep your skill health up as a pianist", "summarize the independent
+# perspectives in this essay", "what is media input on an old VCR", "how do I
+# cancel my gym membership" and "how long does it take to become a doctor"
+# each dispatched, or led a clarify with, the skill whose phrase they share.
+#
+# The skill withdraws only when the phrase arrives with other content and
+# none of it is the lane's. The anchor words are the skill's other trigger
+# vocabulary plus the lane nouns and request verbs that say which sense is
+# meant. The phrase on its own -- "silent failures", "status review",
+# "cancel", "doctor" -- is still the phrase being asked for and keeps its
+# route, and an explicit invocation overrides this the way it overrides every
+# offers-itself precondition. Each path one of the measured sentences
+# reached its skill through asks `everyday_sense_phrase_unanchored`: catalog
+# scoring, the operator-surface fast path, the harness-session guard, a bare
+# leading name ("cancel my netflix subscription"), and the clarify shortlist.
+# The routing-precision controls fail when any one of those checks is removed.
+EVERYDAY_SENSE_PHRASES: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
+    "failure-signal-audit": (
+        ("silent failure", "silent failures", "hidden failure", "hidden failures"),
+        frozenset(
+            {
+                "api", "app", "apps", "async", "audit", "backend", "bug", "bugs", "build", "catch",
+                "client", "code", "codebase", "console", "cron", "database", "deploy",
+                "endpoint", "error", "errors", "exception", "exceptions", "fallback", "fallbacks",
+                "frontend", "function", "functions", "handler", "handlers", "hunter", "integration",
+                "job", "jobs", "library", "log", "logging", "logs", "module", "network", "pipeline",
+                "prod", "production", "propagation", "queue", "repo", "retries", "retry", "runtime",
+                "script", "sdk", "server", "service", "services", "swallowed", "sync", "test",
+                "tests", "webhook", "worker", "workers",
+            }
+        ),
+    ),
+    "harness-session-inventory": (
+        ("harness sessions",),
+        frozenset(
+            {
+                "adapter", "adapters", "agents", "claude", "cli", "codex", "coding",
+                "config", "configs", "connector", "connectors", "drift", "inventory", "lifecycle",
+                "list", "mcp", "omh", "opencode", "recall", "recover", PI_DISTRIBUTION_HOST, "session", "show",
+                "worktree", "worktrees",
+            }
+        ),
+    ),
+    "ops-review": (
+        ("status review", "weekly status"),
+        frozenset(
+            {
+                "blockers", "draft", "incident", "incidents", "launch", "milestone", "milestones",
+                "okr", "okrs", "operating", "ops", "our", "prepare", "priorities", "project",
+                "release", "risks", "roadmap", "run", "sprint", "standup", "team", "write",
+            }
+        ),
+    ),
+    "physical-device-readiness": (
+        ("camera gate",),
+        frozenset(
+            {
+                "actuator", "actuators", "device", "devices", "g-code", "gated", "gcode", "hardware",
+                "heat", "iot", "klipper", "moonraker", "nozzle", "physical", "print", "printer",
+                "printers", "relay", "relays", "robot", "robotics", "safety", "sensor", "sensors",
+                "snapmaker",
+            }
+        ),
+    ),
+    "skill-health": (
+        ("skill health",),
+        frozenset(
+            {
+                "amendments", "catalog", "check", "dashboard", "failure", "failures", "installed",
+                "omh", "our", "pattern", "patterns", "pending", "portfolio", "report", "run", "show",
+                "skills",
+            }
+        ),
+    ),
+    "adversarial-consensus": (
+        ("independent perspectives", "multiple perspectives"),
+        frozenset(
+            {
+                "adversarial", "approach", "architecture", "critique", "decision", "design",
+                "hyperplan", "idea", "migration", "plan", "plans", "proposal", "red-team", "refactor",
+                "rfc", "roadmap", "rollout", "spec", "strategy",
+            }
+        ),
+    ),
+    "media-input-operator": (
+        ("media input",),
+        frozenset(
+            {
+                "attached", "attachment", "audio", "clip", "extract", "extraction", "file", "files",
+                "handle", "image", "ocr", "operator", "photo", "picture", "podcast", "process",
+                "receipt", "recording", "screenshot", "text", "timestamps", "transcribe",
+                "transcript", "transcription", "upload", "uploaded", "url", "video", "webinar",
+                "youtube",
+            }
+        ),
+    ),
+    "cancel": (
+        ("cancel",),
+        frozenset(
+            {
+                "abort", "autopilot", "everything", "execution", "goal", "job", "loop", "mode", "omh",
+                "ralph", "run", "running", "session", "stop", "team", "ultrawork",
+            }
+        ),
+    ),
+    # "the root cause of my back pain", "my phone update is lost after the
+    # reset" and "the race condition at the track" are not requests to debug
+    # code; the phrase keeps its route only beside a word of the code being
+    # debugged.
+    # "write a PR description of our product launch for the press release" is
+    # public relations, and "a message to my landlord about the pull request
+    # for more time" is not a repository.
+    # "resolve the conflict between the two teams", "force push the car out of
+    # the snow", "cherry-pick the best apples" and "bisect an angle with a
+    # compass" are not git; each phrase keeps this route only beside a word of
+    # the repository.
+    # "what index fund should I buy", "the table in the kitchen needs a new
+    # partition" and "alter the table setting" are not database work; each
+    # phrase keeps this route only beside a word of the database.
+    # "the band cut a release of their album", "my canary stopped singing" and
+    # "the release candidate for mayor" are not software releases; each phrase
+    # keeps this route only beside a word of shipping software.
+    "release-cut": (
+        ("cut a release", "cut the release", "canary", "release candidate"),
+        frozenset(
+            {
+                "artifact", "build", "changelog", "cluster", "deploy", "deployed", "deployment", "kubernetes", "npm",
+                "package", "pipeline", "pods", "prod", "production", "rollback", "rollout", "semver", "service",
+                "services", "tag", "traffic", "version", "versions",
+            }
+        ),
+    ),
+    # "the red sox won last night", "i have no internal control over my
+    # snacking", "quality control testing on the assembly line" and "the
+    # material weakness in this bridge design" are not control audits; each
+    # phrase keeps this route only beside a word of auditing.
+    "internal-audit": (
+        ("sox", "internal control", "internal controls", "control testing", "material weakness"),
+        frozenset(
+            {
+                "404", "access", "approval", "approvals", "attestation", "audit", "auditor", "auditors", "audits",
+                "coso", "deficiencies", "deficiency", "evidence", "financial", "icfr", "invoice", "invoices", "itgc",
+                "itgcs", "journal", "ledger", "materiality", "payment", "payments", "pcaob", "population",
+                "reconciliation", "reconciliations", "reperform", "reperformance", "sample", "samples", "sampling",
+                "segregation", "vendor", "walkthrough", "workpaper", "workpapers",
+            }
+        ),
+    ),
+    # "congress raised the spending cap again" and "the photo fell out from my
+    # wallet" move no money for the person. The pair lives in the bundle's
+    # `spend_signals`, whose request clause applies it too, so the route hint
+    # withdraws the gate from the same messages the router does ("can you check
+    # out the spending cap for the city council budget"); its comment says
+    # which words anchor and why. The gate named as a command is exempt
+    # (`everyday_sense_phrase_unanchored`).
+    "spend-gate": (SPEND_EVERYDAY_SENSE_PHRASES, SPEND_EVERYDAY_SENSE_ANCHORS),
+    # "the play store on my phone will not open", "my google play gift card did
+    # not work" and "the app store keeps asking for my password" are a phone's
+    # store app, not a release; each phrase keeps this route only beside a word
+    # of release work.
+    "mobile-release": (
+        ("play store", "google play"),
+        frozenset(
+            {
+                "aab", "anr", "apk", "beta", "build", "builds", "bundle", "console", "crash", "crashes", "fastlane",
+                "hotfix", "listing", "phased", "provisioning", "rejected", "rejection", "release", "releases",
+                "publish", "publishing", "resubmit", "rollout", "sdk", "sdks", "ship", "shipping", "signing", "staged",
+                "submission", "submit", "testers", "testflight", "track", "upload", "version", "versioncode", "xcode",
+            }
+        ),
+    ),
+    # "fine-tune the wording of this email", "my workout needs some
+    # fine-tuning", "our dpo needs a report" (a data protection officer) and "a
+    # lora gateway for the soil sensors" (a radio) are not model training; each
+    # phrase keeps this route only beside a word of model training.
+    "model-finetuning": (
+        ("fine-tune", "fine tune", "fine-tuning", "fine tuning", "sft", "dpo", "lora"),
+        frozenset(
+            {
+                "adapter", "adapters", "baseline", "bert", "checkpoint", "checkpoints", "classifier", "dataset",
+                "datasets", "embedding", "embeddings", "epoch", "epochs", "eval", "evals", "finetune", "finetuning",
+                "gemma", "gpt", "gpu", "gpus", "huggingface", "hyperparameters", "llama", "llm", "llms", "mistral",
+                "model", "models", "peft", "preference", "preferences", "pytorch", "qlora", "qwen", "reward",
+                "rewards", "rlvr", "tokenizer", "train", "training", "transformers", "weights",
+            }
+        ),
+    ),
+    # "we need to backfill the open position on the team", "my family lineage
+    # goes back to scotland", "duplicate events in my calendar" and "the batch
+    # job at the bakery" are not pipelines; each phrase keeps this route only
+    # beside a word of data engineering.
+    "data-pipelines": (
+        ("backfill", "lineage", "duplicate events", "batch job", "data quality"),
+        frozenset(
+            {
+                "airflow", "bigquery", "consumer", "dag", "dags", "dagster", "data", "databricks", "dataset", "datasets", "dbt",
+                "elt", "etl", "ingestion", "kafka", "offset", "offsets", "parquet", "partition", "partitions",
+                "pipeline", "pipelines", "redshift", "rows", "schema", "sink", "snowflake", "spark", "stream",
+                "streaming", "table", "tables", "topic", "warehouse",
+            }
+        ),
+    ),
+    # "the cost delta between the two flights", "drift detection in the ocean
+    # model" and "a helm chart for the sailing class" are not infrastructure;
+    # each phrase keeps this route only beside a word of infrastructure.
+    "iac-change": (
+        ("cost delta", "drift detection", "helm chart"),
+        frozenset(
+            {
+                "apply", "aws", "azure", "bucket", "cloud", "cloudformation", "cluster", "clusters",
+                "deployment", "eks", "gcp", "gke", "iac", "iam", "infra", "infracost", "infrastructure", "ingress", "k8s",
+                "kubectl", "kubernetes", "kustomize", "manifest", "manifests", "module", "modules", "namespace",
+                "opentofu", "plan", "pod", "pods", "provider", "pulumi", "release", "resource", "resources", "stack",
+                "state", "terraform", "tfvars", "values", "vpc", "workspace",
+            }
+        ),
+    ),
+    # "the mouse cursor rules the screen in this game" is not an editor rule
+    # file; the phrase keeps this route only beside a word of the repository.
+    "agent-instructions": (
+        ("cursor rules", "cursor rule"),
+        frozenset(
+            {
+                "agents", "assistant", "codebase", "coding", "cursorrules", "editor", "ide", "mdc",
+                "project", "repo", "repository",
+            }
+        ),
+    ),
+    # "the travel security advisory for mexico", "the leaked secret ending of
+    # the film" and "is my driver's license ok abroad" are not security events;
+    # each phrase keeps this route only beside a word of code.
+    "security-event-response": (
+        ("security advisory", "leaked secret", "leaked a secret", "license ok", "license compatibility"),
+        frozenset(
+            {
+                "cargo", "code", "codebase", "commit", "committed", "credential", "credentials", "cve", "dependabot",
+                "dependencies", "dependency", "ghsa", "git", "github", "gitlab", "gpl", "library",
+                "libraries", "lockfile", "maven", "npm", "package", "packages", "pip", "push", "pushed", "pypi",
+                "repo", "repository", "token", "tokens",
+            }
+        ),
+    ),
+    "relational-db": (
+        (
+            "what index", "which index", "missing index", "index size", "alter table", "table lock",
+            "took a lock", "need to shard", "partition the table", "table partitioning",
+        ),
+        frozenset(
+            {
+                "column", "columns", "constraint", "database", "deploy", "endpoint", "foreign", "join",
+                "joins", "key", "migration", "mysql", "orm", "postgres", "postgresql", "queries", "query",
+                "row", "rows", "scan", "scans", "schema", "seq-scans", "sql", "sqlite", "transaction",
+                "users", "writes",
+            }
+        ),
+    ),
+    "git-workflow": (
+        (
+            "resolve the conflict", "resolve this conflict", "bisect", "force push", "cherry-pick",
+            "rewrite history", "rewrite the history", "clean up the history", "undo the last commit",
+            "lost commit", "recover the commit",
+        ),
+        frozenset(
+            {
+                "branch", "branches", "commit", "commits", "diff", "file", "files", "git", "github",
+                "head", "hunk", "lockfile", "main", "master", "merge", "merged", "origin", "pushed",
+                "rebase", "regression", "remote", "repo", "repository", "reset", "sha", "stash", "tag",
+                "test", "tests", "upstream", "worktree",
+            }
+        ),
+    ),
+    "commit-pr-authoring": (
+        ("pr body", "pr description", "pr template", "pull request body", "pull request description"),
+        frozenset(
+            {
+                "branch", "bug", "code", "commit", "commits", "diff", "e2e", "feature", "fix",
+                "git", "github", "merge", "not-tested", "patch", "refactor", "repo", "repository",
+                "staged", "test", "tested", "tests", "trailer", "trailers",
+            }
+        ),
+    ),
+    "app-debugging": (
+        ("root cause", "root-cause", "update is lost", "lost update", "race condition"),
+        frozenset(
+            {
+                "api", "app", "application", "async", "backend", "bug", "bugs", "cache", "code",
+                "codebase", "concurrency", "concurrent", "crash", "database", "deadlock", "debug",
+                "endpoint", "error", "errors", "exception", "exceptions", "fails", "failing", "flaky",
+                "frontend", "function", "handler", "job", "jobs", "library", "lock", "locks", "method",
+                "module", "mutex", "prod", "production", "query", "queue", "regression",
+                "requests", "returns", "row", "rows", "script", "sdk", "server", "service", "services",
+                "stack", "test", "tests", "thread", "threads", "transaction", "transactions", "worker",
+                "workers", "write", "writes",
+            }
+        ),
+    ),
+    "doctor": (
+        ("doctor",),
+        frozenset(
+            {
+                "check", "cli", "config", "diagnose", "gateway", "health", "install", "installation",
+                "installed", "omh", "plugin", "plugins", "repair", "run", "setup", "skills", "tui",
+                "update", "version",
+            }
+        ),
+    ),
+}
+# Words a bare request wraps around the phrase without adding a sense of its own.
+# "draft" and "write" are the request verbs of a writing phrase ("draft the PR
+# body"): alone beside the phrase they ask for it, and add no sense of their own.
+_EVERYDAY_SENSE_FILLER_TOKENS = frozenset(
+    {"again", "can", "could", "draft", "just", "now", "please", "would", "write", "you"}
+)
+
+
+def everyday_sense_phrase_unanchored(skill: str, normalized_query: str) -> bool:
+    """True when the skill's only claim on the message is an everyday-English phrase.
+
+    See `EVERYDAY_SENSE_PHRASES`: the phrase is spoken, the message carries
+    other content, and none of that content is an anchor word of the skill.
+    """
+    entry = EVERYDAY_SENSE_PHRASES.get(skill)
+    if entry is None:
+        return False
+    # "run spend gate on my spending limit" asks for the gate whatever cap it
+    # names; `spend_signals`' clause rule skips the check for it too.
+    if skill == "spend-gate" and spend_gate_named_as_command(normalized_query):
+        return False
+    phrases, anchors = entry
+    spoken = tuple(phrase for phrase in phrases if phrase_is_spoken(normalized_query, phrase))
+    if not spoken:
+        return False
+    query_tokens = routing_tokens(normalized_query)
+    if query_tokens & anchors:
+        return False
+    return bool(query_tokens - routing_tokens(" ".join(spoken)) - _EVERYDAY_SENSE_FILLER_TOKENS)
+
+
+_HARNESS_SESSION_INVENTORY_PHRASES = (
+    "harness-session-inventory",
+    "harness session inventory",
+    "session inventory",
+    "session adapter",
+    "session adapters",
+    "harness sessions",
+    "mcp inventory",
+    "mcp config inventory",
+    "mcp drift",
+    "harness drift",
+    "connector drift",
+    "worktree inventory",
+    "worktree lifecycle",
+    "operator inventory",
+    "control pane inventory",
+    "codex session inventory",
+    "claude code session inventory",
+    "세션 인벤토리",
+    "하네스 세션",
+    "하네스 드리프트",
+    "mcp 인벤토리",
+    "mcp 설정 드리프트",
+    "워크트리 인벤토리",
+    "커넥터 드리프트",
+)
+_HARNESS_SESSION_INVENTORY_TOKENS = _normalized_token_set(
+    {
+        "inventory",
+        "drift",
+        "adapter",
+        "adapters",
+        "session",
+        "sessions",
+        "harness",
+        "harnesses",
+        "mcp",
+        "connector",
+        "connectors",
+        "worktree",
+        "worktrees",
+        "인벤토리",
+        "드리프트",
+        "세션",
+        "하네스",
+        "워크트리",
+        "커넥터",
+    }
+)
+_MATERIALS_PACKAGE_PHRASES = (
+    "ppt and pdf",
+    "pdf and ppt",
+    "ppt/pdf",
+    "pdf/ppt",
+    "spreadsheet to pdf",
+    "excel to pdf",
+    "monthly report pdf",
+    "attached spreadsheet",
+    "pdf deck",
+    "pdf slide deck",
+    "summarize this pdf deck",
+    "summarize this deck",
+    "deck into action items",
+    *OFFICE_FILE_MATERIAL_PHRASES,
+    "pdf랑 ppt",
+    "ppt랑 pdf",
+    "ppt와 pdf",
+    "pdf와 ppt",
+    "pdf랑 ppt로",
+    "make a ppt",
+    "make a deck",
+    "presentation deck",
+    "meeting notes to slides",
+    "create a ppt",
+    "create a deck",
+    "as a deck",
+    "export a pdf",
+    "export pdf",
+    "as a pdf",
+    "package it as a pdf",
+    "ppt로 만들",
+    "pdf로 만들",
+    "ppt 만들어",
+    "ppt 만들어줘",
+    "피피티 만들",
+    "피피티 만들어",
+    "피피티 만들어줘",
+    "슬라이드 만들",
+    "슬라이드 만들어",
+    "발표자료",
+    "발표 자료",
+    "발표자료로",
+    "발표 자료로",
+    "회의록을 발표자료",
+    "회의록을 발표 자료",
+    "발표자료로 만들어",
+    "발표자료로 만들어줘",
+)
+_MATERIALS_PACKAGE_FORMAT_TOKENS = _normalized_token_set(
+    {
+        "pdf",
+        "ppt",
+        "pptx",
+        "spreadsheet",
+        "excel",
+        "xlsx",
+        "deck",
+        "slides",
+        "doc",
+        "docx",
+        "csv",
+        "hwp",
+        "document",
+        "피디에프",
+        "피피티",
+        "슬라이드",
+        "발표자료",
+        "발표",
+        "덱",
+        "워드",
+        "엑셀",
+        "문서",
+        "자료",
+        "첨부",
+    }
+)
+_MATERIALS_PACKAGE_ACTION_TOKENS = _normalized_token_set(
+    {
+        "make",
+        "create",
+        "turn",
+        "summarize",
+        "summary",
+        "prepare",
+        "package",
+        "compare",
+        "extract",
+        "export",
+        "share",
+        "render",
+        "만들",
+        "정리",
+        "요약",
+        "비교",
+        "추출",
+        "뽑",
+        "공유",
+        "준비",
+        "생성",
+        "변환",
+    }
+)
+# Unambiguous capture vocabulary: each phrase names the act of adding a durable fact,
+# so it is a memory-new signal on its own.
+MEMORY_NEW_CAPTURE_PHRASES = (
+    "memory-new",
+    "new memory",
+    "remember this project",
+    "remember this product",
+    "memory capture",
+    "capture memory",
+    "save project memory",
+    "save product memory",
+    "프로젝트 메모리 저장",
+    "제품 메모리 저장",
+    "새 기억",
+    "기억 추가",
+    "메모리 캡처",
+)
+# Scope nouns name *where* a durable fact lives, not what to do with it. Alone they read
+# as capture ("project memory"), but paired with curation intent they describe cleanup of
+# memories that already exist ("clean up my stale project memory") and must not be treated
+# as capture -- that is the memory-new/memory-sync overroute these two tuples separate.
+MEMORY_NEW_SCOPE_PHRASES = (
+    "project memory",
+    "product memory",
+    "project context memory",
+    "product context memory",
+    "프로젝트 기억",
+    "제품 기억",
+)
+# Verbs and adjectives that mark a request about memories that already exist.
+MEMORY_CURATION_INTENT_PHRASES = (
+    "clean up",
+    "cleanup",
+    "clear out",
+    "curate",
+    "review",
+    "inspect",
+    "audit",
+    "check",
+    "prune",
+    "dedupe",
+    "deduplicate",
+    "stale",
+    "outdated",
+    "duplicate",
+    "conflicting",
+    "정리",
+    "점검",
+    "검사",
+    "검토",
+    "정돈",
+    "오래된",
+    "중복",
+    "충돌",
+)
+_MEMORY_CURATION_PHRASES = (
+    "memory curation",
+    "memory review",
+    "memory inspect",
+    "memory check",
+    "memory update",
+    "memory updates",
+    "memory health",
+    "check memories",
+    "inspect memories",
+    "review memories",
+    "stale memories",
+    "record stale memories",
+    "review stale memories",
+    "inspect stale memories",
+    "ask me what to keep",
+    "context cleanup",
+    "context compaction",
+    "cross-channel context",
+    "channel context collision",
+    "stale project context",
+    "old project context",
+    "hermes remembers",
+    "hermes remembers incorrectly",
+    "hermes remembers this wrong",
+    "hermes is remembering wrong",
+    "hermes remembered context",
+    "hermes remembered incorrectly",
+    "기억하고 있는",
+    "기억하고 있는 프로젝트 맥락",
+    "기억하는 맥락",
+    "기억하는 맥락을 점검",
+    "현재 hermes가 기억하는 맥락",
+    "현재 헤르메스가 기억하는 맥락",
+    "헤르메스가 기억하는 맥락",
+    "hermes가 기억하는 내용",
+    "헤르메스가 기억하는 내용",
+    "hermes가 내 기억을 잘못",
+    "헤르메스가 내 기억을 잘못",
+    "hermes가 기억을 잘못",
+    "헤르메스가 기억을 잘못",
+    "내 기억을 잘못 기억",
+    "기억을 잘못 기억",
+    "잘못 기억하는",
+    "잘못 기억하",
+    "기억이 잘못",
+    "잘못된 기억",
+    "기억이 틀렸",
+    "틀리게 기억",
+    "기억하는 내용 점검",
+    "기억 내용 점검",
+    "기억하는 내용 한번 점검",
+    "프로젝트 맥락이 오래된",
+    "오래된 맥락",
+    "오래된 기억",
+    "맥락이 오래된",
+    "메모리가 쌓",
+    "메모리가 너무 쌓",
+    "메모리 너무 쌓",
+    "메모리가 쌓였",
+    "메모리 업데이트",
+    "메모리 업데이트 할",
+    "메모리 업데이트할",
+    "메모리 검사",
+    "메모리 점검",
+    "메모리 압축",
+    "메모리 뭐가 저장",
+    "메모리 뭐 저장",
+    "내 메모리 뭐가 저장",
+    "내 기억 뭐가 저장",
+    "내 기억에 뭐 저장",
+    "내 기억에 뭐가 저장",
+    "메모리에 뭐가 저장",
+    "기억에 뭐가 저장",
+    "저장되어있는지 점검",
+    "저장되어 있는지 점검",
+    "저장돼있는지 점검",
+    "저장돼 있는지 점검",
+    "저장되어있는지 검토",
+    "저장되어 있는지 검토",
+    "저장돼있는지 검토",
+    "저장돼 있는지 검토",
+    "맥락 피드백",
+    "채널 용어",
+    "용어가 겹",
+    "다른 채널",
+)
+# Tokens naming a memory store. Built through `_normalized_token_set` because
+# `routing_tokens` folds Korean to decomposed jamo: a raw NFC literal such as "기억"
+# never equals the folded token, so an unnormalized set is silently dead for Korean.
+_MEMORY_STORE_TOKENS = _normalized_token_set(
+    {
+        "memory",
+        "memories",
+        "context",
+        "contexts",
+        "기억",
+        "메모리",
+        "맥락",
+    }
+)
+_MEMORY_CURATION_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "memory",
+        "memories",
+        "context",
+        "contexts",
+        "remember",
+        "remembers",
+        "stale",
+        "old",
+        "duplicate",
+        "update",
+        "updates",
+        "check",
+        "inspect",
+        "review",
+        "cleanup",
+        "curate",
+        "기억",
+        "맥락",
+        "메모리",
+        "업데이트",
+        "검사",
+        "점검",
+        "검토",
+        "피드백",
+        "오래된",
+        "중복",
+        "채널",
+        "용어",
+        "압축",
+        "충돌",
+        "정리",
+    }
+)
+_AGENT_BOARD_PHRASES = (
+    "agent board",
+    "multi agent board",
+    "multiple hermes agents",
+    "multiple hermes profiles",
+    "coordinate pm cto qa",
+    "coordinate pm cto qa and release agents",
+    "coordinate release agents",
+    "roles and board",
+    "role board",
+    "task board",
+    "kanban board",
+    "hermes agent 여러 명",
+    "여러 명이 같이 일",
+    "역할과 보드",
+    "역할 보드",
+    "작업 보드",
+)
+_AGENT_BOARD_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "agent",
+        "agents",
+        "profile",
+        "profiles",
+        "multi",
+        "multiple",
+        "board",
+        "kanban",
+        "role",
+        "roles",
+        "team",
+        "hermes",
+        "에이전트",
+        "여러",
+        "보드",
+        "역할",
+        "팀",
+        "같이",
+    }
+)
+_CODING_PROGRESS_STATUS_PHRASES = (
+    "coding progress",
+    "codex progress",
+    "codex status",
+    "codex session status",
+    "codex session running",
+    "is codex session running",
+    "codex session is running",
+    "is codex session alive",
+    "check if codex session is alive",
+    "check codex session liveness",
+    "codex work session",
+    "codex session do so far",
+    "what did the codex session do",
+    "what did the codex session do so far",
+    "track the codex work session",
+    "track codex work session",
+    "coding agent status",
+    "coding agent session",
+    "coding handoff status",
+    "coding handoff progress",
+    "coding work status",
+    "coding work progress",
+    "what is the coding handoff status",
+    "what did the coding agent do",
+    "what did the coding agent do while i was away",
+    "what has the coding agent done",
+    "what did codex do",
+    "what did claude code do",
+    "see current codex session",
+    "see the current codex session",
+    "current codex session",
+    "see current claude code session",
+    "see the current claude code session",
+    "current claude code session",
+    "view codex session",
+    "view claude code session",
+    "did the coding agent finish",
+    "the coding agent was dispatched",
+    "coding agent was dispatched",
+    "what happened next",
+    "what changed in the coding agent session",
+    "what changed in coding agent session",
+    "tell me what changed",
+    "work session and tell me what changed",
+    "what is codex doing",
+    "what is codex doing now",
+    "what is claude code doing",
+    "what is claude code doing now",
+    "where is codex",
+    "codex 작업",
+    "codex 작업이 어디까지",
+    "codex가 지금 뭐",
+    "codex 지금 뭐",
+    "codex가 뭐하고",
+    "codex 뭐하고",
+    "codex 세션 실행 중",
+    "codex 세션 지금 실행 중",
+    "codex 세션 살아있는지",
+    "codex 세션이 살아있는지",
+    "codex 세션 살아 있",
+    "codex 세션이 살아 있",
+    "codex 세션 붙여서 상태",
+    "codex 진행상황",
+    "코덱스 작업",
+    "코덱스가 지금 어디까지",
+    "코덱스 지금 어디까지",
+    "코덱스가 지금 뭐",
+    "코덱스 지금 뭐",
+    "코덱스가 뭐하고",
+    "코덱스가 뭐 하고",
+    "코덱스 뭐하고",
+    "코덱스 뭐 하고",
+    "코덱스 세션 실행 중",
+    "코덱스 세션 지금 실행 중",
+    "코덱스 세션 살아있는지",
+    "코덱스 세션이 살아있는지",
+    "코덱스 세션 살아 있",
+    "코덱스 세션이 살아 있",
+    "코덱스 세션 붙여서 상태",
+    "코덱스 진행상황",
+    "코덱스 상태",
+    "claude code가 지금 어디까지",
+    "claude code가 지금 뭐",
+    "claude code 지금 뭐",
+    "claude code가 뭐하고",
+    "claude code 작업 완료",
+    "claude code 완료",
+    "클로드 코드가 지금 어디까지",
+    "클로드 코드가 지금 뭐",
+    "클로드 코드 지금 뭐",
+    "클로드 코드가 뭐하고",
+    "클로드 코드가 뭐 하고",
+    "클로드 코드 뭐하고",
+    "클로드 코드 뭐 하고",
+    "클로드 코드 작업 완료",
+    "클로드 코드 완료",
+    "작업이 어디까지",
+    "코딩 작업 어디까지",
+    "코딩 작업 지금 어디까지",
+    "코딩 작업 진행상황",
+    "코딩 작업 상태",
+    "pr 머지 준비",
+    "머지 준비 됐는지",
+    "머지 준비 상태",
+    "머지 준비해줘",
+    "pr 머지 상태",
+    "pr 머지됐는지",
+    "pr 머지 되었는지",
+    "pr 머지됐어",
+    "pr 머지 되었어",
+    "리뷰어 코멘트 반영",
+    "리뷰 코멘트 반영",
+    "코멘트 반영됐는지",
+    "코멘트 반영 되었는지",
+    "코멘트 반영하고 머지",
+    "ci 통과했어",
+    "ci 통과했는지",
+    "ci 상태",
+    "진행됐는지",
+    "진행되었는지",
+)
+_CODING_SESSION_STATUS_ONLY_PHRASES = (
+    "session looks stuck",
+    "coding session looks stuck",
+    "codex session looks stuck",
+    "claude code session looks stuck",
+    "codex session status",
+    "codex session running",
+    "is codex session alive",
+    "what did the codex session do",
+    "what did the codex session do so far",
+    "what is it doing",
+    "what is codex doing",
+    "what is codex doing now",
+    "what is claude code doing",
+    "what is claude code doing now",
+    "what did the coding agent do",
+    "what did codex do",
+    "what did claude code do",
+    "did the coding agent finish",
+    "the coding agent was dispatched",
+    "coding agent was dispatched",
+    "says done",
+    "said done",
+    "tests passed",
+    "pr is open",
+    "pr opened",
+    "what is still missing",
+    "what's still missing",
+    "what evidence is still missing",
+    "evidence is still missing",
+    "still missing",
+    "merge ready",
+    "merge readiness",
+    "pr merge ready",
+    "pr merge readiness",
+    "is codex done",
+    "is claude code done",
+    "coding handoff status",
+    "what is the coding handoff status",
+    "coding work status",
+    "codex 세션 살아있는지",
+    "codex 세션이 살아있는지",
+    "codex가 지금 뭐",
+    "codex 지금 뭐",
+    "codex가 뭐하고",
+    "codex 뭐하고",
+    "코덱스 세션 살아있는지",
+    "코덱스 세션이 살아있는지",
+    "코덱스가 지금 뭐",
+    "코덱스 지금 뭐",
+    "코덱스가 뭐하고",
+    "코덱스가 뭐 하고",
+    "코덱스 뭐하고",
+    "코덱스 뭐 하고",
+    "claude code가 지금 뭐",
+    "claude code 지금 뭐",
+    "claude code가 뭐하고",
+    "클로드 코드가 지금 뭐",
+    "클로드 코드 지금 뭐",
+    "클로드 코드가 뭐하고",
+    "클로드 코드가 뭐 하고",
+    "클로드 코드 뭐하고",
+    "클로드 코드 뭐 하고",
+    "코딩 작업 어디까지",
+    "코딩 작업 지금 어디까지",
+    "pr 머지 준비",
+    "머지 준비 됐는지",
+    "머지 준비 상태",
+    "pr 머지 상태",
+    "pr 머지됐는지",
+    "ci 통과했어",
+    "ci 통과했는지",
+    "ci 상태",
+)
+_CODING_PROGRESS_STATUS_TOKENS = _normalized_token_set(
+    {
+        "codex",
+        "claude",
+        "coding",
+        "agent",
+        "executor",
+        "progress",
+        "status",
+        "running",
+        "session",
+        "connected",
+        "available",
+        "installed",
+        "작업",
+        "진행",
+        "진행상황",
+        "상태",
+        "코덱스",
+        "클로드",
+        "세션",
+        "핸드오프",
+    }
+)
+# A security advisory or a leaked secret is an event on shipped code owned by
+# `security-event-response` (#1694), even when it arrives as an opened PR: the
+# PR is the carrier, and the advisory decides the containment order.
+_SECURITY_EVENT_OVER_GITHUB_EVENT_PHRASES = (
+    "security advisory",
+    "dependabot alert",
+    "dependabot security",
+    "leaked secret",
+    "leaked credential",
+    "committed a secret",
+)
+# A build waiting in TestFlight or a store's review is a store release owned by
+# `mobile-release` (#1568), not a CI build or a pull-request review: the store,
+# not GitHub, decides what happens next.
+_MOBILE_RELEASE_OVER_GITHUB_EVENT_PHRASES = (
+    "testflight",
+    "app store",
+    "play store",
+    "google play",
+    "play console",
+)
+
+_GITHUB_EVENT_OPS_PHRASES = (
+    "github event ops",
+    "github events",
+    "github issue ops",
+    "github pr ops",
+    "github issue to pr",
+    "issue to pr",
+    "issue into a pr",
+    "issue should become a pr",
+    "issue should become pr",
+    "this issue should become a pr",
+    "turn this issue into a pr",
+    "make this issue into a pr",
+    "convert this issue into a pr",
+    "issue opened",
+    "pr opened",
+    "ci failed",
+    "github issue",
+    "github pr",
+    "github issue 들어온",
+    "github pr 열렸",
+    "issue labeling",
+    "label this issue",
+    "label issue and prepare pr",
+    "pr 열렸",
+    "pr 열리",
+    "pr 열렸는데 ci 실패",
+    "pr이 열렸는데 ci 실패",
+    "ci 실패했어",
+    "ci 실패 원인",
+    "이슈 들어오면",
+    "새 이슈 들어오면",
+    "이슈 라벨링",
+    "라벨링하고 pr 준비",
+    "이 이슈 pr로 만들",
+    "이 이슈 pr로 만들 수 있게",
+    "이슈 pr로 만들 수 있게",
+    "이슈를 pr로 만들",
+    "pr로 만들 수 있게 정리",
+    "pr 준비",
+    "pr 준비해줘",
+    "라벨링",
+    "issue para un pr",
+    "preparar este issue para un pr",
+    "preparar issue para pr",
+    "convertir este issue en pr",
+    "este issue para pr",
+    "このprをレビュー",
+    "prをレビューしやすい計画",
+    "issueをpr",
+    "このissueをpr",
+    "このissueをprに",
+    "reviewer left comments on my pr",
+    "reviewer left comments",
+    "pr comments",
+    "ci is red",
+    "red ci",
+    "job failed",
+    "test job failed",
+    "build failed",
+    "latest push failed",
+)
+_GITHUB_EVENT_OPS_TOKENS = _normalized_token_set(
+    {
+        "github",
+        "issue",
+        "pr",
+        "pull",
+        "request",
+        "review",
+        "ci",
+        "label",
+        "깃허브",
+        "이슈",
+        "리뷰",
+        "라벨",
+        "실패",
+        "열렸",
+        "열림",
+    }
+)
+_GITHUB_ISSUE_INTAKE_PHRASES = (
+    "github issue intake",
+    "issue intake",
+    "file this as an issue",
+    "file this as a github issue",
+    "file an issue",
+    "file a github issue",
+    "file a new issue",
+    "file a bug report",
+    "open an issue",
+    "open a github issue",
+    "open a new issue",
+    "create an issue",
+    "create a github issue",
+    "create a new issue",
+    "submit an issue",
+    "submit a github issue",
+    "raise an issue",
+    "raise a github issue",
+    "register an issue",
+    "register a github issue",
+    "report this as an issue",
+    "report a bug as an issue",
+    "make a github issue",
+    "new github issue",
+    "이슈로 올려",
+    "깃허브 이슈로 올려",
+    "깃허브에 이슈",
+    "이슈 등록",
+    "이슈 생성",
+    "이슈 만들어",
+    "깃허브 이슈 만들",
+    "깃허브 이슈 생성",
+    "깃허브 이슈 등록",
+    "버그 리포트 올려",
+    "버그 리포트 등록",
+)
+# Only these forms establish a new GitHub issue without separately naming a
+# repository. Generic English "file/open an issue" is common non-GitHub
+# language (landlord, payroll, support tickets), so it needs GitHub/repo context.
+_GITHUB_ISSUE_INTAKE_EXPLICIT_PHRASES = (
+    "github issue intake",
+    "issue intake",
+    "file this as an issue",
+    "file this as a github issue",
+    "file a github issue",
+    "open a github issue",
+    "create a github issue",
+    "submit a github issue",
+    "report a bug as an issue",
+    "new github issue",
+    "이슈로 올려",
+    "깃허브 이슈로 올려",
+    "깃허브에 이슈",
+    "이슈 등록",
+    "이슈 생성",
+    "이슈 만들어",
+    "깃허브 이슈 만들",
+    "깃허브 이슈 생성",
+    "깃허브 이슈 등록",
+    "버그 리포트 올려",
+    "버그 리포트 등록",
+)
+_GITHUB_ISSUE_INTAKE_TOKENS = _normalized_token_set(
+    {
+        "file",
+        "open",
+        "create",
+        "submit",
+        "raise",
+        "register",
+        "올려",
+        "등록",
+        "생성",
+    }
+)
+_RELEASE_CLAIM_REVIEW_PHRASES = (
+    "readme claim",
+    "readme claims",
+    "readme 주장",
+    "claim matches actual",
+    "docs match code",
+    "docs claim",
+    "docs claim matches",
+    "release docs claim",
+    "release claim review",
+    "릴리즈 전에 readme",
+    "release 전에 docs claim",
+    "릴리즈 전에 docs claim",
+    "docs claim이 맞는지",
+    "docs claim 맞는지",
+    "readme 주장과 실제",
+    "실제 기능이 맞는지",
+    "doctor/harness",
+    "release readiness status",
+    "release readiness check",
+    "릴리즈 준비 상태",
+    "릴리즈 준비 상태 점검",
+)
+_RELEASE_CLAIM_REVIEW_TOKENS = _normalized_token_set(
+    {
+        "readme",
+        "claim",
+        "claims",
+        "docs",
+        "doctor",
+        "harness",
+        "release",
+        "review",
+        "verify",
+        "검토",
+        "릴리즈",
+        "주장",
+        "실제",
+        "기능",
+        "맞는지",
+        "통과",
+    }
+)
+_OPS_OBSERVABILITY_PHRASES = (
+    "ops observability",
+    "runtime observability",
+    "external metric provider",
+    "metric provider",
+    "metric source",
+    "prometheus metrics",
+    "prometheus metric",
+    "grafana metrics",
+    "grafana panel export",
+    "grafana panel",
+    "service quality board",
+    "service quality",
+    "ops command board",
+    "operations command board",
+    "slo dashboard",
+    "token cost latency run history",
+    "cost latency run history",
+    "loop cost",
+    "latency status",
+    "cost and latency",
+    "cost latency",
+    "token cost",
+    "run history",
+    "루프 비용",
+    "지연시간 상태",
+    "비용이랑 지연시간",
+    "비용 지연시간",
+    "토큰 비용",
+    "실행 기록",
+    "omh가 너무 느려",
+    "omh 너무 느려",
+    "omh가 느려",
+    "omh 느려",
+    "omh feels slow",
+    "omh is slow",
+    "omh routing is slow",
+    "slow omh routing",
+    "hermes omh response takes too long",
+    "hermes에서 omh 답변이 오래",
+    "omh 답변이 오래",
+    "omh 라우팅이 느려",
+    "라우팅이 느려",
+    "라우터가 느려",
+    "응답 지연시간",
+    "답변 지연시간",
+    "토큰을 너무 많이",
+    "토큰 너무 많이",
+    "too many tokens",
+    "using too many tokens",
+    "cost too high",
+    "비용이 많이",
+    "비용 많이",
+    "비용 확인",
+    "운영 지휘판",
+    "서비스 품질",
+    "메트릭 제공자",
+    "프로메테우스 메트릭",
+    "그라파나 패널",
+)
+_OPS_OBSERVABILITY_TOKENS = _normalized_token_set(
+    {
+        "observability",
+        "telemetry",
+        "metric",
+        "metrics",
+        "prometheus",
+        "grafana",
+        "slo",
+        "token",
+        "tokens",
+        "cost",
+        "latency",
+        "history",
+        "usage",
+        "queue",
+        "failure",
+        "slow",
+        "slowness",
+        "비용",
+        "지연시간",
+        "레이턴시",
+        "토큰",
+        "기록",
+        "관측성",
+        "메트릭",
+        "프로메테우스",
+        "그라파나",
+        "지휘판",
+        "느려",
+        "느림",
+    }
+)
+_OPS_OBSERVABILITY_GENERIC_METRIC_TOKENS = _normalized_token_set(
+    {
+        "metric",
+        "metrics",
+        "메트릭",
+    }
+)
+_OPS_OBSERVABILITY_EXTERNAL_BLOCKERS = (
+    "aws cost",
+    "aws bill",
+    "gcp cost",
+    "gcp bill",
+    "azure cost",
+    "azure bill",
+    "cloud bill",
+    "cloud cost",
+    "provider cost",
+    "provider pricing",
+    "external provider cost",
+    "external provider pricing",
+    "hosting cost",
+    "server cost",
+    "network routing",
+    "router hardware",
+    "aws 비용",
+    "gcp 비용",
+    "azure 비용",
+    "클라우드 비용",
+    "호스팅 비용",
+    "서버 비용",
+    "네트워크 라우팅",
+    "공유기",
+)
+_OPS_OBSERVABILITY_CONNECTOR_READINESS_BLOCKERS = (
+    "external connector readiness",
+    "connector readiness",
+    "plugin readiness",
+    "provider readiness",
+    "api readiness",
+    "connector adoption",
+    "external plugin adoption",
+    "weather plugin readiness",
+    "weather connector readiness",
+    "wxtrain readiness",
+    # Broader than the sibling entries on purpose. `external-connector-readiness`
+    # declares `memory_provider_posture/v1` and `memory-sync` sends every
+    # provider-lifecycle question to it, so the noun phrase itself is the
+    # ownership line -- "memory provider readiness" was only the one wording
+    # that had been asked for. A comparison ("retrieval quality and latency
+    # across providers") reads as telemetry word for word and is still a
+    # provider-posture question.
+    "memory provider",
+    "search provider connector readiness",
+    "social automation connector readiness",
+    "twitter automation connector readiness",
+    "x/twitter automation connector readiness",
+    "x twitter automation connector readiness",
+    "onequery read-only sql",
+    "read-only sql connector",
+    "sql connector readiness",
+    "nextcloud connector",
+    "microsoft workspace connector",
+    "microsoft graph connector",
+    "chainlink connector",
+    "solana connector",
+    "monero gateway",
+    "xmr gateway",
+    "private crypto",
+    "private cryptocurrency",
+    "private crypto transaction",
+    "crypto transaction plugin",
+    "blockchain gateway",
+    "composio",
+    "universal cli",
+    "skill connector adoption",
+    "connector auth risk",
+    "connector cost auth risk",
+    "cost-aware connector",
+    "multimodal connector",
+    "multimodal routing",
+    "plugin auto-routing",
+    "connector auto-routing",
+    "커넥터 준비도",
+    "외부 커넥터 준비",
+    "외부 플러그인 채택",
+    "플러그인 준비도",
+    "커넥터 도입",
+    "플러그인 도입",
+    "비용 인증",
+    "인증 리스크",
+    "도입 비용",
+    "비용 기준 커넥터",
+    "멀티모달 커넥터",
+    "멀티모달 라우팅",
+)
+# Enabling, switching, pausing, or removing an optional memory provider is a
+# lifecycle and portability question about an external backend, not a review of
+# what Hermes already remembers. These phrases carry that intent, and naming
+# them here is what holds the memory-curation guard back from claiming them.
+MEMORY_PROVIDER_LIFECYCLE_READINESS_PHRASES = (
+    "memory provider readiness",
+    "memory provider posture",
+    "memory provider lifecycle",
+    "memory provider adoption",
+    "memory provider retention",
+    "memory provider portability",
+    "memory provider sync failure",
+    "switch memory provider",
+    "switching memory providers",
+    "disable memory provider",
+    "delete provider memory",
+    "export memory provider data",
+)
+# One list, read by both the policy guard and the recommendation scorer, so a
+# phrase can never be creditable in one place and invisible in the other.
+PUBLIC_PLUGIN_CONNECTOR_READINESS_EXACT_PHRASES = (
+    *MEMORY_PROVIDER_LIFECYCLE_READINESS_PHRASES,
+    "search provider connector readiness",
+    "social automation connector readiness",
+    "twitter automation connector readiness",
+    "x/twitter automation connector readiness",
+    "x twitter automation connector readiness",
+)
+# Realtime voice adoption questions are connector-readiness questions, not
+# missing-tool questions: the connector is installed and answering, and what
+# is in doubt is whether it keeps whole spoken turns. Each phrase names the
+# voice surface plus what is being judged, so a plain "set up a voice tool"
+# request still reaches toolbelt-readiness.
+REALTIME_VOICE_CONNECTOR_READINESS_PHRASES = (
+    "realtime voice connector",
+    "real-time voice connector",
+    "realtime voice readiness",
+    "real-time voice readiness",
+    "realtime voice trial",
+    "real-time voice trial",
+    "realtime voice stack",
+    "voice connector readiness",
+    "voice connector trial",
+    "voice gateway readiness",
+    "voice gateway trial",
+    "voice agent connector readiness",
+    "voice trial receipt",
+    "voice turn integrity",
+    "voice turn receipt",
+    "barge-in behavior",
+    "barge-in behaviour",
+    "barge-in handling",
+    "voice tool safety",
+    "spoken tool safety",
+    "실시간 음성 커넥터",
+    "실시간 음성 준비",
+    "음성 커넥터 준비",
+    "음성 커넥터 시험",
+    "음성 게이트웨이 준비",
+    "음성 턴 무결성",
+    "음성 시험 영수증",
+)
+PUBLIC_PLUGIN_CONNECTOR_ALIAS_PHRASES = (
+    "home assistant",
+    "홈 어시스턴트",
+    "홈어시스턴트",
+    "hermes-example-plugins",
+    "hermes example plugins",
+    "remnic",
+    "mem9-hermes-plugin",
+    "mem9 hermes plugin",
+    "scope-recall",
+    "scope recall",
+    "scope-recall-hermes",
+    "scope recall hermes",
+    "yantrikdb-hermes-plugin",
+    "yantrikdb hermes plugin",
+    "hermes-brave-search-plugin",
+    "hermes brave search plugin",
+    "hermes-kagi-plugin",
+    "hermes kagi plugin",
+    "tokentelemetry-hermes-plugin",
+    "tokentelemetry hermes plugin",
+    "hermes-curator-evolver",
+    "hermes curator evolver",
+    "hermes-skill-view",
+    "hermes skill view",
+    "42-evey/hermes-plugins",
+    "42 evey hermes plugins",
+    "hermes-plugins",
+    "hermes plugins",
+    "evey hermes plugins",
+    "evey-bridge-plugin",
+    "evey bridge plugin",
+    "evey-council",
+    "evey council",
+    "evey-delegate-model",
+    "evey delegate model",
+    "x-twitter-scraper",
+    "x twitter scraper",
+    "hermes-tweet",
+    "hermes tweet",
+)
+PUBLIC_PLUGIN_CONNECTOR_READINESS_CONTEXT_PHRASES = (
+    "automation",
+    "auth",
+    "authentication",
+    "credential",
+    "connector",
+    "connector readiness",
+    "control",
+    "cost",
+    "device",
+    "integration",
+    "provider",
+    "provider readiness",
+    "price",
+    "pricing",
+    "readiness",
+    "smart home",
+    "trial",
+    "기기",
+    "도입",
+    "스마트홈",
+    "연동",
+    "인증",
+    "리스크",
+    "비용",
+    "준비",
+    "준비도",
+    "제어",
+    "커넥터",
+)
+SKILL_SCOUT_CANDIDATE_ALIAS_PHRASES: tuple[str, ...] = (
+    "obsidian skills",
+    "defuddle",
+    "vault/markdown skill",
+    "humanizer skill",
+    "ai writing tells",
+    "cognify",
+    "agentskills pack",
+    "business operations skills",
+    "skill forge",
+    "agentskills.io skill",
+    "agentskills io skill",
+    "education hermes skills",
+    "k-12 education",
+    "k 12 education",
+    "hermes edu skills",
+    "hermes-example-plugins",
+    "hermes example plugins",
+    "plugin authoring",
+    "remnic",
+    "scope-recall",
+    "scope recall",
+    "scope-recall-hermes",
+    "scope recall hermes",
+    "mem9-hermes-plugin",
+    "mem9 hermes plugin",
+    "yantrikdb-hermes-plugin",
+    "yantrikdb hermes plugin",
+    "hermes-brave-search-plugin",
+    "hermes brave search plugin",
+    "hermes-kagi-plugin",
+    "hermes kagi plugin",
+    "hermes-tweet",
+    "hermes tweet",
+    "tokentelemetry-hermes-plugin",
+    "tokentelemetry hermes plugin",
+    "hermes-curator-evolver",
+    "hermes curator evolver",
+    "hermes-skill-view",
+    "hermes skill view",
+    "42-evey/hermes-plugins",
+    "42 evey hermes plugins",
+    "hermes-plugins",
+    "hermes plugins",
+    "evey hermes plugins",
+    "evey-bridge-plugin",
+    "evey bridge plugin",
+    "evey-council",
+    "evey council",
+    "evey-delegate-model",
+    "evey delegate model",
+    "x-twitter-scraper",
+    "x twitter scraper",
+)
+SKILL_SCOUT_CANDIDATE_INTENT_PHRASES: tuple[str, ...] = (
+    "adopt",
+    "adoption",
+    "compare",
+    "candidate",
+    "candidates",
+    "review and route",
+    "route and review",
+    "before building",
+    "before creating",
+    "before we create",
+    "find existing",
+    "skill candidate",
+    "skill candidates",
+    "skill adoption",
+    "도입",
+    "비교",
+    "후보",
+    "검토",
+    "판단",
+    "라우팅",
+    "찾아보고",
+    "설치할지",
+)
+SKILL_SCOUT_CANDIDATE_BLOCKER_PHRASES: tuple[str, ...] = (
+    "skill list",
+    "list installed",
+    "installed skills",
+    "source-finder",
+    "source finder",
+    "find source",
+    "source candidates",
+    "datasets",
+    "dataset",
+    "latest citations",
+    "citations",
+    "citation",
+    "latest",
+)
+_OPS_OBSERVABILITY_OPERATOR_CONTEXT = (
+    "omh",
+    "oh-my-hermes",
+    "hermes",
+    "agent",
+    "runtime",
+    "executor",
+    "gateway",
+    "loop",
+    "automation",
+    "router",
+    "routing",
+    "latency",
+    "런타임",
+    "실행",
+    "게이트웨이",
+    "루프",
+    "자동화",
+    "라우터",
+    "라우팅",
+    "지연시간",
+    "레이턴시",
+)
+_OPS_OBSERVABILITY_BLOCKER_OVERRIDE_CONTEXT = (
+    "omh",
+    "oh-my-hermes",
+    "hermes",
+    "agent",
+    "runtime",
+    "executor",
+    "gateway",
+    "loop",
+    "automation",
+    "latency",
+    "metric provider",
+    "external metric provider",
+    "metric source",
+    "prometheus",
+    "grafana",
+    "slo",
+    "service quality",
+    "run history",
+    "런타임",
+    "실행",
+    "게이트웨이",
+    "루프",
+    "자동화",
+    "지연시간",
+    "레이턴시",
+)
+_VOICE_OPERATOR_PHRASES = (
+    "voice operator",
+    "voice-first",
+    "voice note",
+    "mobile command",
+    "from mobile",
+    "on mobile",
+    "from phone",
+    "mobile request",
+    "mobile note",
+    "spoken request",
+    "short voice",
+    "hands free",
+    "음성",
+    "음성으로",
+    "음성 명령",
+    "짧은 명령",
+    "짧게 말한 요청",
+    "모바일 요청",
+)
+_VOICE_OPERATOR_TOKENS = _normalized_token_set(
+    {
+        "voice",
+        "mobile",
+        "spoken",
+        "short",
+        "terse",
+        "accessibility",
+        "음성",
+        "모바일",
+        "짧은",
+        "접근성",
+    }
+)
+_BROWSER_OPERATOR_PHRASES = (
+    "browser operator",
+    "browser task",
+    "browser operation",
+    "browser automation",
+    "browser session",
+    "webpage operation",
+    "web page operation",
+    "open url",
+    "open the url",
+    "open page",
+    "open the page",
+    "visit url",
+    "visit page",
+    "navigate url",
+    "navigate page",
+    "click page",
+    "click this page",
+    "click login",
+    "fill form",
+    "fill the form",
+    "submit form",
+    "checkout url",
+    "capture blockers",
+    "page blockers",
+    "브라우저 작업",
+    "브라우저 조작",
+    "웹페이지 열",
+    "웹 페이지 열",
+    "url 열",
+    "링크 열",
+    "로그인 폼",
+    "폼 작성",
+    "폼 입력",
+    "막히는 부분 캡처",
+)
+_BROWSER_OPERATOR_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "browser",
+        "page",
+        "webpage",
+        "website",
+        "url",
+        "link",
+        "login",
+        "form",
+        "checkout",
+        "staging",
+        "브라우저",
+        "페이지",
+        "웹페이지",
+        "웹",
+        "url",
+        "링크",
+        "로그인",
+        "폼",
+    }
+)
+_BROWSER_OPERATOR_ACTION_TOKENS = _normalized_token_set(
+    {
+        "open",
+        "visit",
+        "navigate",
+        "click",
+        "fill",
+        "submit",
+        "capture",
+        "inspect",
+        "check",
+        "login",
+        "열",
+        "열고",
+        "클릭",
+        "입력",
+        "작성",
+        "제출",
+        "캡처",
+        "확인",
+        "로그인",
+    }
+)
+# "로그인/login" is a browser action token, but a login mentioned next to a
+# model PROVIDER (quota exhausted, switch account) is Hermes auth work, not
+# web automation — that request belongs to model-setup.
+_BROWSER_OPERATOR_PROVIDER_AUTH_BLOCKERS = (
+    "프로바이더",
+    "provider",
+    "한도 초과",
+    "한도초과",
+    "quota",
+    "rate limit",
+)
+# A live incident is not a browser errand. `browser-operator` fires on a
+# context token plus an action token, and both sets are ordinary English:
+# `checkout` names a page and also the service that takes payments, `open`
+# opens a tab and also describes an incident that has not been closed. So
+# "we have an incident open right now, the checkout API is down" crossed the
+# guard at 42 and dispatched a page-operation lane to an outage, with
+# `live-incident-response` third at 7 (#1689).
+#
+# A blocker rather than a score contest: a guard boost of 42 cannot be
+# outscored by trigger evidence, so the ordering is the only place this can
+# be decided. Every phrase here declares an incident that is running; none
+# of them has a browsing sense.
+_BROWSER_OPERATOR_LIVE_INCIDENT_BLOCKERS = (
+    "incident open",
+    "open incident",
+    "active incident",
+    "ongoing incident",
+    "incident response",
+    "incident commander",
+    "production outage",
+    "production is down",
+    "we have an outage",
+    "war room",
+    "sev1",
+    "sev2",
+    "sev3",
+)
+_BROWSER_OPERATOR_VISUAL_QA_BLOCKERS = (
+    "visual qa",
+    "browser qa",
+    "browser interaction qa",
+    "click path audit",
+    "click-path audit",
+    "screenshot qa",
+    "dead link check",
+    "console error check",
+    "network failure check",
+    "keyboard navigation check",
+)
+_WORKSPACE_FILE_OPERATOR_PHRASES = (
+    "workspace-file-operator",
+    "workspace file operator",
+    "file operator",
+    "file operation",
+    "file operations",
+    "filesystem task",
+    "filesystem operation",
+    "file system task",
+    "file system operation",
+    "list files",
+    "list folder",
+    "list directory",
+    "find local files",
+    "search local files",
+    "search files in folder",
+    "organize files",
+    "organize folder",
+    "move file",
+    "move files",
+    "copy file",
+    "copy files",
+    "rename file",
+    "rename files",
+    "delete file",
+    "delete files",
+    "remove file",
+    "remove files",
+    "archive files",
+    "downloads folder",
+    "reports folder",
+    "folder cleanup",
+    "file cleanup",
+    "파일 작업",
+    "파일 조작",
+    "파일 정리",
+    "파일 검색",
+    "파일 찾아",
+    "파일 이동",
+    "파일 복사",
+    "파일 이름 변경",
+    "파일 삭제",
+    "폴더 정리",
+    "다운로드 폴더",
+    "디렉터리 목록",
+)
+_WORKSPACE_FILE_OPERATOR_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "file",
+        "files",
+        "folder",
+        "folders",
+        "directory",
+        "directories",
+        "filesystem",
+        "path",
+        "paths",
+        "downloads",
+        "reports",
+        "archive",
+        "local",
+        "workspace",
+        "파일",
+        "폴더",
+        "디렉터리",
+        "경로",
+        "다운로드",
+        "아카이브",
+        "작업공간",
+        "워크스페이스",
+    }
+)
+_WORKSPACE_FILE_OPERATOR_ACTION_TOKENS = _normalized_token_set(
+    {
+        "list",
+        "find",
+        "search",
+        "organize",
+        "cleanup",
+        "clean",
+        "move",
+        "copy",
+        "rename",
+        "delete",
+        "remove",
+        "archive",
+        "sort",
+        "group",
+        "confirm",
+        "목록",
+        "찾아",
+        "검색",
+        "정리",
+        "이동",
+        "복사",
+        "변경",
+        "삭제",
+        "제거",
+        "아카이브",
+        "확인",
+    }
+)
+_WORKSPACE_FILE_OPERATOR_BLOCKERS = (
+    "pdf to ppt",
+    "pdf into ppt",
+    "make a ppt",
+    "make a deck",
+    "export pdf",
+    "export a pdf",
+    "attach file",
+    "file attachment",
+    "generated file",
+    "file upload bug",
+    "파일 업로드 버그",
+    "pdf를 ppt",
+    "ppt 만들어",
+    "발표자료",
+    "첨부할 수 있게",
+)
+_WORKSPACE_FILE_OPERATOR_MATERIALS_BLOCKERS = OFFICE_FILE_MATERIAL_PHRASES
+_COMMAND_OPERATOR_PHRASES = (
+    "command operator",
+    "terminal command",
+    "terminal task",
+    "shell command",
+    "shell task",
+    "cli command",
+    "command execution",
+    "run command",
+    "run this command",
+    "execute command",
+    "execute this command",
+    "run npm test",
+    "run tests",
+    "npm test",
+    "pnpm test",
+    "bun test",
+    "uv run",
+    "python -m unittest",
+    "pytest",
+    "make test",
+    "cargo test",
+    "go test",
+    "summarize command output",
+    "터미널 명령",
+    "터미널에서",
+    "셸 명령",
+    "쉘 명령",
+    "명령 실행",
+    "명령어 실행",
+    "실행 준비",
+    "npm test 실행",
+    "테스트 실행",
+    "결과 요약",
+)
+_COMMAND_OPERATOR_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "terminal",
+        "shell",
+        "cli",
+        "command",
+        "commands",
+        "npm",
+        "pnpm",
+        "bun",
+        "uv",
+        "python",
+        "pytest",
+        "unittest",
+        "cargo",
+        "go",
+        "test",
+        "tests",
+        "터미널",
+        "셸",
+        "쉘",
+        "명령",
+        "명령어",
+        "테스트",
+    }
+)
+_COMMAND_OPERATOR_ACTION_TOKENS = _normalized_token_set(
+    {
+        "run",
+        "execute",
+        "start",
+        "launch",
+        "prepare",
+        "summarize",
+        "capture",
+        "실행",
+        "돌려",
+        "돌리고",
+        "준비",
+        "요약",
+        "캡처",
+    }
+)
+_COMMAND_OPERATOR_BLOCKERS = (
+    "failed with",
+    "failure log",
+    "stack trace",
+    "root cause",
+    "find root cause",
+    "fix the failing",
+    "fix failing",
+    "fix test",
+    "fix tests",
+    "test failed",
+    "tests failed",
+    "build failed",
+    "ci failed",
+    "lint failed",
+    "typecheck failed",
+    "실패 원인",
+    "실패 로그",
+    "스택 트레이스",
+    "고쳐",
+    "수정",
+    "원인 찾아",
+)
+_CONNECTOR_OPERATOR_PHRASES = (
+    "connector operator",
+    "external app action",
+    "external connector action",
+    "saas action",
+    "api action",
+    "send email",
+    "email customer",
+    "gmail draft",
+    "gmail send",
+    "create linear ticket",
+    "create linear issue",
+    "linear ticket",
+    "linear issue",
+    "update linear",
+    "jira ticket",
+    "jira issue",
+    "create jira issue",
+    "open jira ticket",
+    "create jira",
+    "notion page",
+    "update notion",
+    "crm update",
+    "salesforce update",
+    "hubspot update",
+    "create calendar event",
+    "calendar invite",
+    "google calendar",
+    "send slack dm",
+    "slack dm",
+    "discord dm",
+    "post to discord",
+    "post to slack",
+    "discord post",
+    "slack post",
+    "connector action",
+    "이메일 보내",
+    "이메일 발송",
+    "메일 보내",
+    "gmail 초안",
+    "linear ticket",
+    "linear 티켓",
+    "linear 이슈",
+    "jira 티켓",
+    "jira 이슈",
+    "notion 페이지",
+    "노션 페이지",
+    "캘린더 초대",
+    "외부 앱",
+    "외부 커넥터",
+    "커넥터 액션",
+)
+_CONNECTOR_OPERATOR_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "connector",
+        "connectors",
+        "external",
+        "saas",
+        "api",
+        "email",
+        "gmail",
+        "linear",
+        "jira",
+        "notion",
+        "calendar",
+        "salesforce",
+        "hubspot",
+        "crm",
+        "ticket",
+        "tickets",
+        "issue",
+        "issues",
+        "invite",
+        "recipient",
+        "assignee",
+        "provider",
+        "이메일",
+        "메일",
+        "외부",
+        "커넥터",
+        "티켓",
+        "노션",
+        "캘린더",
+        "초대",
+        "수신자",
+        "담당자",
+    }
+)
+_CONNECTOR_OPERATOR_ACTION_TOKENS = _normalized_token_set(
+    {
+        "send",
+        "draft",
+        "create",
+        "update",
+        "assign",
+        "invite",
+        "prepare",
+        "confirm",
+        "confirmation",
+        "approve",
+        "approval",
+        "notify",
+        "post",
+        "schedule",
+        "보내",
+        "발송",
+        "초안",
+        "생성",
+        "만들",
+        "업데이트",
+        "배정",
+        "초대",
+        "준비",
+        "승인",
+        "확인",
+    }
+)
+_CONNECTOR_OPERATOR_BLOCKERS = (
+    "connector is missing",
+    "connector missing",
+    "missing connector",
+    "credential missing",
+    "credentials missing",
+    "api key missing",
+    "api key is missing",
+    "not connected",
+    "not configured",
+    "setup needed",
+    "what setup",
+    "커넥터가 없어",
+    "커넥터 없음",
+    "연결 안",
+    "설정 필요",
+    "셋업 필요",
+)
+_LIVE_INFO_OPERATOR_PHRASES = (
+    "live info operator",
+    "live information",
+    "real time information",
+    "real-time information",
+    "weather today",
+    "current weather",
+    "weather forecast",
+    "stock price",
+    "crypto price",
+    "btc price",
+    "exchange rate",
+    "sports score",
+    "game score",
+    "time zone",
+    "timezone",
+    "time in",
+    "map directions",
+    "directions to",
+    "near me",
+    "nearby restaurants",
+    "traffic now",
+    "오늘 날씨",
+    "현재 날씨",
+    "날씨 예보",
+    "주가",
+    "코인 가격",
+    "환율",
+    "스포츠 점수",
+    "경기 결과",
+    "시간대",
+    "현재 시간",
+    "지도",
+    "길찾기",
+    "주변 식당",
+)
+_LIVE_INFO_OPERATOR_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "weather",
+        "forecast",
+        "temperature",
+        "stock",
+        "stocks",
+        "price",
+        "crypto",
+        "btc",
+        "bitcoin",
+        "eth",
+        "sports",
+        "score",
+        "scores",
+        "game",
+        "exchange",
+        "rate",
+        "currency",
+        "timezone",
+        "time",
+        "map",
+        "directions",
+        "traffic",
+        "nearby",
+        "restaurant",
+        "location",
+        "날씨",
+        "예보",
+        "기온",
+        "주가",
+        "가격",
+        "코인",
+        "환율",
+        "스포츠",
+        "점수",
+        "경기",
+        "시간",
+        "시간대",
+        "지도",
+        "길찾기",
+        "주변",
+        "식당",
+        "위치",
+    }
+)
+_LIVE_INFO_OPERATOR_LOOKUP_TOKENS = _normalized_token_set(
+    {
+        "what",
+        "current",
+        "today",
+        "now",
+        "latest",
+        "lookup",
+        "look",
+        "check",
+        "get",
+        "find",
+        "tell",
+        "freshness",
+        "현재",
+        "오늘",
+        "지금",
+        "최신",
+        "확인",
+        "조회",
+        "알려",
+        "찾아",
+        "경계",
+    }
+)
+_LIVE_INFO_OPERATOR_EVERYDAY_CONTEXT_TOKENS = _normalized_token_set(
+    {"time", "map", "rate", "score", "scores", "game", "price", "stock", "exchange", "location", "nearby", "sports"}
+)
+_LIVE_INFO_OPERATOR_LIVE_CUE_TOKENS = _normalized_token_set(
+    {"now", "today", "current", "latest", "tonight", "yesterday", "live", "nearby"}
+)
+_LIVE_INFO_OPERATOR_BLOCKERS = (
+    "web search",
+    "web research",
+    "source backed",
+    "with citations",
+    "citations",
+    "sources",
+    "best practices",
+    "api best practices",
+    "plugin is missing",
+    "plugin missing",
+    "provider setup",
+    "setup needed",
+    "what setup",
+    "connector is missing",
+    "connector missing",
+    "create calendar event",
+    "calendar event",
+    "calendar invite",
+    "웹서치",
+    "웹 리서치",
+    "출처",
+    "근거",
+    "셋업",
+    "설정 필요",
+    "캘린더 초대",
+)
+_MEDIA_INPUT_OPERATOR_PHRASES = (
+    "media-input-operator",
+    "media input operator",
+    "media input",
+    "audio transcription",
+    "audio transcript",
+    "transcribe audio",
+    "transcribe this audio",
+    "transcribe this recording",
+    "meeting recording",
+    "recording transcript",
+    "video transcript",
+    "youtube summary",
+    "youtube video",
+    "summarize youtube",
+    "summarize this youtube",
+    "video summary",
+    "summarize this video",
+    "ocr image",
+    "image ocr",
+    "photo ocr",
+    "picture ocr",
+    "graphic ocr",
+    "screenshot ocr",
+    "ocr this image",
+    "ocr receipt image",
+    "ocr this receipt image",
+    "receipt ocr",
+    "receipt image ocr",
+    "receipt text",
+    "receipt text from image",
+    "receipt fields",
+    "receipt fields from image",
+    "receipt image extraction",
+    "receipt image text",
+    "receipt image fields",
+    "parse receipt image",
+    "receipt image parse",
+    "receipt image into fields",
+    "image text extraction",
+    "extract text from image",
+    "extract text from this image",
+    "screenshot text extraction",
+    "extract text from screenshot",
+    "extract text from this screenshot",
+    "screenshot to text",
+    "with timestamps",
+    "clip summary",
+    "podcast summary",
+    "webinar summary",
+    "오디오 전사",
+    "음성 전사",
+    "회의 녹음",
+    "녹음 요약",
+    "영상 요약",
+    "유튜브 요약",
+    "youtube 요약",
+    "이미지 ocr",
+    "이미지 OCR",
+    "이미지 텍스트 추출",
+    "이미지에서 텍스트 추출",
+    "영수증 ocr",
+    "영수증 OCR",
+    "영수증 이미지 ocr",
+    "영수증 이미지 OCR",
+    "스크린샷 텍스트 추출",
+    "스크린샷에서 텍스트 추출",
+    "타임스탬프",
+    "타임라인 요약",
+)
+_MEDIA_INPUT_RECEIPT_EXTRACTION_PHRASES = (
+    "receipt text",
+    "receipt text from image",
+    "receipt fields",
+    "receipt fields from image",
+    "receipt image extraction",
+    "receipt image text",
+    "receipt image fields",
+    "parse receipt image",
+    "receipt image parse",
+    "receipt image into fields",
+    "extract receipt text",
+    "extract receipt fields",
+    "영수증 텍스트",
+    "영수증 필드",
+    "영수증 이미지 텍스트",
+    "영수증 이미지 필드",
+)
+_MEDIA_INPUT_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "audio",
+        "voice",
+        "recording",
+        "video",
+        "youtube",
+        "transcript",
+        "timestamps",
+        "timestamp",
+        "clip",
+        "podcast",
+        "webinar",
+        "media",
+        "ocr",
+        "image",
+        "screenshot",
+        "receipt",
+        "photo",
+        "text",
+        "오디오",
+        "음성",
+        "녹음",
+        "영상",
+        "동영상",
+        "유튜브",
+        "youtube",
+        "전사",
+        "자막",
+        "이미지",
+        "사진",
+        "스크린샷",
+        "영수증",
+        "텍스트",
+        "타임스탬프",
+        "타임라인",
+        "클립",
+        "팟캐스트",
+        "웨비나",
+    }
+)
+_MEDIA_INPUT_VISUAL_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "ocr",
+        "image",
+        "screenshot",
+        "receipt",
+        "photo",
+        "text",
+        "이미지",
+        "사진",
+        "스크린샷",
+        "영수증",
+        "텍스트",
+    }
+)
+_MEDIA_INPUT_ACTION_TOKENS = _normalized_token_set(
+    {
+        "transcribe",
+        "transcription",
+        "transcript",
+        "summarize",
+        "summarise",
+        "summary",
+        "extract",
+        "ocr",
+        "table",
+        "fields",
+        "totals",
+        "parse",
+        "timestamp",
+        "timestamps",
+        "action",
+        "items",
+        "notes",
+        "chapters",
+        "전사",
+        "요약",
+        "추출",
+        "정리해줘",
+        "표",
+        "필드",
+        "금액",
+        "정리",
+        "타임스탬프",
+        "타임라인",
+        "액션아이템",
+        "액션",
+        "자막",
+        "챕터",
+    }
+)
+_MEDIA_INPUT_EXTRACTIVE_ACTION_TOKENS = _normalized_token_set(
+    {
+        "ocr",
+        "extract",
+        "extraction",
+        "parse",
+        "추출",
+    }
+)
+_MEDIA_INPUT_OPERATOR_BLOCKERS = (
+    "web search",
+    "web research",
+    "with citations",
+    "citations",
+    "source finder",
+    "find sources",
+    "find papers",
+    "best practices",
+    "market trends",
+    "make a ppt",
+    "make slides",
+    "export pdf",
+    "export to pdf",
+    "export to ppt",
+    "send email",
+    "send an email",
+    "post to slack",
+    "post to discord",
+    "create calendar event",
+    "create linear ticket",
+    "웹서치",
+    "웹 리서치",
+    "출처",
+    "근거",
+    "논문",
+    "시장 조사",
+    "시장조사",
+    "피피티",
+    "슬라이드",
+    "pdf로",
+    "메일 보내",
+    "이메일 보내",
+    "슬랙에 보내",
+)
+_CONTENT_OPERATOR_PHRASES = (
+    "content-operator",
+    "content operator",
+    "content workflow",
+    "writing workflow",
+    "publish-ready writing",
+    "publish ready writing",
+    "release notes",
+    "release note draft",
+    "newsletter draft",
+    "customer announcement",
+    "customer copy",
+    "product copy",
+    "landing page copy",
+    "social post draft",
+    "email draft",
+    "draft an email",
+    "rewrite for executives",
+    "summarize for customers",
+    "style guide rewrite",
+    "audience and tone",
+    "tone of voice",
+    "콘텐츠 오퍼레이터",
+    "글쓰기 워크플로",
+    "릴리즈 노트",
+    "릴리즈노트",
+    "뉴스레터 초안",
+    "고객 공지문",
+    "고객 공지",
+    "고객용 요약",
+    "메일 초안",
+    "이메일 초안",
+    "채널별 톤",
+    "문체 가이드",
+)
+_CONTENT_OPERATOR_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "content",
+        "copy",
+        "writing",
+        "draft",
+        "newsletter",
+        "announcement",
+        "release",
+        "notes",
+        "email",
+        "mail",
+        "blog",
+        "readme",
+        "landing",
+        "post",
+        "summary",
+        "translation",
+        "rewrite",
+        "콘텐츠",
+        "글쓰기",
+        "초안",
+        "뉴스레터",
+        "공지",
+        "공지문",
+        "릴리즈",
+        "노트",
+        "메일",
+        "이메일",
+        "요약",
+        "번역",
+        "카피",
+    }
+)
+_CONTENT_OPERATOR_ACTION_TOKENS = _normalized_token_set(
+    {
+        "write",
+        "draft",
+        "create",
+        "prepare",
+        "rewrite",
+        "summarize",
+        "summarise",
+        "translate",
+        "proofread",
+        "edit",
+        "polish",
+        "작성",
+        "써",
+        "초안",
+        "만들",
+        "준비",
+        "고쳐",
+        "다듬",
+        "요약",
+        "번역",
+        "교정",
+        "정리",
+    }
+)
+_CONTENT_OPERATOR_QUALITY_TOKENS = _normalized_token_set(
+    {
+        "publish-ready",
+        "publish",
+        "audience",
+        "channel",
+        "tone",
+        "style",
+        "brand",
+        "executive",
+        "executives",
+        "customer",
+        "customers",
+        "review",
+        "approval",
+        "legal",
+        "compliance",
+        "hallucination",
+        "fact",
+        "facts",
+        "source",
+        "sources",
+        "공개",
+        "게시",
+        "고객",
+        "채널",
+        "톤",
+        "문체",
+        "브랜드",
+        "검토",
+        "승인",
+        "팩트",
+        "출처",
+        "근거",
+    }
+)
+_CONTENT_OPERATOR_BLOCKERS = (
+    "web search",
+    "web research",
+    "with citations",
+    "citations",
+    "source finder",
+    "find sources",
+    "find a skill",
+    "find skills",
+    "is there a skill",
+    "skill for",
+    "skill candidate",
+    "skill discovery",
+    "existing skill",
+    "before building one",
+    "before creating one",
+    "ops review",
+    "weekly ops review",
+    "operating review",
+    "customer feedback",
+    "release risks",
+    "image card",
+    "summary card",
+    "announcement card",
+    "release notes image",
+    "release notes card",
+    "release notes thumbnail",
+    "thumbnail",
+    "poster",
+    "visual",
+    "image",
+    "send email",
+    "send an email",
+    "send the email",
+    "send slack",
+    "post to slack",
+    "post to discord",
+    "create calendar event",
+    "create linear ticket",
+    "export pdf",
+    "export to pdf",
+    "export to ppt",
+    "make a ppt",
+    "make slides",
+    "turn into slides",
+    "media input",
+    "audio transcription",
+    "audio transcript",
+    "transcribe audio",
+    "meeting recording",
+    "recording transcript",
+    "video transcript",
+    "youtube summary",
+    "youtube video",
+    "summarize youtube",
+    "video summary",
+    "summarize this video",
+    "with timestamps",
+    "podcast summary",
+    "webinar summary",
+    "웹서치",
+    "웹 리서치",
+    "출처 찾아",
+    "스킬 찾아",
+    "스킬 있어",
+    "스킬이 있어",
+    "스킬 후보",
+    "기존 스킬",
+    "ops 리뷰",
+    "운영 리뷰",
+    "고객 피드백",
+    "릴리즈 리스크",
+    "이미지",
+    "사진",
+    "카드",
+    "썸네일",
+    "포스터",
+    "메일 보내",
+    "이메일 보내",
+    "이메일 발송",
+    "슬랙에 보내",
+    "디스코드에 보내",
+    "pdf로",
+    "ppt로",
+    "피피티",
+    "슬라이드",
+    "오디오 전사",
+    "음성 전사",
+    "회의 녹음",
+    "녹음 요약",
+    "영상 요약",
+    "유튜브 요약",
+    "타임스탬프",
+)
+_CAPABILITY_INTENT_TOKENS = _normalized_token_set(
+    {
+        "support",
+        "supports",
+        "feature",
+        "features",
+        "capability",
+        "capabilities",
+        "available",
+        "help",
+        "helps",
+        "can",
+        "기능",
+        "지원",
+        "가능",
+        "있어",
+        "있나요",
+    }
+)
+_DELIVERABLE_STRONG_TOKENS = _normalized_token_set(
+    {
+        "attachment",
+        "attachments",
+        "attach",
+        "attached",
+        "deliverable",
+        "deliverables",
+        "첨부",
+        "전달",
+    }
+)
+_DELIVERABLE_FILE_TOKENS = _normalized_token_set(
+    {
+        "file",
+        "files",
+        "pdf",
+        "ppt",
+        "pptx",
+        "xlsx",
+        "docx",
+        "hwp",
+        "markdown",
+        "report",
+        "deck",
+        "document",
+        "파일",
+        "보고서",
+        "자료",
+        "문서",
+        "피디에프",
+        "엑셀",
+    }
+)
+_DELIVERABLE_PHRASES = (
+    "attach file",
+    "file attachment",
+    "attachment status",
+    "file delivery",
+    "deliverable package",
+    "generated file",
+    "make it attachable",
+    "ready to attach",
+    "파일로 만들어",
+    "파일로 만들어서 첨부",
+    "첨부할 수 있게",
+    "첨부 가능",
+    "첨부 상태",
+    "전달 상태",
+)
+# "generated file" is two different things. To `deliverable-package` it is the
+# PDF somebody produced and wants attached; in a repository it is a checked-in
+# artifact whose source of truth is a generator. The words are identical, so
+# the sense is decided by whether the sentence also asks where the file came
+# from. Both halves are required: a provenance cue alone is an ordinary code
+# question, and the noun alone is the delivery sense the existing guard owns.
+# A dependency upgrade is a boundary-changing refactor with an upstream author,
+# but the sentence that asks for one says "upgrade", not "refactor", so
+# `refactor-plan` never offered itself. Complete phrases only: a bare `upgrade`
+# is a laptop, a plan, a seat, and a subscription tier, and `version` and
+# `major` are ordinary words everywhere else in this catalog.
+# Rotating a credential is a sequencing problem with a proof step, not a missing
+# tool. `toolbelt-readiness` owns "I do not have an API key"; this owns "I have
+# one and it has to be replaced while the service stays up". Both halves are
+# required: `rotate` alone turns an image, and `key` alone is a map legend.
+# A redline is always a redline OF something. `redline` is unambiguous inside a
+# work catalog and not in English -- crediting it alone sent "the engine is
+# running at the redline" to the legal lane -- so the markup word and the
+# document it marks up are both required.
+_CONTRACT_MARKUP_CUES = (
+    "redline",
+    "redlines",
+    "redlining",
+    "negotiat",
+    "concession",
+    "counterproposal",
+    "counter-proposal",
+    "fallback position",
+    "walk-away",
+    "walk away",
+    "레드라인",
+    "협상",
+)
+_CONTRACT_DOCUMENT_NOUNS = (
+    "contract",
+    "agreement",
+    "clause",
+    "clauses",
+    "terms",
+    "msa",
+    "nda",
+    "sow",
+    "dpa",
+    "playbook",
+    "amendment",
+    "addendum",
+    "계약",
+    "조항",
+    "약관",
+)
+_CREDENTIAL_ROTATION_VERBS = (
+    "rotate",
+    "rotating",
+    "rotation",
+    "revoke",
+    "revoking",
+    "revocation",
+    "교체",
+    "폐기",
+)
+_CREDENTIAL_ROTATION_SUBJECTS = (
+    "api key",
+    "api keys",
+    "access key",
+    "secret",
+    "secrets",
+    "credential",
+    "credentials",
+    "certificate",
+    "certificates",
+    "private key",
+    "signing key",
+    "token",
+    "tokens",
+    "password",
+    "passwords",
+    "api 키",
+    "인증서",
+    "자격 증명",
+)
+_DEPENDENCY_UPGRADE_PHRASES = (
+    "dependency upgrade",
+    "dependency upgrades",
+    "upgrade the dependency",
+    "upgrade this dependency",
+    "upgrade our dependencies",
+    "major version upgrade",
+    "major version bump",
+    "framework upgrade",
+    "upgrade the framework",
+    "upgrade to the next major",
+    "breaking change upgrade",
+    "의존성 업그레이드",
+    "메이저 버전 업그레이드",
+)
+# A bot-opened version bump is the routine or major upgrade half of the
+# dependabot split (#1694, #1712): an advisory or a leaked secret is an event
+# for `security-event-response`; a bump with no advisory is an upgrade.
+_DEPENDENCY_BUMP_PHRASES = (
+    "dependabot bumped",
+    "dependabot bumps",
+    "dependabot bump",
+    "dependabot bumping",
+    "renovate bumped",
+    "renovate bumps",
+    "renovate bump",
+)
+# A spoken version jump -- "upgrade react from 18 to 19" -- names no upgrade
+# phrase at all: an upgrade verb, two version numbers, and the thing being
+# upgraded. The software word is what separates it from "upgrade my iphone
+# from 14 to 16" and "the price bumped from 10 to 12". Names that are also
+# ordinary words are left out -- express shipping, a mattress spring, the next
+# tier, a vacation package, a battery's runtime -- so "upgrade express from 4
+# to 5" is carried only by a word beside it, such as "dependabot".
+_VERSION_JUMP_VERBS = frozenset(
+    {"upgrade", "upgrading", "upgraded", "bump", "bumped", "bumping", "bumps", "migrate", "migrating"}
+)
+_VERSION_JUMP_SOFTWARE_ANCHORS = frozenset(
+    {
+        "angular", "dependabot", "dependencies", "dependency", "django", "dotnet", "electron", "eslint",
+        "fastapi", "flask", "framework", "golang", "gradle", "java", "jdk", "jest", "js", "kotlin", "laravel",
+        "lodash", "node", "nodejs", "npm", "numpy", "pandas", "php", "pip", "pydantic", "python", "pytorch",
+        "rails", "react", "renovate", "sdk", "svelte", "tailwind", "tensorflow", "typescript", "vite", "vue",
+        "webpack",
+    }
+)
+_GENERATED_ARTIFACT_NOUNS = (
+    "generated file",
+    "generated files",
+    "generated artifact",
+    "generated artifacts",
+    "generated output",
+    "generated code",
+    "generated doc",
+    "generated docs",
+    "생성된 파일",
+    "생성 파일",
+)
+_GENERATED_PROVENANCE_CUES = (
+    "source of truth",
+    "generator",
+    "regenerate",
+    "regenerated",
+    "regeneration",
+    "hand-edit",
+    "hand edit",
+    "hand-edited",
+    "hand edited",
+    "by hand",
+    "edit",
+    "edited",
+    "editing",
+    "diff",
+    "checked in",
+    "손으로 고치",
+    "직접 수정",
+)
+_DELIVERABLE_GATEWAY_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "gateway",
+        "platform",
+        "thread",
+        "silent",
+        "silently",
+        "discord",
+        "slack",
+        "telegram",
+        "message",
+        "messages",
+        "status",
+        "updates",
+        "게이트웨이",
+        "플랫폼",
+        "스레드",
+        "조용히",
+        "디스코드",
+        "슬랙",
+        "텔레그램",
+        "메시지",
+        "상태",
+        "업데이트",
+    }
+)
+_DELIVERABLE_GATEWAY_CONTEXT_PHRASES = (
+    "gateway thread",
+    "discord gateway",
+    "slack gateway",
+    "telegram gateway",
+    "silent attachment status",
+    "silent status update",
+    "status updates",
+    "gateway status",
+    "platform delivery",
+)
+_RISKY_REFACTOR_TOKENS = _normalized_token_set(
+    {
+        "risky",
+        "risk",
+        "dangerous",
+        "unsafe",
+        "risque",
+        "risquee",
+        "dangereux",
+        "dangereuse",
+        "peligroso",
+        "peligrosa",
+        "riesgoso",
+        "riesgosa",
+        "inseguro",
+        "insegura",
+        "gefahrlich",
+        "gefaehrlich",
+        "riskant",
+        "riskante",
+        "riskantes",
+    }
+)
+_RISKY_REFACTOR_EXPLICIT_PHRASES = (
+    "위험한 리팩터링",
+    "위험한 리팩토링",
+    "위험한 refactor",
+    "위험한 refactoring",
+    "리팩터링 위험",
+    "리팩토링 위험",
+    "refactor 위험",
+    "refactoring 위험",
+)
+_RISKY_REFACTOR_RISK_PHRASES = (
+    "feels risky",
+    "seems risky",
+)
+_CODING_HANDOFF_EXECUTOR_TOKENS = _normalized_token_set(
+    {
+        "codex",
+        "claude",
+        "claude-code",
+        "claudecode",
+        "omx",
+        RUNTIME_SHORT_NAME,
+        "omc",
+        "executor",
+        "codex로",
+        "codex에게",
+        "claude로",
+        "claude에게",
+        "코덱스",
+        "코덱스로",
+        "코덱스에게",
+        "클로드",
+        "클로드로",
+        "클로드에게",
+    }
+)
+_CODING_HANDOFF_WORK_TOKENS = _normalized_token_set(
+    {
+        "implement",
+        "implementation",
+        "code",
+        "coding",
+        "fix",
+        "issue",
+        "pr",
+        "feature",
+        "구현",
+        "코딩",
+        "기능",
+        "수정",
+        "고쳐",
+        "이슈",
+    }
+)
+_CODING_HANDOFF_CONTROL_TOKENS = _normalized_token_set(
+    {
+        "delegate",
+        "handoff",
+        "dispatch",
+        "assign",
+        "track",
+        "tracking",
+        "posted",
+        "status",
+        "progress",
+        "session",
+        "attach",
+        "맡기고",
+        "맡기",
+        "맡겨",
+        "맡겨줘",
+        "맡겨주세요",
+        "넘기",
+        "넘겨",
+        "넘겨줘",
+        "위임",
+        "추적",
+        "진행상태",
+        "진행",
+        "상태",
+        "세션",
+    }
+)
+_CODING_HANDOFF_PHRASES = (
+    "delegate to codex",
+    "send to codex",
+    "use codex to implement",
+    "use claude code to implement",
+    "codex implement",
+    "codex implementation",
+    "codex handoff",
+    "codex progress tracking",
+    "codex session tracking",
+    "codex로 이 기능 구현",
+    "codex로 구현 맡겨",
+    "codex로 맡겨",
+    "track coding progress",
+    "keep me posted",
+    "coding agent progress",
+    "open in codex",
+    "attach codex session",
+    "claude code handoff",
+    "codex로 구현",
+    "코덱스로 구현",
+    "codex에게 맡기",
+    "codex로 맡기",
+    "코덱스에게 맡기",
+    "코딩 에이전트에게 맡기",
+    "구현하게 맡기고 진행상태 추적",
+    "진행상태 추적",
+    "진행 상태 추적",
+)
+_CODING_HANDOFF_CONTROL_PHRASES = (
+    "start the work",
+    "start work",
+    "start the task",
+    "start task",
+    "작업 시작",
+    "작업 시작해",
+    "작업 시작해줘",
+    "작업 시작하게",
+)
+_SCHEDULED_OPS_PHRASES = (
+    "automation blueprint",
+    "scheduled ops blueprint",
+    "ops blueprint",
+    "cron blueprint",
+    "schedule blueprint",
+    "hermes cron spec",
+    "cron spec",
+    "automate this",
+    "automate workflow",
+    "every morning",
+    "every day",
+    "every monday",
+    "every week",
+    "every month",
+    "notify if",
+    "only if changed",
+    "only if something changed",
+    "silent if nothing changed",
+    "if nothing changed",
+    "매일 아침",
+    "아침마다",
+    "매주",
+    "매월",
+    "자동화해줘",
+    "자동화 해줘",
+    "자동화하는 흐름",
+    "변화 있으면",
+    "변화 없으면",
+    "바뀐 게 없으면",
+    "조용히",
+)
+_EXPLICIT_SCHEDULED_OPS_BLUEPRINT_PHRASES = (
+    "automation blueprint",
+    "scheduled ops blueprint",
+    "ops blueprint",
+    "cron blueprint",
+    "schedule blueprint",
+    "hermes cron spec",
+    "cron spec",
+)
+_ONE_OFF_TOKENS = _normalized_token_set(
+    {
+        "once",
+        "일회성",
+        "한번만",
+    }
+)
+_ONE_OFF_PHRASES = (
+    "one-off",
+    "one off",
+    "one-time",
+    "one time",
+    "single run",
+    "single-use",
+    "non-recurring",
+    "non recurring",
+    "do not repeat",
+    "dont repeat",
+    "no recurrence",
+    "just once",
+    "only once",
+    "이번만",
+    "한 번만",
+    "한번만",
+    "일회성",
+)
+
+
+@dataclass(frozen=True)
+class RoutingGuardRule:
+    id: str
+    rule: str
+    matched_label: str
+    preferred_skills: tuple[str, ...]
+    score_boost: int
+    why: str
+    activation_status: str
+
+
+RISKY_REFACTOR_GUARD = RoutingGuardRule(
+    id="risky_refactor_before_cleanup",
+    rule="Risky refactor language should route to planning/review before cleanup unless explicit invocation overrides.",
+    matched_label="guard:risky_refactor_before_cleanup",
+    preferred_skills=("plan", "ralplan"),
+    score_boost=20,
+    why="Matched guard/trigger metadata; risky code-change requests should get a reviewed plan before cleanup.",
+    activation_status="active",
+)
+SAFE_FEATURE_PLAN_GUARD = RoutingGuardRule(
+    id="safe_feature_change_before_generic_plan",
+    rule="Safe feature-change requests should route to ralplan before generic planning.",
+    matched_label="guard:safe_feature_change",
+    preferred_skills=("ralplan",),
+    score_boost=32,
+    why="Matched safe feature-change language; prepare a reviewed plan before executor handoff.",
+    activation_status="active",
+)
+FEEDBACK_BEFORE_CODING_GUARD = RoutingGuardRule(
+    id="feedback_before_coding",
+    rule="Product feedback and bug reports should route through triage/investigation before coding handoff unless code work is explicit.",
+    matched_label="guard:feedback_before_coding",
+    preferred_skills=("feedback-triage",),
+    score_boost=34,
+    why="Matched customer or product signal language; triage the signal and investigation path before planning fixes.",
+    activation_status="active",
+)
+PRODUCT_SHAPING_GUARD = RoutingGuardRule(
+    id="product_shaping_before_ops_review",
+    rule="Fuzzy product, onboarding, UX, or growth-shaping requests should start with deep interview before ops/status review.",
+    matched_label="guard:product_shaping",
+    preferred_skills=("deep-interview",),
+    score_boost=30,
+    why="Matched guard/trigger metadata; fuzzy product-shaping requests need one clarifying interview before plan or execution.",
+    activation_status="active",
+)
+GREENFIELD_BUILD_GUARD = RoutingGuardRule(
+    id="greenfield_build_before_generic_picker",
+    rule=(
+        "A request to build something that does not exist yet should start with one clarifying "
+        "interview instead of falling back to the generic picker."
+    ),
+    matched_label="guard:greenfield_build",
+    preferred_skills=("deep-interview",),
+    # A floor for the empty field, not an override - deliberately the smallest
+    # boost of any guard here. The creation shape is weak evidence: it says the
+    # object is new, not which lane owns it. Because the candidate is injected
+    # at score 0, this number IS the score of an unclaimed greenfield request,
+    # so it is chosen against the measured bands rather than picked round:
+    # a request nothing claimed lands at 3-7 (`build a todo list` scored 4,
+    # `build a CLI tool` 7), while a genuine multi-signal match starts at 10
+    # (`여러 Hermes agent가 같이 일할 board 만들어줘` scores `agent-board` 10 off four
+    # separate signals). 8 sits between them. At 30 the guard overrode
+    # `frontend` (15) and `websearch-setup` (18); at 10 it tied `agent-board`
+    # and turned a correct dispatch into a clarify.
+    score_boost=8,
+    why="Matched greenfield creation language with no existing surface named; clarify the product before planning or handoff.",
+    activation_status="active",
+)
+DEEP_INTERVIEW_GUARD = RoutingGuardRule(
+    id="deep_interview_before_generic_plan",
+    rule="Explicit deep-interview or interview-before-planning requests should route to deep-interview before generic planning.",
+    matched_label="guard:deep_interview",
+    preferred_skills=("deep-interview",),
+    score_boost=36,
+    why="Matched explicit deep-interview language; ask the smallest useful clarification before planning or handoff.",
+    activation_status="active",
+)
+WORKFLOW_LEARNING_GUARD = RoutingGuardRule(
+    id="workflow_learning_before_skill_management",
+    rule="Requests to learn from a workflow, improve a skill next time, or add routing regressions should route to workflow-learning before generic skill management.",
+    matched_label="guard:workflow_learning",
+    preferred_skills=("workflow-learning",),
+    score_boost=34,
+    why="Matched guard/trigger metadata; workflow improvement requests should become a learning trace, review candidate, or regression instead of generic skill management.",
+    activation_status="active",
+)
+OMH_QUALITY_IMPROVEMENT_GUARD = RoutingGuardRule(
+    id="omh_quality_improvement_loop_before_feedback_triage",
+    rule=(
+        "OMH self-improvement requests about router quality, context loss, progress reporting, or coding-handoff "
+        "reliability should route to the process/coding lane even when bug words are present."
+    ),
+    matched_label="guard:omh_quality_improvement_loop",
+    preferred_skills=("ultrawork",),
+    score_boost=48,
+    why=(
+        "Matched semantic OMH quality-improvement intent; bug/failure terms are evidence for improving OMH "
+        "routing/context/handoff behavior, not customer feedback triage."
+    ),
+    activation_status="active",
+)
+PERSISTENT_COMPLETION_GUARD = RoutingGuardRule(
+    id="persistent_completion_before_board_status",
+    rule=(
+        "Persistent finish-until-pass-or-block requests should route to ultrawork's "
+        "single-owner-persistence capability before board/status surfaces."
+    ),
+    matched_label="guard:persistent_completion",
+    preferred_skills=("ultrawork",),
+    score_boost=38,
+    why="Matched completion-loop language with a concrete pass/block stop condition.",
+    activation_status="active",
+)
+RESEARCH_BRIEF_GUARD = RoutingGuardRule(
+    id="research_brief_before_wiki",
+    rule="Comparison and evidence-gap research synthesis should route to research-brief before durable wiki capture.",
+    matched_label="guard:research_brief",
+    preferred_skills=("research-brief",),
+    score_boost=38,
+    why="Matched comparison research with evidence, confidence, or notes; prepare a brief before capturing knowledge.",
+    activation_status="active",
+)
+STRATEGY_BRIEF_GUARD = RoutingGuardRule(
+    id="strategy_brief_before_generic_plan",
+    rule="Business prioritization and segment decisions should route to strategy-brief before generic planning.",
+    matched_label="guard:strategy_brief",
+    preferred_skills=("strategy-brief",),
+    score_boost=40,
+    why="Matched strategy decision language; prepare options and tradeoffs before implementation planning.",
+    activation_status="active",
+)
+APP_DELIVERY_LOOP_GUARD = RoutingGuardRule(
+    id="app_delivery_loop_before_generic_plan",
+    rule="Idea-to-release paths should route to idea-to-deploy before generic planning.",
+    matched_label="guard:app_delivery_loop",
+    preferred_skills=("idea-to-deploy",),
+    score_boost=38,
+    why="Matched idea, handoff, QA, and release path language; use the app delivery loop surface.",
+    activation_status="active",
+)
+CTO_LOOP_GUARD = RoutingGuardRule(
+    id="cto_loop_before_generic_loop",
+    rule="PM/dev/QA/security/ops leadership loops should route to cto-loop before generic loop handling.",
+    matched_label="guard:cto_loop",
+    preferred_skills=("cto-loop",),
+    score_boost=48,
+    why="Matched leadership role loop language; prepare the CTO operating model rather than a generic loop.",
+    activation_status="active",
+)
+ADVERSARIAL_QA_GUARD = RoutingGuardRule(
+    id="adversarial_qa_before_generic_help",
+    rule="Hostile, adversarial, missing-path, or stale-config testing requests should route to ultraqa.",
+    matched_label="guard:adversarial_qa",
+    preferred_skills=("ultraqa",),
+    score_boost=42,
+    why="Matched adversarial QA scenario language; route to the QA harness instead of generic help.",
+    activation_status="active",
+)
+CLEANUP_REFACTOR_GUARD = RoutingGuardRule(
+    id="cleanup_refactor_before_workflow_learning",
+    rule="Code cleanup/refactor requests with regression-test language should route to ai-slop-cleaner before workflow-learning.",
+    matched_label="guard:cleanup_refactor",
+    preferred_skills=("ai-slop-cleaner",),
+    score_boost=50,
+    why="Matched concrete cleanup/refactor work with behavior-locking tests; use the cleanup harness rather than process learning.",
+    activation_status="active",
+)
+DURABLE_RESEARCH_GUARD = RoutingGuardRule(
+    id="durable_research_goal_before_wiki",
+    rule="Keep-researching-until-gap-closed requests should route to research before wiki capture.",
+    matched_label="guard:durable_research_goal",
+    preferred_skills=("research",),
+    score_boost=44,
+    why="Matched durable research loop language with evidence gaps and a stop condition.",
+    activation_status="active",
+)
+LOOP_GOAL_GUARD = RoutingGuardRule(
+    id="loop_goal_before_generic_clarification",
+    rule="Loopable product or OSS improvement goals should route to loop before generic clarification.",
+    matched_label="guard:loop_goal",
+    preferred_skills=("loop",),
+    score_boost=30,
+    why="Matched loopable goal language; assess the goal shape and start a bounded loop instead of a passive clarification.",
+    activation_status="active",
+)
+OPS_OBSERVABILITY_GUARD = RoutingGuardRule(
+    id="ops_observability_before_generic_loop",
+    rule="Runtime, loop, token, cost, latency, or run-history status requests should route to ops-observability-card before generic loop handling.",
+    matched_label="guard:ops_observability",
+    preferred_skills=("ops-observability-card",),
+    score_boost=46,
+    why="Matched operational telemetry language; prepare an observed-only status card instead of starting or advancing a loop.",
+    activation_status="active",
+)
+WEB_RESEARCH_BEFORE_PROCESS_GUARD = RoutingGuardRule(
+    id="web_research_before_process",
+    rule="Plain web/source/current-evidence requests should route to the web lookup lane before one-cycle delivery.",
+    matched_label="guard:web_research_before_process",
+    preferred_skills=("web-research",),
+    score_boost=14,
+    why="Matched guard/trigger metadata; web, source, or freshness requests should start with one cited retrieval round.",
+    activation_status="active",
+)
+POINT_IN_TIME_WEB_GUARD = RoutingGuardRule(
+    id="point_in_time_web_before_live_lookup",
+    rule=(
+        "Explicit point-in-time web requests (as of a date, archived captures, then versus now) should route "
+        "to the web lookup lane with historical claims bound to temporal_source_receipt/v1."
+    ),
+    matched_label="guard:point_in_time_web",
+    # The lookup lane only. Boosting `research` too ties the two lanes at the
+    # injected score and the router asks which one instead of answering; the
+    # lookup lane's own guidance hands an expanding as-of question to `research`.
+    preferred_skills=("web-research",),
+    # Above the operator fast-path score (13) and the browser/workspace
+    # operator lanes a page or snapshot noun otherwise reaches, so an as-of
+    # question lands on evidence discipline rather than a live page card.
+    score_boost=40,
+    why=(
+        "Matched point-in-time web language; historical claims need an eligible capture receipt at or before "
+        "the cutoff, and live pages stay separate current evidence."
+    ),
+    activation_status="active",
+)
+SOURCE_FINDER_GUARD = RoutingGuardRule(
+    id="source_finder_before_generic_web_research",
+    rule="Typed source candidate acquisition should route to source-finder before generic web research.",
+    matched_label="guard:source_finder",
+    preferred_skills=("source-finder",),
+    score_boost=36,
+    why="Matched guard/trigger metadata; typed source acquisition should prepare candidates, acquisition state, and downstream routing before evidence synthesis.",
+    activation_status="active",
+)
+MISSED_WORKFLOW_WEB_RESEARCH_GUARD = RoutingGuardRule(
+    id="missed_workflow_research_recovery",
+    rule="Missed-OMH feedback about research/source work should recover to research instead of broad router help.",
+    matched_label="guard:missed_workflow_research_recovery",
+    preferred_skills=("research",),
+    score_boost=32,
+    why="Matched guard/trigger metadata; missed OMH research feedback should recover to source-backed Hermes research.",
+    activation_status="active",
+)
+MISSED_WORKFLOW_OPERATING_RHYTHM_GUARD = RoutingGuardRule(
+    id="missed_workflow_operating_record_recovery",
+    rule="Missed-OMH feedback about meeting notes or operating records should recover to operating-rhythm.",
+    matched_label="guard:missed_workflow_operating_record_recovery",
+    preferred_skills=("operating-rhythm",),
+    score_boost=34,
+    why="Matched guard/trigger metadata; missed OMH meeting/record feedback should prepare an operating record with evidence boundaries.",
+    activation_status="active",
+)
+DELIVERY_CYCLE_GUARD = RoutingGuardRule(
+    id="delivery_cycle_before_research_only",
+    rule=(
+        "Requests that ask for PR or delivery-cycle completion should route to ultrawork's "
+        "delivery-boundary capability before research-only lanes."
+    ),
+    matched_label="guard:delivery_cycle_before_research_only",
+    preferred_skills=("ultrawork",),
+    # Raised from 12 to 14 when `web-research` was renamed to `research` (the
+    # research lane collects a +5 catalog-name phrase match on any message
+    # containing the word), and from 14 to 18 at #954 stage 5: `ultrawork`
+    # carries a smaller delivery trigger base than the retired `ultraprocess`
+    # table did, which turned "web research and source scan, then prepare a
+    # PR" into a research win. 18 restores the delivery margin; it is not new
+    # precedence.
+    score_boost=18,
+    why="Matched guard/trigger metadata; PR or delivery-cycle requests need the one-cycle process lane rather than research-only routing.",
+    activation_status="active",
+)
+DIRECT_CODING_TASK_GUARD = RoutingGuardRule(
+    id="direct_coding_task_before_fallback",
+    rule="Concrete code-edit requests should route to the one-cycle delivery lane instead of falling back to the generic picker.",
+    matched_label="guard:direct_coding_task",
+    preferred_skills=("ultrawork",),
+    score_boost=44,
+    why="Matched explicit code-edit language; prepare one bounded implementation cycle instead of asking which workflow to use.",
+    activation_status="active",
+)
+NAMED_CODING_AGENT_DELIVERY_GUARD = RoutingGuardRule(
+    id="named_coding_agent_delivery_before_advisor_or_feedback",
+    rule=(
+        "An explicit coding-agent name plus a coding-delivery request should route to the one-cycle "
+        "delivery lane before external-advisor or customer-feedback lanes."
+    ),
+    matched_label="guard:named_coding_agent_delivery",
+    preferred_skills=("ultrawork",),
+    score_boost=30,
+    why=(
+        "Matched an explicit coding-agent name with a delivery request; naming the CLI is an "
+        "explicit owner choice (recorded as provenance), so prepare the delivery-lane handoff "
+        "for the named executor instead of external advice or feedback triage."
+    ),
+    activation_status="active",
+)
+CODING_HANDOFF_STATUS_GUARD = RoutingGuardRule(
+    id="coding_handoff_status_before_clarify",
+    rule=(
+        "Executor-named coding handoff plus progress/status tracking should route to ultrawork's "
+        "delivery-boundary status surface instead of generic clarification."
+    ),
+    matched_label="guard:coding_handoff_status",
+    preferred_skills=("ultrawork",),
+    score_boost=26,
+    why="Matched guard/trigger metadata; executor-named coding handoff and status requests should prepare a tracked one-cycle handoff without claiming execution.",
+    activation_status="active",
+)
+EXECUTOR_RUNTIME_READINESS_GUARD = RoutingGuardRule(
+    id="executor_runtime_readiness_before_generic_advice",
+    rule="Executor/runtime comparison requests should route to executor-runtime-readiness before generic advice.",
+    matched_label="guard:executor_runtime_readiness",
+    preferred_skills=("executor-runtime-readiness",),
+    score_boost=30,
+    why="Matched guard/trigger metadata; executor/runtime comparison should show tool gaps and handoff mode before selection.",
+    activation_status="active",
+)
+TOOLBELT_READINESS_GUARD = RoutingGuardRule(
+    id="toolbelt_readiness_before_generic_or_visual_fallback",
+    rule="Missing connector, credential, API key, MCP, or image-tool setup requests should route to toolbelt-readiness before generic fallback or visual prompt preparation.",
+    matched_label="guard:toolbelt_readiness",
+    preferred_skills=("toolbelt-readiness",),
+    score_boost=54,
+    why="Matched guard/trigger metadata; missing tool, connector, credential, or image generator setup should show readiness gaps before claiming workflow execution.",
+    activation_status="active",
+)
+PROVIDER_PROFILE_POSTURE_GUARD = RoutingGuardRule(
+    id="provider_profile_posture_before_toolbelt_readiness",
+    rule="Explicit provider/profile posture requests should route to metadata-only provider-profile-posture before general toolbelt readiness.",
+    matched_label="guard:provider_profile_posture",
+    preferred_skills=("provider-profile-posture",),
+    score_boost=58,
+    why="Matched provider/profile posture language; prepare capability and secret-presence metadata without credential validation or provider calls.",
+    activation_status="active",
+)
+MEMORY_PROVIDER_LIFECYCLE_GUARD = RoutingGuardRule(
+    id="memory_provider_lifecycle_before_toggle_or_file_operation",
+    rule=(
+        "Enabling, switching, pausing, deleting, or exporting an optional memory provider should route to "
+        "external-connector-readiness before a capability toggle, a file operation, or native-memory curation."
+    ),
+    matched_label="guard:memory_provider_lifecycle",
+    preferred_skills=("external-connector-readiness",),
+    score_boost=60,
+    why=(
+        "Matched memory-provider lifecycle language; reversibility, isolation, retention, deletion, export, and "
+        "switching must be assessed before the provider is enabled or removed."
+    ),
+    activation_status="active",
+)
+HARNESS_SESSION_INVENTORY_GUARD = RoutingGuardRule(
+    id="harness_session_inventory_before_toolbelt_or_observability",
+    rule="Cross-harness session, MCP inventory, connector drift, or worktree inventory requests should route to harness-session-inventory before setup readiness.",
+    matched_label="guard:harness_session_inventory",
+    preferred_skills=("harness-session-inventory",),
+    score_boost=56,
+    why="Matched guard/trigger metadata; cross-harness session, MCP config, connector, or worktree drift should be inventoried before runtime or setup claims.",
+    activation_status="active",
+)
+MATERIALS_PACKAGE_GUARD = RoutingGuardRule(
+    id="materials_package_before_report_or_clarify",
+    rule="Multi-format document, spreadsheet, deck, or PDF packaging requests should route to materials-package before generic report planning.",
+    matched_label="guard:materials_package",
+    preferred_skills=("materials-package",),
+    score_boost=24,
+    why="Matched guard/trigger metadata; material processing requests should prepare a target-format package and QA ladder.",
+    activation_status="active",
+)
+MEMORY_NEW_GUARD = RoutingGuardRule(
+    id="memory_new_before_existing_memory_curation",
+    rule="New project, product, or durable context capture requests should route to memory-new before existing-memory curation.",
+    matched_label="guard:memory_new",
+    preferred_skills=("memory-new",),
+    score_boost=34,
+    why="Matched guard/trigger metadata; new durable context should become a reviewed memory candidate instead of an existing-memory cleanup review.",
+    activation_status="active",
+)
+MEMORY_CURATION_GUARD = RoutingGuardRule(
+    id="memory_curation_before_generic_clarification",
+    rule="Hermes memory/context cleanup requests should route to memory-sync before generic clarification.",
+    matched_label="guard:memory_curation",
+    preferred_skills=("memory-sync",),
+    score_boost=28,
+    why="Matched guard/trigger metadata; stale or conflicting Hermes context should become a human-approved memory curation review.",
+    activation_status="active",
+)
+AGENT_BOARD_GUARD = RoutingGuardRule(
+    id="agent_board_before_generic_clarification",
+    rule="Multi-agent role, board, kanban, heartbeat, or blocker coordination requests should route to agent-board.",
+    matched_label="guard:agent_board",
+    preferred_skills=("agent-board",),
+    score_boost=26,
+    why="Matched guard/trigger metadata; multiple Hermes targets need a board/status contract before work is claimed.",
+    activation_status="active",
+)
+GATEWAY_INTENT_GUARD = RoutingGuardRule(
+    id="gateway_intent_before_feedback_triage",
+    rule="Messenger origin, thread, delivery, silent update, or attachment policy requests should route to gateway-intent-card before product feedback triage.",
+    matched_label="guard:gateway_intent",
+    preferred_skills=("gateway-intent-card",),
+    score_boost=34,
+    why="Matched gateway/session policy language; prepare an origin, thread, delivery, and attachment card before treating the message as product feedback.",
+    activation_status="active",
+)
+HERMES_CODING_TEAM_GUARD = RoutingGuardRule(
+    id="hermes_coding_team_before_generic_clarification",
+    rule=(
+        "Hermes-owned coding requests with workers, worktrees, team, or swarm language should route "
+        "to ultrawork's coordinated-scope capability before generic clarification."
+    ),
+    matched_label="guard:hermes_coding_team",
+    preferred_skills=("ultrawork",),
+    score_boost=34,
+    why="Matched Hermes-owned coding team language; prepare worker/worktree lanes and evidence boundaries instead of generic clarification.",
+    activation_status="active",
+)
+CODING_PROGRESS_STATUS_GUARD = RoutingGuardRule(
+    id="coding_progress_status_before_clarify",
+    rule=(
+        "Executor or coding-agent progress/status requests should route to ultrawork's "
+        "delivery-boundary status surface before generic clarification."
+    ),
+    matched_label="guard:coding_progress_status",
+    preferred_skills=("ultrawork",),
+    score_boost=56,
+    why="Matched guard/trigger metadata; coding progress questions should render the selected handoff/session status without claiming missing evidence.",
+    activation_status="active",
+)
+GITHUB_ISSUE_INTAKE_GUARD = RoutingGuardRule(
+    id="github_issue_intake_before_event_ops_or_feedback",
+    rule="Public-chat requests to file a brand-new GitHub issue should route to github-issue-intake before github-event-ops or feedback-triage.",
+    matched_label="guard:github_issue_intake",
+    preferred_skills=("github-issue-intake",),
+    score_boost=44,
+    why="Matched pre-creation issue filing language; prepare an intake card with a bounded interview, duplicate search, and direction confirmation before any GitHub mutation claim.",
+    activation_status="active",
+)
+GITHUB_EVENT_OPS_GUARD = RoutingGuardRule(
+    id="github_event_ops_before_generic_planning",
+    rule="GitHub PR, issue, CI, and issue-to-PR requests should route to github-event-ops before generic planning.",
+    matched_label="guard:github_event_ops",
+    preferred_skills=("github-event-ops",),
+    score_boost=42,
+    why="Matched guard/trigger metadata; GitHub event and issue-to-PR requests should create an event ops card before plan or handoff claims.",
+    activation_status="active",
+)
+RELEASE_CLAIM_REVIEW_GUARD = RoutingGuardRule(
+    id="release_claim_review_before_file_lookup",
+    rule="Release claim and README-vs-code review requests should route to review before file lookup fallback.",
+    matched_label="guard:release_claim_review",
+    preferred_skills=("code-review",),
+    score_boost=20,
+    why="Matched guard/trigger metadata; release claim checks need review boundaries instead of plain file lookup.",
+    activation_status="active",
+)
+DOCTOR_HEALTH_GUARD = RoutingGuardRule(
+    id="doctor_health_before_skill_catalog",
+    rule="OMH install, setup, update, stale skill, or registration health confusion should route to doctor.",
+    matched_label="guard:doctor_health",
+    preferred_skills=("doctor",),
+    score_boost=30,
+    why="Matched guard/trigger metadata; setup/update health confusion should run diagnostics before skill catalog management.",
+    activation_status="active",
+)
+VOICE_OPERATOR_GUARD = RoutingGuardRule(
+    id="voice_operator_before_generic_clarification",
+    rule="Voice, mobile, or terse accessibility-sensitive requests should route to voice-operator before generic clarification.",
+    matched_label="guard:voice_operator",
+    preferred_skills=("voice-operator",),
+    score_boost=24,
+    why="Matched guard/trigger metadata; voice/mobile-style requests need concise clarify/plan/status UX with confirmation boundaries.",
+    activation_status="active",
+)
+BROWSER_OPERATOR_GUARD = RoutingGuardRule(
+    id="browser_operator_before_generic_clarification",
+    rule="Browser page-operation requests should route to browser-operator before generic clarification, web research, or visual QA.",
+    matched_label="guard:browser_operator",
+    preferred_skills=("browser-operator",),
+    score_boost=42,
+    why="Matched guard/trigger metadata; browser interaction requests need URL, auth, action, destructive-confirmation, and observation boundaries.",
+    activation_status="active",
+)
+WORKSPACE_FILE_OPERATOR_GUARD = RoutingGuardRule(
+    id="workspace_file_operator_before_materials_or_coding",
+    rule="Local file/folder operation requests should route to workspace-file-operator before materials packaging or generic coding fallback.",
+    matched_label="guard:workspace_file_operator",
+    preferred_skills=("workspace-file-operator",),
+    score_boost=44,
+    why="Matched guard/trigger metadata; file operations need path scope, allowed actions, destructive-confirmation, and observation boundaries.",
+    activation_status="active",
+)
+COMMAND_OPERATOR_GUARD = RoutingGuardRule(
+    id="command_operator_before_generic_terminal_or_coding",
+    rule="Terminal, shell, CLI, package-manager, or test command requests should route to command-operator before generic coding fallback.",
+    matched_label="guard:command_operator",
+    preferred_skills=("command-operator",),
+    score_boost=44,
+    why="Matched guard/trigger metadata; command execution requests need command text, cwd, environment, safety, timeout, and observed-result boundaries.",
+    activation_status="active",
+)
+CONNECTOR_OPERATOR_GUARD = RoutingGuardRule(
+    id="connector_operator_before_generic_api_or_command",
+    rule="External app, SaaS, email, ticket, calendar, CRM, or connector action requests should route to connector-operator before generic command or coding fallback.",
+    matched_label="guard:connector_operator",
+    preferred_skills=("connector-operator",),
+    score_boost=44,
+    why="Matched guard/trigger metadata; external connector actions need provider, target, auth, payload, confirmation, and observed-result boundaries.",
+    activation_status="active",
+)
+LIVE_INFO_OPERATOR_GUARD = RoutingGuardRule(
+    id="live_info_operator_before_generic_current_facts",
+    rule="Weather, finance, sports, map, place, exchange-rate, and time-zone lookup requests should route to live-info-operator before generic fallback.",
+    matched_label="guard:live_info_operator",
+    preferred_skills=("live-info-operator",),
+    score_boost=42,
+    why="Matched guard/trigger metadata; live information requests need provider, freshness, units, source-quality, and observed-result boundaries.",
+    activation_status="active",
+)
+MEDIA_INPUT_OPERATOR_GUARD = RoutingGuardRule(
+    id="media_input_operator_before_generic_content_or_direct",
+    rule="Audio, video, YouTube, transcript, recording, OCR, screenshot-text, receipt-image, podcast, webinar, timestamp, or clip-summary requests should route to media-input-operator before generic content or direct fallback.",
+    matched_label="guard:media_input",
+    preferred_skills=("media-input-operator",),
+    score_boost=42,
+    why="Matched guard/trigger metadata; media input requests need source, permission, extraction, transcript, timestamp, summary-method, and observed-result boundaries.",
+    activation_status="active",
+)
+CONTENT_OPERATOR_GUARD = RoutingGuardRule(
+    id="content_operator_before_generic_text_transform",
+    rule="Publish-ready content, copy, release-note, newsletter, announcement, email-draft, or style-guided writing requests should route to content-operator before generic fallback.",
+    matched_label="guard:content_operator",
+    preferred_skills=("content-operator",),
+    score_boost=38,
+    why="Matched guard/trigger metadata; quality-controlled content requests need source scope, audience, tone, review, and output-evidence boundaries.",
+    activation_status="active",
+)
+VISUAL_SUMMARY_GUARD = RoutingGuardRule(
+    id="img_summary_before_materials_or_delivery",
+    rule="Image, card, or img-summary requests should route to img-summary before materials or PR delivery-cycle lanes.",
+    matched_label="guard:img_summary",
+    preferred_skills=("img-summary",),
+    score_boost=30,
+    why="Matched guard/trigger metadata; visual image-card requests should prepare a visual prompt card before delivery or material packaging.",
+    activation_status="active",
+)
+CONTRACT_REDLINE_GUARD = RoutingGuardRule(
+    id="contract_redline_before_generic_review",
+    rule="Redline, concession, and negotiation-preparation requests about a contract document should route to the legal review lane that owns the authority citation and counsel hold.",
+    matched_label="guard:contract_redline",
+    preferred_skills=("legal-compliance-review",),
+    score_boost=30,
+    why="Matched guard/trigger metadata; proposed clause language is preparation material bound to a playbook position and a counsel hold, not a general review.",
+    activation_status="active",
+)
+CREDENTIAL_ROTATION_GUARD = RoutingGuardRule(
+    id="credential_rotation_before_toolbelt_readiness",
+    rule="Rotating or revoking an existing credential should route to the security review lane that carries the cutover order and the revocation proof, not to the missing-capability inventory.",
+    matched_label="guard:credential_rotation",
+    preferred_skills=("security-safety-review",),
+    score_boost=36,
+    why="Matched guard/trigger metadata; replacing a live credential needs an overlap window, a cutover order, and a check that the old credential stopped working.",
+    activation_status="active",
+)
+DEPENDENCY_UPGRADE_GUARD = RoutingGuardRule(
+    id="dependency_upgrade_before_generic_plan",
+    rule="A major dependency or framework upgrade should route to the phased refactor planner rather than the generic plan lane.",
+    matched_label="guard:dependency_upgrade",
+    preferred_skills=("refactor-plan",),
+    score_boost=32,
+    why="Matched guard/trigger metadata; an upgrade across a boundary needs phased order, per-phase verification, and a rollback point, which is the phased refactor plan.",
+    activation_status="active",
+)
+GENERATED_ARTIFACT_PROVENANCE_GUARD = RoutingGuardRule(
+    id="generated_artifact_provenance_before_deliverable_package",
+    rule="A request asking whether a change touches a generated file, and where its source of truth is, should route to verification-gate rather than the delivery lane.",
+    matched_label="guard:generated_artifact_provenance",
+    preferred_skills=("verification-gate",),
+    score_boost=30,
+    why="Matched guard/trigger metadata; a generated-path question is a provenance check against the repository's declared artifact map, not a file to attach.",
+    activation_status="active",
+)
+DELIVERABLE_PACKAGE_GUARD = RoutingGuardRule(
+    id="deliverable_package_for_file_attachment",
+    rule="Requests that combine generated files or reports with attachment/delivery status should route to deliverable-package.",
+    matched_label="guard:deliverable_package",
+    preferred_skills=("deliverable-package",),
+    score_boost=28,
+    why="Matched guard/trigger metadata; file attachment or delivery-status requests should prepare a deliverable package before claiming output.",
+    activation_status="active",
+)
+SCHEDULED_OPS_BLUEPRINT_GUARD = RoutingGuardRule(
+    id="scheduled_ops_blueprint_before_reliability_or_research",
+    rule="Recurring schedule, delivery, or silence-policy requests should route to the scheduled ops blueprint lane before one-off review/research lanes.",
+    matched_label="guard:scheduled_ops_blueprint",
+    preferred_skills=("automation-blueprint",),
+    score_boost=24,
+    why="Matched guard/trigger metadata; recurring schedule or delivery requests should prepare a Hermes ops blueprint first.",
+    activation_status="active",
+)
+RESEARCH_DEPARTMENT_GUARD = RoutingGuardRule(
+    id="research_department_before_generic_scheduled_ops",
+    rule="Recurring or durable research operations should route to the research department workflow pack before generic scheduled ops.",
+    matched_label="guard:research_department",
+    preferred_skills=("research-department",),
+    score_boost=40,
+    why="Matched guard/trigger metadata; recurring research operations should prepare a Scout/Analyst/Briefer research department plan.",
+    activation_status="active",
+)
+LONG_DOCUMENT_READING_GUARD = RoutingGuardRule(
+    id="long_document_reading_before_paper_or_materials",
+    rule="Requests to read, summarize, or process a document past one read budget should route to long-document-reading before paper tutoring or file packaging.",
+    matched_label="guard:long_document_reading",
+    preferred_skills=("long-document-reading",),
+    score_boost=44,
+    why="Matched a long-document reading cue; the document needs a page-count probe, page ranges sized to the read budget, and a covered / next / missing ledger before any coverage claim.",
+    activation_status="active",
+)
+PAPER_LEARNING_GUARD = RoutingGuardRule(
+    id="paper_learning_before_materials_or_research_ops",
+    rule="One-off paper or paper-PDF explanation requests should route to paper-learning before generic file packaging or research ops.",
+    matched_label="guard:paper_learning",
+    preferred_skills=("paper-learning",),
+    score_boost=42,
+    why="Matched guard/trigger metadata; paper explanation requests need level selection, source-state evidence, and a coverage ledger.",
+    activation_status="active",
+)
+JIT_LEARN_GUARD = RoutingGuardRule(
+    id="jit_learn_before_generic_research_or_review",
+    rule=(
+        "Requests to pick what to learn right now for a live blocker, with immediately applicable books, podcasts, "
+        "creators, or courses, should route to jit-learn before generic research, review, or curriculum workflows."
+    ),
+    matched_label="guard:jit_learn",
+    preferred_skills=("jit-learn",),
+    score_boost=38,
+    why=(
+        "Matched guard/trigger metadata; immediate-learning requests need a confirmed learning target and a "
+        "source-gated, application-first brief instead of generic research or review."
+    ),
+    activation_status="active",
+)
+ROUTING_GUARD_RULES = (
+    RISKY_REFACTOR_GUARD,
+    SAFE_FEATURE_PLAN_GUARD,
+    FEEDBACK_BEFORE_CODING_GUARD,
+    PRODUCT_SHAPING_GUARD,
+    DEEP_INTERVIEW_GUARD,
+    PERSISTENT_COMPLETION_GUARD,
+    RESEARCH_BRIEF_GUARD,
+    STRATEGY_BRIEF_GUARD,
+    APP_DELIVERY_LOOP_GUARD,
+    CTO_LOOP_GUARD,
+    ADVERSARIAL_QA_GUARD,
+    CLEANUP_REFACTOR_GUARD,
+    DURABLE_RESEARCH_GUARD,
+    LOOP_GOAL_GUARD,
+    OPS_OBSERVABILITY_GUARD,
+    WORKFLOW_LEARNING_GUARD,
+    OMH_QUALITY_IMPROVEMENT_GUARD,
+    PAPER_LEARNING_GUARD,
+    JIT_LEARN_GUARD,
+    RESEARCH_DEPARTMENT_GUARD,
+    SCHEDULED_OPS_BLUEPRINT_GUARD,
+    SOURCE_FINDER_GUARD,
+    WEB_RESEARCH_BEFORE_PROCESS_GUARD,
+    POINT_IN_TIME_WEB_GUARD,
+    MISSED_WORKFLOW_WEB_RESEARCH_GUARD,
+    MISSED_WORKFLOW_OPERATING_RHYTHM_GUARD,
+    GITHUB_ISSUE_INTAKE_GUARD,
+    GITHUB_EVENT_OPS_GUARD,
+    MATERIALS_PACKAGE_GUARD,
+    MEMORY_NEW_GUARD,
+    MEMORY_CURATION_GUARD,
+    AGENT_BOARD_GUARD,
+    GATEWAY_INTENT_GUARD,
+    HERMES_CODING_TEAM_GUARD,
+    CODING_PROGRESS_STATUS_GUARD,
+    RELEASE_CLAIM_REVIEW_GUARD,
+    DOCTOR_HEALTH_GUARD,
+    EXECUTOR_RUNTIME_READINESS_GUARD,
+    PROVIDER_PROFILE_POSTURE_GUARD,
+    TOOLBELT_READINESS_GUARD,
+    CONNECTOR_OPERATOR_GUARD,
+    VOICE_OPERATOR_GUARD,
+    BROWSER_OPERATOR_GUARD,
+    WORKSPACE_FILE_OPERATOR_GUARD,
+    COMMAND_OPERATOR_GUARD,
+    VISUAL_SUMMARY_GUARD,
+    DELIVERABLE_PACKAGE_GUARD,
+    DELIVERY_CYCLE_GUARD,
+    DIRECT_CODING_TASK_GUARD,
+    NAMED_CODING_AGENT_DELIVERY_GUARD,
+    CODING_HANDOFF_STATUS_GUARD,
+)
+
+
+# Which guards may decide a dispatch on their own (#dispatch-evidence).
+#
+# Rule for the label: a guard with a measured record as the dispatched winner
+# on the tuning set is trusted only when that record is at least three right
+# for every wrong, with at least one right. A guard with no measured record
+# keeps the label its intent shape earned (owner decision, 2026-09-26: making
+# every unmeasured guard context-only cost two skills their natural reach for
+# no measured gain). One exception keeps a measured guard under 3:1 trusted:
+# demoting it would break a product quality floor (routing accuracy, the
+# known-lanes baseline, grounded score, route-hint alignment, chat-card and
+# common-request coverage, the ulw-equivalence digests), or it removes no
+# measured wrong dispatch while moving canonical pins; the reason names which.
+# Every reason below says which rule decided it. The earlier bar (right >= wrong, or at most one wrong) left held-out English
+# wrong dispatch at 22.7%, largely guard-carried. This is a trust-policy
+# change, not a predicate change: every guard still boosts and reorders the
+# field, and a context-only winner clarifies with itself first on the
+# shortlist.
+#
+# A guard boost reorders the field either way. What this table decides is
+# whether the boost alone may DISPATCH a skill whose own trigger evidence is
+# thin. A trusted guard matches an intent shape -- an imperative plus its
+# object ("fix the login bug"), an explicit skill surface ("voice note"), a
+# cadence plus a scheduled action -- and keeps that authority. A context-only
+# guard fires on co-occurring topic words ("what" beside "time", a document
+# size, a format noun); when it is the only strong evidence the route clarifies
+# with its skill as the candidate. Every guard id must appear here, so a new
+# guard is a visible choice rather than a silent default.
+GUARD_TRUSTED = "trusted"
+GUARD_CONTEXT_ONLY = "context_only"
+GUARD_DISPATCH_TRUST: dict[str, tuple[str, str]] = {
+    "adversarial_qa_before_generic_help": (GUARD_TRUSTED, "hostile/missing-path testing named as the task; no measured record as a winner, keeps its shape label"),
+    "agent_board_before_generic_clarification": (GUARD_TRUSTED, "an imperative to coordinate named agents or a board; no measured record as a winner, keeps its shape label"),
+    "app_delivery_loop_before_generic_plan": (GUARD_TRUSTED, "an explicit idea-to-release path; no measured record as a winner, keeps its shape label"),
+    "browser_operator_before_generic_clarification": (GUARD_CONTEXT_ONLY, "an imperative to operate a browser page; measured 1 right / 1 wrong"),
+    "cleanup_refactor_before_workflow_learning": (GUARD_TRUSTED, "a cleanup verb on code with regression-test language; no measured record as a winner, keeps its shape label"),
+    "coding_handoff_status_before_clarify": (GUARD_CONTEXT_ONLY, "a named executor plus a status request; measured 0 right / 1 wrong"),
+    "coding_progress_status_before_clarify": (GUARD_TRUSTED, "a named executor plus a progress request; no measured record as a winner, keeps its shape label"),
+    "command_operator_before_generic_terminal_or_coding": (GUARD_TRUSTED, "an imperative to run a terminal or package command; measured 2 right / 0 wrong"),
+    "connector_operator_before_generic_api_or_command": (GUARD_TRUSTED, "an action on a named external app; measured 1 right / 1 wrong; kept trusted: demoting it removes no measured wrong dispatch and moves canonical pins"),
+    "content_operator_before_generic_text_transform": (GUARD_TRUSTED, "an imperative to write publish-ready copy; no measured record as a winner, keeps its shape label"),
+    "contract_redline_before_generic_review": (GUARD_TRUSTED, "redline or negotiation verbs on a contract; no measured record as a winner, keeps its shape label"),
+    "credential_rotation_before_toolbelt_readiness": (GUARD_TRUSTED, "rotate or revoke on an existing credential; no measured record as a winner, keeps its shape label"),
+    "cto_loop_before_generic_loop": (GUARD_TRUSTED, "an explicit PM/dev/QA leadership loop; no measured record as a winner, keeps its shape label"),
+    "deep_interview_before_generic_plan": (GUARD_TRUSTED, "an explicit interview-before-planning request; no measured record as a winner, keeps its shape label"),
+    "deliverable_package_for_file_attachment": (GUARD_CONTEXT_ONLY, "a generated file plus an attach or delivery action; measured 0 right / 1 wrong"),
+    "delivery_cycle_before_research_only": (GUARD_TRUSTED, "an explicit PR or delivery-cycle completion request; no measured record as a winner, keeps its shape label"),
+    "dependency_upgrade_before_generic_plan": (GUARD_TRUSTED, "an upgrade verb on a named framework version; no measured record as a winner, keeps its shape label"),
+    "direct_coding_task_before_fallback": (GUARD_TRUSTED, "an imperative code-edit verb plus a code object; measured 0 right / 1 wrong; kept trusted: demoting it breaks the routing-accuracy floors, the known-lanes baseline, and the ulw-equivalence digest"),
+    "doctor_health_before_skill_catalog": (GUARD_TRUSTED, "OMH install or setup health named as the problem; no measured record as a winner, keeps its shape label"),
+    "durable_research_goal_before_wiki": (GUARD_TRUSTED, "keep-researching-until-closed shape; no measured record as a winner, keeps its shape label"),
+    "executor_runtime_readiness_before_generic_advice": (GUARD_TRUSTED, "an executor named with a can-it-run or connect question; narrowed off comparisons and session inventories; no measured record as a winner, keeps its shape label"),
+    "feedback_before_coding": (GUARD_TRUSTED, "a customer or user report of a defect handed over for triage; narrowed off replies, filing, test commands, system memory, and a product-plus-defect topic under an edit command (#1892); measured 1 right / 1 wrong; kept trusted: demoting it breaks the known-lanes baseline and route-hint alignment"),
+    "gateway_intent_before_feedback_triage": (GUARD_TRUSTED, "messenger thread or delivery policy named as the task; measured 2 right / 0 wrong"),
+    "generated_artifact_provenance_before_deliverable_package": (GUARD_TRUSTED, "asks whether a change touches a generated file; no measured record as a winner, keeps its shape label"),
+    "github_event_ops_before_generic_planning": (GUARD_TRUSTED, "an explicit PR, CI, or issue-to-PR event; measured 0 right / 1 wrong; kept trusted: demoting it removes no measured wrong dispatch and moves canonical pins"),
+    "github_issue_intake_before_event_ops_or_feedback": (GUARD_TRUSTED, "an imperative to file a new issue; no measured record as a winner, keeps its shape label"),
+    "greenfield_build_before_generic_picker": (GUARD_CONTEXT_ONLY, "fires on build plus the absence of a named existing surface; no measured record as a winner, keeps its shape label"),
+    "harness_session_inventory_before_toolbelt_or_observability": (GUARD_TRUSTED, "an inventory request over named harness sessions; measured 1 right / 0 wrong"),
+    "hermes_coding_team_before_generic_clarification": (GUARD_TRUSTED, "Hermes-owned coding with workers or worktrees; no measured record as a winner, keeps its shape label"),
+    "img_summary_before_materials_or_delivery": (GUARD_TRUSTED, "an image or card summary named as the output; measured 1 right / 0 wrong"),
+    "jit_learn_before_generic_research_or_review": (GUARD_TRUSTED, "what-to-learn-now for a live blocker; no measured record as a winner, keeps its shape label"),
+    "live_info_operator_before_generic_current_facts": (GUARD_TRUSTED, "a live topic (weather, rate, score) with a live cue (now, today, latest); measured 1 right / 0 wrong"),
+    "long_document_reading_before_paper_or_materials": (GUARD_TRUSTED, "a read or summarize verb on a document past one read budget; measured 1 right / 0 wrong"),
+    "loop_goal_before_generic_clarification": (GUARD_TRUSTED, "a loopable product or OSS goal; no measured record as a winner, keeps its shape label"),
+    "materials_package_before_report_or_clarify": (GUARD_TRUSTED, "a production verb on a document format (turn into slides, export a pdf); measured 0 right / 1 wrong; kept trusted: demoting it breaks the common-request coverage floor"),
+    "media_input_operator_before_generic_content_or_direct": (GUARD_TRUSTED, "an audio, video, or recording input named as the source; measured 1 right / 0 wrong"),
+    "memory_curation_before_generic_clarification": (GUARD_TRUSTED, "an imperative to clean up Hermes memory; measured 0 right / 1 wrong; kept trusted: demoting it breaks the ulw-equivalence digest"),
+    "memory_new_before_existing_memory_curation": (GUARD_TRUSTED, "an imperative to capture a new durable fact; no measured record as a winner, keeps its shape label"),
+    "memory_provider_lifecycle_before_toggle_or_file_operation": (GUARD_TRUSTED, "enable, switch, or export a named memory provider; no measured record as a winner, keeps its shape label"),
+    "missed_workflow_operating_record_recovery": (GUARD_TRUSTED, "explicit missed-OMH feedback about operating records; no measured record as a winner, keeps its shape label"),
+    "missed_workflow_research_recovery": (GUARD_TRUSTED, "explicit missed-OMH feedback about research work; no measured record as a winner, keeps its shape label"),
+    "named_coding_agent_delivery_before_advisor_or_feedback": (GUARD_TRUSTED, "a named coding agent plus a delivery verb; no measured record as a winner, keeps its shape label"),
+    "omh_quality_improvement_loop_before_feedback_triage": (GUARD_TRUSTED, "OMH self-improvement named as the task; no measured record as a winner, keeps its shape label"),
+    "ops_observability_before_generic_loop": (GUARD_CONTEXT_ONLY, "a status or metrics request over a named runtime surface; measured 1 right / 1 wrong"),
+    "paper_learning_before_materials_or_research_ops": (GUARD_TRUSTED, "a paper named as the thing to explain; measured 2 right / 1 wrong; kept trusted: demoting it breaks the routing-accuracy floors and the ulw-equivalence digest"),
+    "persistent_completion_before_board_status": (GUARD_TRUSTED, "finish-until-pass-or-block shape; no measured record as a winner, keeps its shape label"),
+    "point_in_time_web_before_live_lookup": (GUARD_TRUSTED, "an explicit as-of date or archived capture; no measured record as a winner, keeps its shape label"),
+    "product_shaping_before_ops_review": (GUARD_TRUSTED, "a product goal stated with an explicit do-not-know-where-to-start cue; measured 0 right / 1 wrong; kept trusted: demoting it breaks the grounded-score floor"),
+    "provider_profile_posture_before_toolbelt_readiness": (GUARD_TRUSTED, "explicit provider or profile posture request; no measured record as a winner, keeps its shape label"),
+    "release_claim_review_before_file_lookup": (GUARD_TRUSTED, "release claims versus code named for review; no measured record as a winner, keeps its shape label"),
+    "research_brief_before_wiki": (GUARD_CONTEXT_ONLY, "a comparison with evidence gaps named as the output; measured 0 right / 1 wrong"),
+    "research_department_before_generic_scheduled_ops": (GUARD_TRUSTED, "a recurring research operation shape; measured 1 right / 1 wrong; kept trusted: demoting it breaks the grounded-score and chat-card coverage floors"),
+    "risky_refactor_before_cleanup": (GUARD_TRUSTED, "risky refactor named as the change; no measured record as a winner, keeps its shape label"),
+    "safe_feature_change_before_generic_plan": (GUARD_TRUSTED, "a safe feature change named as the change; no measured record as a winner, keeps its shape label"),
+    "scheduled_ops_blueprint_before_reliability_or_research": (GUARD_CONTEXT_ONLY, "a cadence plus a scheduled action; measured 0 right / 1 wrong"),
+    "source_finder_before_generic_web_research": (GUARD_CONTEXT_ONLY, "fires on source and paper nouns; no measured record as a winner, keeps its shape label"),
+    "strategy_brief_before_generic_plan": (GUARD_TRUSTED, "a decide-whether or prioritize decision shape; no measured record as a winner, keeps its shape label"),
+    "toolbelt_readiness_before_generic_or_visual_fallback": (GUARD_TRUSTED, "a named tool or credential plus a missing or setup cue; narrowed off bare setup, api, provider, and model words; measured 2 right / 0 wrong"),
+    "voice_operator_before_generic_clarification": (GUARD_CONTEXT_ONLY, "an explicit voice-note or mobile surface cue; measured 0 right / 1 wrong"),
+    "web_research_before_process": (GUARD_CONTEXT_ONLY, "fires on web, source, or current-evidence nouns; no measured record as a winner, keeps its shape label"),
+    "workflow_learning_before_skill_management": (GUARD_TRUSTED, "learn-from-this-workflow named as the task; no measured record as a winner, keeps its shape label"),
+    "workspace_file_operator_before_materials_or_coding": (GUARD_CONTEXT_ONLY, "an imperative file or folder operation; measured 2 right / 1 wrong"),
+}
+
+
+@lru_cache(maxsize=1)
+def guard_label_dispatch_trust() -> Mapping[str, str]:
+    """`guard:<label>` -> trust, for every guard rule defined in this module."""
+    rules = [value for value in globals().values() if isinstance(value, RoutingGuardRule)]
+    return MappingProxyType({rule.matched_label: GUARD_DISPATCH_TRUST[rule.id][0] for rule in rules})
+
+
+def is_ambiguous_scores(first_score: int, second_score: int | None) -> bool:
+    return second_score is not None and first_score > 0 and first_score == second_score
+
+
+def meets_confidence_threshold(confidence: str, threshold: str) -> bool:
+    return _CONFIDENCE_RANK[confidence] >= _CONFIDENCE_RANK[threshold]
+
+
+# Words that mark a message as "I am naming a skill to run", independent of
+# where they sit in the sentence.
+OMH_INVOCATION_MARKERS = frozenset({"omh", "oh-my-hermes", "oh-my-hermes-agent", "ohmyhermes"})
+SKILL_INVOCATION_MARKERS = frozenset({"skill", "workflow", "스킬", "워크플로우", "워크플로"})
+
+# Korean attaches particles to the noun, so a skill named in Korean word order
+# arrives as "wiki를" or "wiki로" rather than as a bare token.
+#
+# Public because the scorer needs the same list for a different question:
+# marker-scoped invocation below also requires a run cue, while
+# `recommend._self_name_is_marked` only asks whether the particle is there.
+# Two lists of Korean particles in one router would drift the first time one
+# of them gained an entry.
+KOREAN_NOUN_PARTICLES = ("으로", "로", "를", "을", "는", "은", "이", "가", "에게", "에", "도", "만")
+
+# A marker alone is not an invocation: "does OMH support skill health
+# dashboards?" and "what is oh-my-hermes?" both name a marker and a skill while
+# asking a question about the catalog. Requiring a cue that means *run it* is
+# what separates the two.
+_INVOCATION_RUN_CUES = (
+    "use",
+    "run",
+    "execute",
+    "invoke",
+    "start",
+    "써줘",
+    "써",
+    "쓰자",
+    "사용",
+    "실행",
+    "돌려",
+    "해줘",
+    "해주세요",
+    "부탁",
+)
+
+# `context` is an everyday word and also a catalog name, so a message that opens
+# with it reads as an explicit invocation of the terminology workflow: +12 and
+# first place in the shortlist, ahead of whatever the sentence is about. The
+# budget sense was carved out one word at a time, starting with `context
+# budget`. `window`, `limit`, `compaction`, and `overflow` are the same word in
+# the same sense, and every one of them belongs to `context-budget-review`, not
+# to the workflow that aligns the words a repository uses.
+#
+# Each entry is `context ` plus one word on purpose: the first-word check below
+# and the scorer's phrase check then read one table rather than two lists that
+# drift apart.
+CONTEXT_BUDGET_SENSE_WORDS = frozenset({"budget", "compaction", "limit", "overflow", "window"})
+CONTEXT_BUDGET_SENSE_PHRASES = tuple(f"context {word}" for word in sorted(CONTEXT_BUDGET_SENSE_WORDS))
+
+
+def context_query_is_budget_sense(normalized_query: str) -> bool:
+    """True when "context" here names the context window, not the project's terms."""
+    return _contains_phrase(normalized_query, CONTEXT_BUDGET_SENSE_PHRASES)
+
+
+def explicit_skill_invocation(message: str, names: set[str], query: RoutingQuery | None = None) -> str | None:
+    stripped = executable_routing_text(message).strip()
+    if not stripped:
+        return None
+    # The scorers below rebuild the prep chain from `stripped`. A caller's
+    # prepared query stands in only when it was built from that same text, so
+    # what they score never changes.
+    if query is not None and query.raw != stripped:
+        query = None
+    # An explicit invocation of a named non-Jev skill wins: "/omh-code-review
+    # this PR; we can ask jev later" names its owner. A message that addresses
+    # Jev displaces only the generic `ask` opening -- "ask jev ..." starts with
+    # the `ask` skill's name, and the Jev skill is the more specific owner
+    # (`routing/jev_addressing.py`) -- or a message with no explicit form.
+    ordinary = _ordinary_explicit_skill_invocation(stripped, names, query)
+    if ordinary is not None and ordinary != "ask" and not ordinary.startswith("jev-"):
+        return ordinary
+    jev_skill = jev_addressed_skill(stripped, names, query)
+    if jev_skill is not None:
+        return jev_skill
+    return ordinary
+
+
+def _ordinary_explicit_skill_invocation(
+    stripped: str, names: set[str], query: RoutingQuery | None = None
+) -> str | None:
+    # A two-word name read before any one-word form, so `ulw dag ...` is not taken for `ulw` alone. A question
+    # about dag-ulw ("dag-ulw 결과 알려줘") names it without invoking it. A sigil makes the rest a command, so a sigil
+    # message gets here only when `invokes_dag_ulw` read it as a question ("/dag-ulw what is it?").
+    if DAG_ULW in names and dag_ulw_control(stripped):
+        return None  # stop or status for the run in progress, sigil or not: never a new run
+    if DAG_ULW in names and invokes_dag_ulw(stripped):
+        return DAG_ULW
+    if DAG_ULW in names and asks_about_dag_ulw(stripped):
+        return None
+    words = [word.strip(":,").lower() for word in stripped.split()]
+    if len(words) >= 3 and words[0] == "use" and words[1] in {
+        "omh",
+        "oh-my-hermes",
+        "oh-my-hermes-agent",
+    }:
+        candidate = words[2]
+        if candidate in names:
+            return None if _explicit_skill_candidate_is_negated(stripped, candidate) else candidate
+        alias = _EXPLICIT_SKILL_ALIASES.get(candidate)
+        if alias in names:
+            return None if _explicit_skill_candidate_is_negated(stripped, candidate, alias) else alias
+    first = stripped.split(maxsplit=1)[0].strip(":,").lower()
+    used_prefix = False
+    for prefix in sorted(EXPLICIT_INVOCATION_PREFIXES, key=len, reverse=True):
+        if first.startswith(prefix):
+            first = first[len(prefix) :].strip(":,")
+            used_prefix = True
+            break
+    if bare_name_reports_or_asks(stripped, names):
+        return None  # about the skill, not a request for it (after a sigil: `invocation_cues.invoked_instruction`)
+    if (
+        first in names
+        and not (
+            not used_prefix
+            and first == "context"
+            and len(words) > 1
+            and words[1] in CONTEXT_BUDGET_SENSE_WORDS
+        )
+        and not _bare_first_word_reads_as_a_verb(stripped, first, used_prefix, query)
+        and not _bare_verb_name_takes_a_plain_object(stripped, first, used_prefix)
+        and not _bare_first_word_names_a_longer_skill(stripped, first, names, used_prefix)
+    ):
+        return None if _explicit_skill_candidate_is_negated(stripped, first) else first
+    alias = _EXPLICIT_SKILL_ALIASES.get(first)
+    if alias in names:
+        return None if _explicit_skill_candidate_is_negated(stripped, first, alias) else alias
+    if used_prefix:
+        alias = _PREFIXED_SKILL_ALIASES.get(first)
+        if len(stripped.split(maxsplit=1)) == 1:
+            alias = _PREFIXED_BARE_SKILL_ALIASES.get(first, alias)
+        if alias in names:
+            return None if _explicit_skill_candidate_is_negated(stripped, first, alias) else alias
+    return _marker_scoped_skill_invocation(stripped, words, names)
+
+
+def bare_name_reports_or_asks(stripped: str, names: set[str]) -> str | None:
+    """The skill a message opens with when the words after its name report on it or ask about it.
+
+    "ultrawork broke my build", "ralplan 때문에 빌드 깨졌어", "code-review 결과가 이상해" and "ultrawork 이거 어떻게
+    써" open with a skill's name and are about that skill: a complaint or a question, not a request to run it
+    (`name_report_cues.about_the_skill`; a report counts only after a name that can mean nothing but the skill). A
+    colon or comma right after the name keeps it a command ("ultrawork: the build is broken").
+
+    After a sigil the name is the person's own invocation, so the skill runs unless the words after it are about the
+    skill or its run (`invocation_cues.invoked_instruction`): a stop with no task object ("/ultrawork stop"), a
+    request to see how the run stands ("/ulw-loop 상태 보여줘"), or a question about what the skill is ("/ralplan
+    what does this do?"). A report, a task and a question with a task object still run it ("/ultrawork broke the
+    build", "/ulw-work kill the zombie processes", "/omh-code-review is it safe to merge?"). Hermes sends every
+    slash skill this way. dag-ulw reads its own two-word name in `dag_ulw_cues`.
+    """
+    words = stripped.split()
+    sigil = next(
+        (prefix for prefix in sorted(EXPLICIT_INVOCATION_PREFIXES, key=len, reverse=True) if words and words[0].startswith(prefix)),
+        "",
+    )
+    if sigil:
+        words[0] = words[0][len(sigil) :]
+    # The longest name first, written with its hyphens or with spaces ("code-review", "code review").
+    for length in (3, 2, 1):
+        if len(words) <= length or words[length - 1].endswith((":", ",")):
+            continue
+        head = "-".join(words[:length]).lower()
+        name = head if head in names else _EXPLICIT_SKILL_ALIASES.get(head, "")
+        if name == DAG_ULW:
+            return None  # read by `dag_ulw_cues`, whose stop and status words point at the run in progress
+        if name in names:
+            written, rest = " ".join(words[:length]), " ".join(words[length:])
+            if not sigil:
+                return name if about_the_skill(written, rest) else None
+            return name if invoked_instruction(name, rest) else None
+    return None
+
+
+# `research` is the one routable name that is also a transitive English verb a
+# request naturally opens with. "research this attached arxiv PDF and explain it"
+# names paper-learning's whole job and only *starts* with the catalog name, but
+# the bare-first-word form promoted it to an explicit research invocation, which
+# both adds +12 and suppresses the guards that would have handed the message to
+# its real owner. `loop`, `plan`, `team`, and `ask` do not have this problem:
+# they open a sentence as nouns or as the thing being asked for, not as a verb
+# taking the rest of the request as its object.
+_VERB_SHAPED_BARE_INVOCATION_NAMES = frozenset({"research"})
+
+# Skill names that are also imperative verbs. Unprefixed, such a first word is
+# the skill used AS a command only when what follows is its target: nothing,
+# a colon or comma, a determiner or pronoun, or a question word ("plan this",
+# "plan the migration", "plan how to ship X", "plan: ..."). Followed by a bare
+# noun it is the verb of an ordinary sentence ("plan meals for the
+# week" wants meals planned, not the `plan` workflow) and the message routes
+# on merit.
+_IMPERATIVE_BARE_INVOCATION_NAMES = frozenset({"plan", "loop", "cancel"})
+_BARE_INVOCATION_TARGET_WORDS = frozenset(
+    {"a", "an", "the", "this", "that", "these", "those", "it", "my", "our", "your", "me", "us", "out", "how", "what", "for"}
+)
+
+
+def _bare_verb_name_takes_a_plain_object(stripped: str, candidate: str, used_prefix: bool) -> bool:
+    if used_prefix or candidate not in _IMPERATIVE_BARE_INVOCATION_NAMES:
+        return False
+    parts = stripped.split(maxsplit=2)
+    if len(parts) < 2 or parts[0].endswith((":", ",")):
+        return False
+    return parts[1].strip(":,.!?").lower() not in _BARE_INVOCATION_TARGET_WORDS
+
+
+def _bare_first_word_reads_as_a_verb(
+    stripped: str, candidate: str, used_prefix: bool, query: RoutingQuery | None = None
+) -> bool:
+    """Return True when an unprefixed first word is the verb, not an invocation.
+
+    Only the verb-shaped names are checked, and only without a sigil:
+    `./research`, `$research`, `/research`, `@research`, and `use omh research`
+    stay unconditional invocations. For the bare form the decision is handed to
+    the unbiased scored field: if another lane wins the message on its own
+    merits, the first word was the verb; if nothing outscores the named skill,
+    the invocation stands and `research kubernetes operator patterns for this
+    design` still reaches research.
+    """
+    if used_prefix:
+        return False
+    # "cancel my netflix subscription" opens with the name and is the English
+    # verb: nothing else in it is the lane's (see `EVERYDAY_SENSE_PHRASES`).
+    if everyday_sense_phrase_unanchored(candidate, normalized_phrase(stripped)):
+        return True
+    if candidate not in _VERB_SHAPED_BARE_INVOCATION_NAMES:
+        return False
+    return _bare_invocation_is_outscored(stripped, candidate, query)
+
+
+def _bare_invocation_is_outscored(message: str, candidate: str, query: RoutingQuery | None = None) -> bool:
+    from .recommend import _RawMessageKey
+
+    return _bare_invocation_is_outscored_cached(_RawMessageKey(message, query), candidate)
+
+
+@lru_cache(maxsize=512)
+def _bare_invocation_is_outscored_cached(key: _RawMessageKey, candidate: str) -> bool:
+    from .recommend import scored_field_winner_without_explicit_invocation
+
+    winner = scored_field_winner_without_explicit_invocation(key.query or key.raw, candidate)
+    return bool(winner) and winner != candidate
+
+
+def _bare_first_word_names_a_longer_skill(
+    stripped: str,
+    candidate: str,
+    names: set[str],
+    used_prefix: bool,
+) -> bool:
+    """Return True when the first word only starts the skill the message names.
+
+    `research` is a prefix of `research-brief` and `research-department`, and
+    `skill` of `skill-scout` and `skill-health`, so "research brief가 뭐야?"
+    opened with a routable name while asking about a different skill entirely.
+    Matching is substring containment on the normalized message
+    (`_contains_phrase`), so an adverb continuation like "research briefly
+    what the options are" also matches `research brief`; that over-match is
+    harmless because the unbiased scored field routes such messages to the
+    longer skill on merit anyway. A sigil form (`$research ... create a
+    research brief`) stays an explicit invocation of the short name.
+    """
+    if used_prefix:
+        return False
+    normalized = normalized_phrase(stripped)
+    longer_names = tuple(
+        normalized_phrase(name.replace("-", " "))
+        for name in names
+        if name.startswith(f"{candidate}-")
+    )
+    return _contains_phrase(normalized, longer_names)
+
+
+def _marker_scoped_skill_invocation(stripped: str, words: list[str], names: set[str]) -> str | None:
+    """Resolve "run this named skill" wherever the name sits in the sentence.
+
+    Every form above assumes English word order: `use omh <skill>` needs the
+    name third, and the prefix and bare-first-word forms need it first. Korean
+    puts the verb last, so `omh wiki 써줘` matched none of them and fell through
+    to trigger scoring -- which is right only when the name happens to be a
+    distinctive token. Measured across all routable skills, that form resolved
+    81 of 92, and `use the <skill> skill` 86 of 92; the failures were the skills
+    with ordinary names, exactly the ones a user cannot rescue by rephrasing.
+
+    Slack and Discord are why this matters. There is no slash-command surface
+    there, so naming the skill in a sentence is the explicit path, and it has to
+    work in the language the sentence is written in.
+
+    Three things are required together, and each one removes a real overroute
+    found while building this:
+
+    - A marker word, so a bare mention is never promoted to an invocation.
+    - A run cue. "does OMH support skill health dashboards?" names a marker and
+      a skill while asking a catalog question; answering it by running the skill
+      is exactly the wrong move.
+    - The name adjacent to the marker. Several skills are named with ordinary
+      words -- loop, plan, team, ask -- so "Run a loop to find and fix OMH
+      router bugs" carries a marker, a cue, and the token `loop` while meaning
+      none of it as an invocation.
+
+    Two names is ambiguity, not a decision, so the router scores it instead.
+    """
+    tokens = [_invocation_token(word) for word in words]
+    marker_positions = {
+        index
+        for index, token in enumerate(tokens)
+        if token in OMH_INVOCATION_MARKERS or token in SKILL_INVOCATION_MARKERS
+    }
+    if not marker_positions or not _contains_run_cue(stripped):
+        return None
+    candidates: list[str] = []
+    for index, token in enumerate(tokens):
+        if not {index - 1, index + 1} & marker_positions:
+            continue
+        name = _resolved_skill_name(token, names)
+        if name and name not in candidates:
+            candidates.append(name)
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    return None if _explicit_skill_candidate_is_negated(stripped, candidate) else candidate
+
+
+def _contains_run_cue(message: str) -> bool:
+    # Both sides go through the same fold. `normalized_phrase` decomposes
+    # Hangul to jamo, so a composed literal like "써줘" never matches a folded
+    # message unless it is folded too -- which is how this first shipped
+    # silently doing nothing for every Korean cue.
+    normalized = normalized_phrase(message)
+    return any(normalized_phrase(cue) in normalized for cue in _INVOCATION_RUN_CUES)
+
+
+def _invocation_token(word: str) -> str:
+    token = word.strip(":,.!?~…'\"()[]").lower()
+    for particle in KOREAN_NOUN_PARTICLES:
+        if token.endswith(particle) and len(token) > len(particle):
+            return token[: -len(particle)]
+    return token
+
+
+def _resolved_skill_name(token: str, names: set[str]) -> str:
+    if token in names:
+        return token
+    alias = _EXPLICIT_SKILL_ALIASES.get(token, "")
+    return alias if alias in names else ""
+
+
+def skill_is_negated(message: str, skill: str) -> bool:
+    """The message names `skill` only to decline it ("don't use ultraqa")."""
+    if skill == DAG_ULW and declines_dag_ulw(message):
+        return True  # people write its name with a space ("don't use dag ulw")
+    return bool(skill) and _explicit_skill_candidate_is_negated(message, skill)
+
+
+def _explicit_skill_candidate_is_negated(message: str, *candidates: str) -> bool:
+    normalized_message = normalized_phrase(message)
+    for candidate in candidates:
+        normalized_candidate = normalized_phrase(candidate)
+        if not normalized_candidate or normalized_candidate not in normalized_message:
+            continue
+        if _contains_phrase(
+            normalized_message,
+            (
+                f"{normalized_candidate} 말고",
+                f"{normalized_candidate}은 말고",
+                f"{normalized_candidate}는 말고",
+                f"{normalized_candidate}이 아니라",
+                f"{normalized_candidate}가 아니라",
+                f"{normalized_candidate} 아니라",
+                f"{normalized_candidate} 아니고",
+                f"{normalized_candidate} 대신",
+                f"not {normalized_candidate}",
+                f"without {normalized_candidate}",
+                f"instead of {normalized_candidate}",
+                f"other than {normalized_candidate}",
+                f"except {normalized_candidate}",
+                f"do not use {normalized_candidate}",
+                f"don't use {normalized_candidate}",
+            ),
+        ):
+            return True
+    return False
+
+
+def active_routing_guard_rules(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    explicit_skill: str | None = None,
+    loop_timer: str = LOOP_TIMER_NONE,
+) -> tuple[RoutingGuardRule, ...]:
+    """`loop_timer` is the query's `RoutingQuery.loop_timer`; a caller that has
+    no query leaves the loop guard as it reads without a timer."""
+    if explicit_skill:
+        return ()
+    return _active_routing_guard_rules_cached(normalized_query, frozenset(query_tokens), loop_timer)
+
+
+@lru_cache(maxsize=512)
+def _active_routing_guard_rules_cached(
+    normalized_query: str,
+    query_tokens: frozenset[str],
+    loop_timer: str = LOOP_TIMER_NONE,
+) -> tuple[RoutingGuardRule, ...]:
+    rules: list[RoutingGuardRule] = []
+    if _risky_refactor_guard_applies(normalized_query, query_tokens):
+        rules.append(RISKY_REFACTOR_GUARD)
+    if _safe_feature_plan_guard_applies(normalized_query, query_tokens):
+        rules.append(SAFE_FEATURE_PLAN_GUARD)
+    visual_summary_applies = _visual_summary_guard_applies(normalized_query, query_tokens)
+    direct_coding_task_applies = _direct_coding_task_guard_applies(
+        normalized_query,
+        query_tokens,
+        visual_summary_applies=visual_summary_applies,
+    )
+    if direct_coding_task_applies:
+        rules.append(DIRECT_CODING_TASK_GUARD)
+    named_coding_agent_delivery_applies = named_coding_agent_delivery_requested(normalized_query, query_tokens)
+    feedback_before_coding_applies = _feedback_before_coding_guard_applies(
+        normalized_query,
+        query_tokens,
+        direct_coding_task_applies=direct_coding_task_applies,
+        named_coding_agent_delivery_applies=named_coding_agent_delivery_applies,
+    )
+    if feedback_before_coding_applies:
+        rules.append(FEEDBACK_BEFORE_CODING_GUARD)
+    if _product_shaping_guard_applies(normalized_query, query_tokens):
+        rules.append(PRODUCT_SHAPING_GUARD)
+    if _deep_interview_guard_applies(normalized_query, query_tokens):
+        rules.append(DEEP_INTERVIEW_GUARD)
+    if _persistent_completion_guard_applies(normalized_query, query_tokens):
+        rules.append(PERSISTENT_COMPLETION_GUARD)
+    # An as-of question about a page is an evidence question before it is a
+    # market brief or a browser session: the two lanes a page or pricing noun
+    # otherwise reaches stand down while the point-in-time guard is active.
+    point_in_time_web_applies = _point_in_time_web_guard_applies(normalized_query, query_tokens)
+    if _research_brief_guard_applies(normalized_query, query_tokens) and not point_in_time_web_applies:
+        rules.append(RESEARCH_BRIEF_GUARD)
+    if _strategy_brief_guard_applies(normalized_query, query_tokens):
+        rules.append(STRATEGY_BRIEF_GUARD)
+    if _app_delivery_loop_guard_applies(normalized_query, query_tokens):
+        rules.append(APP_DELIVERY_LOOP_GUARD)
+    if _cto_loop_guard_applies(normalized_query, query_tokens):
+        rules.append(CTO_LOOP_GUARD)
+    if _adversarial_qa_guard_applies(normalized_query, query_tokens):
+        rules.append(ADVERSARIAL_QA_GUARD)
+    if _cleanup_refactor_guard_applies(normalized_query, query_tokens):
+        rules.append(CLEANUP_REFACTOR_GUARD)
+    if _durable_research_goal_guard_applies(normalized_query, query_tokens):
+        rules.append(DURABLE_RESEARCH_GUARD)
+    if _ops_observability_guard_applies(normalized_query, query_tokens):
+        rules.append(OPS_OBSERVABILITY_GUARD)
+    loop_goal_applies = _loop_goal_guard_applies(normalized_query, query_tokens, loop_timer)
+    if loop_goal_applies:
+        rules.append(LOOP_GOAL_GUARD)
+    workflow_learning_applies = (
+        not loop_goal_applies or _contains_phrase(normalized_query, _WORKFLOW_LEARNING_PHRASES)
+    ) and _workflow_learning_guard_applies(normalized_query, query_tokens)
+    if workflow_learning_applies:
+        rules.append(WORKFLOW_LEARNING_GUARD)
+    if not workflow_learning_applies and _omh_quality_improvement_guard_applies(normalized_query):
+        rules.append(OMH_QUALITY_IMPROVEMENT_GUARD)
+    delivery_cycle_applies = _delivery_cycle_guard_applies(
+        normalized_query,
+        query_tokens,
+        visual_summary_applies=visual_summary_applies,
+    )
+    long_document_reading_applies = (
+        not delivery_cycle_applies
+        and not workflow_learning_applies
+        and _long_document_reading_guard_applies(normalized_query, query_tokens)
+    )
+    if long_document_reading_applies:
+        rules.append(LONG_DOCUMENT_READING_GUARD)
+    paper_learning_applies = (
+        not delivery_cycle_applies
+        and not workflow_learning_applies
+        and not long_document_reading_applies
+        and _paper_learning_guard_applies(
+            normalized_query,
+            query_tokens,
+            visual_summary_applies=visual_summary_applies,
+        )
+    )
+    if paper_learning_applies:
+        rules.append(PAPER_LEARNING_GUARD)
+    scheduled_ops_blueprint_applies = (
+        not delivery_cycle_applies and _scheduled_ops_blueprint_guard_applies(normalized_query, query_tokens)
+    )
+    explicit_scheduled_ops_blueprint = _explicit_scheduled_ops_blueprint_requested(normalized_query, query_tokens)
+    research_department_applies = (
+        not delivery_cycle_applies
+        and not paper_learning_applies
+        and not explicit_scheduled_ops_blueprint
+        and _research_department_guard_applies(normalized_query, query_tokens)
+    )
+    if research_department_applies:
+        rules.append(RESEARCH_DEPARTMENT_GUARD)
+    if (
+        scheduled_ops_blueprint_applies
+        and (explicit_scheduled_ops_blueprint or not research_department_applies)
+    ):
+        rules.append(SCHEDULED_OPS_BLUEPRINT_GUARD)
+    source_finder_applies = (
+        not delivery_cycle_applies
+        and not paper_learning_applies
+        and not research_department_applies
+        and _source_finder_guard_applies(
+            normalized_query,
+            query_tokens,
+            visual_summary_applies=visual_summary_applies,
+        )
+    )
+    if source_finder_applies:
+        rules.append(SOURCE_FINDER_GUARD)
+    # Every sibling that owns a narrower learning surface wins first: OMH
+    # self-improvement, supplied-paper explanation, recurring research ops, and
+    # typed source acquisition. `jit-learn` only takes what is left.
+    if (
+        not delivery_cycle_applies
+        and not workflow_learning_applies
+        and not paper_learning_applies
+        and not research_department_applies
+        and not source_finder_applies
+        and _jit_learn_guard_applies(normalized_query, query_tokens)
+    ):
+        rules.append(JIT_LEARN_GUARD)
+    if _missed_workflow_operating_record_guard_applies(
+        normalized_query,
+        query_tokens,
+        visual_summary_applies=visual_summary_applies,
+    ):
+        rules.append(MISSED_WORKFLOW_OPERATING_RHYTHM_GUARD)
+    if _web_research_guard_applies(normalized_query, query_tokens) and not paper_learning_applies and not source_finder_applies:
+        rules.append(WEB_RESEARCH_BEFORE_PROCESS_GUARD)
+    if point_in_time_web_applies and not paper_learning_applies and not source_finder_applies:
+        rules.append(POINT_IN_TIME_WEB_GUARD)
+    if _missed_workflow_research_guard_applies(normalized_query, query_tokens):
+        rules.append(MISSED_WORKFLOW_WEB_RESEARCH_GUARD)
+    if _github_issue_intake_guard_applies(normalized_query, query_tokens):
+        rules.append(GITHUB_ISSUE_INTAKE_GUARD)
+    if _github_event_ops_guard_applies(normalized_query, query_tokens):
+        rules.append(GITHUB_EVENT_OPS_GUARD)
+    if contract_redline_guard_applies(normalized_query):
+        rules.append(CONTRACT_REDLINE_GUARD)
+    if credential_rotation_guard_applies(normalized_query):
+        rules.append(CREDENTIAL_ROTATION_GUARD)
+    if dependency_upgrade_guard_applies(normalized_query):
+        rules.append(DEPENDENCY_UPGRADE_GUARD)
+    if _generated_artifact_provenance_guard_applies(normalized_query):
+        rules.append(GENERATED_ARTIFACT_PROVENANCE_GUARD)
+    deliverable_package_applies = _deliverable_package_guard_applies(
+        normalized_query,
+        query_tokens,
+        visual_summary_applies=visual_summary_applies,
+    )
+    workspace_file_operator_applies = _workspace_file_operator_guard_applies(normalized_query, query_tokens)
+    if (
+        workspace_file_operator_applies
+        and not feedback_before_coding_applies
+        and not paper_learning_applies
+        and not long_document_reading_applies
+        and not deliverable_package_applies
+    ):
+        rules.append(WORKSPACE_FILE_OPERATOR_GUARD)
+    if (
+        _materials_package_guard_applies(
+            normalized_query,
+            query_tokens,
+            visual_summary_applies=visual_summary_applies,
+        )
+        and not workspace_file_operator_applies
+        and not paper_learning_applies
+        and not long_document_reading_applies
+        and not deliverable_package_applies
+    ):
+        rules.append(MATERIALS_PACKAGE_GUARD)
+    memory_new_applies = _memory_new_guard_applies(normalized_query)
+    if memory_new_applies:
+        rules.append(MEMORY_NEW_GUARD)
+    if not workflow_learning_applies and not memory_new_applies and _memory_curation_guard_applies(normalized_query, query_tokens):
+        rules.append(MEMORY_CURATION_GUARD)
+    if _agent_board_guard_applies(normalized_query, query_tokens):
+        rules.append(AGENT_BOARD_GUARD)
+    if _gateway_intent_guard_applies(normalized_query, query_tokens):
+        rules.append(GATEWAY_INTENT_GUARD)
+    if _hermes_coding_team_guard_applies(normalized_query, query_tokens):
+        rules.append(HERMES_CODING_TEAM_GUARD)
+    if _coding_progress_status_guard_applies(normalized_query, query_tokens):
+        rules.append(CODING_PROGRESS_STATUS_GUARD)
+    if _release_claim_review_guard_applies(normalized_query, query_tokens):
+        rules.append(RELEASE_CLAIM_REVIEW_GUARD)
+    if _doctor_health_guard_applies(normalized_query, query_tokens):
+        rules.append(DOCTOR_HEALTH_GUARD)
+    if _executor_runtime_readiness_guard_applies(normalized_query, query_tokens):
+        rules.append(EXECUTOR_RUNTIME_READINESS_GUARD)
+    if _harness_session_inventory_guard_applies(normalized_query, query_tokens):
+        rules.append(HARNESS_SESSION_INVENTORY_GUARD)
+    if _memory_provider_lifecycle_guard_applies(normalized_query):
+        rules.append(MEMORY_PROVIDER_LIFECYCLE_GUARD)
+    if _provider_profile_posture_guard_applies(normalized_query):
+        rules.append(PROVIDER_PROFILE_POSTURE_GUARD)
+    if _toolbelt_readiness_guard_applies(normalized_query, query_tokens):
+        rules.append(TOOLBELT_READINESS_GUARD)
+    if (
+        not direct_coding_task_applies
+        and not feedback_before_coding_applies
+        and _connector_operator_guard_applies(normalized_query, query_tokens)
+    ):
+        rules.append(CONNECTOR_OPERATOR_GUARD)
+    if (
+        not direct_coding_task_applies
+        and not feedback_before_coding_applies
+        and _live_info_operator_guard_applies(normalized_query, query_tokens)
+    ):
+        rules.append(LIVE_INFO_OPERATOR_GUARD)
+    if (
+        not direct_coding_task_applies
+        and not feedback_before_coding_applies
+        and not workflow_learning_applies
+        and _media_input_operator_guard_applies(normalized_query, query_tokens)
+    ):
+        rules.append(MEDIA_INPUT_OPERATOR_GUARD)
+    if (
+        not direct_coding_task_applies
+        and not feedback_before_coding_applies
+        and _content_operator_guard_applies(normalized_query, query_tokens)
+    ):
+        rules.append(CONTENT_OPERATOR_GUARD)
+    if (
+        not direct_coding_task_applies
+        and not feedback_before_coding_applies
+        and _command_operator_guard_applies(normalized_query, query_tokens)
+    ):
+        rules.append(COMMAND_OPERATOR_GUARD)
+    if _voice_operator_guard_applies(normalized_query, query_tokens):
+        rules.append(VOICE_OPERATOR_GUARD)
+    if (
+        not direct_coding_task_applies
+        and not feedback_before_coding_applies
+        and not point_in_time_web_applies
+        and _browser_operator_guard_applies(normalized_query, query_tokens)
+    ):
+        rules.append(BROWSER_OPERATOR_GUARD)
+    if visual_summary_applies and not workflow_learning_applies:
+        rules.append(VISUAL_SUMMARY_GUARD)
+    if deliverable_package_applies:
+        rules.append(DELIVERABLE_PACKAGE_GUARD)
+    if _coding_handoff_status_guard_applies(
+        normalized_query,
+        query_tokens,
+        visual_summary_applies=visual_summary_applies,
+    ):
+        rules.append(CODING_HANDOFF_STATUS_GUARD)
+    if delivery_cycle_applies:
+        rules.append(DELIVERY_CYCLE_GUARD)
+    # Appended last on purpose: an explicit coding-agent name plus a delivery request
+    # outranks generic advisor and customer-signal routing, but never outranks a more
+    # specific lane that already claimed the message.
+    if named_coding_agent_delivery_applies:
+        rules.append(NAMED_CODING_AGENT_DELIVERY_GUARD)
+    # Truly last. The order of this list is precedence, not just presentation:
+    # the guarded fast path takes the FIRST entry, so a low `score_boost` alone
+    # does not make a guard a fallback. Registered mid-list, this one selected
+    # `deep-interview` for "...create a research brief" over `research-brief`,
+    # whose own guard sat two places behind it with a boost of 38. The creation
+    # shape is the weakest signal here; anything that claimed the message on
+    # actual vocabulary should be reached first.
+    if _greenfield_build_guard_applies(
+        normalized_query,
+        query_tokens,
+        direct_coding_task_applies=direct_coding_task_applies,
+    ):
+        rules.append(GREENFIELD_BUILD_GUARD)
+    return tuple(rules)
+
+
+def _risky_refactor_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _RISKY_REFACTOR_EXPLICIT_PHRASES):
+        return True
+    if not ({"refactor", "refactoring"} & query_tokens):
+        return False
+    if _RISKY_REFACTOR_TOKENS & query_tokens:
+        return True
+    return _contains_phrase(normalized_query, _RISKY_REFACTOR_RISK_PHRASES)
+
+
+def _product_shaping_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _delivery_cycle_terms(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _PRODUCT_SHAPING_PHRASES):
+        return True
+    product_context = bool(_PRODUCT_SHAPING_CONTEXT_TOKENS & query_tokens)
+    shaping_uncertainty = bool(_PRODUCT_SHAPING_UNCERTAINTY_TOKENS & query_tokens)
+    return product_context and shaping_uncertainty
+
+
+def _greenfield_build_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    direct_coding_task_applies: bool | None = None,
+) -> bool:
+    """"Build me an X" where X does not exist yet belongs in the interview lane.
+
+    `_direct_coding_task_guard_applies` reads as the lane for build requests, but
+    its `concrete_surface` set enumerates surfaces you EDIT - `navbar`, `readme`,
+    `variable`, `toggle` - not products you CREATE. So the product noun decided
+    the lane, and it decided arbitrarily: with the verb and sentence shape held
+    constant, `build a navbar` reached the delivery cycle at 44 while
+    `build a todo list`, `build a react app`, and `build a dashboard` all
+    collapsed to the generic picker at 4, because `navbar` is in the set and
+    `app` is not.
+
+    The fix is not a longer noun list. What actually separates the two is
+    whether the thing already exists: an edit request points at a surface the
+    repo can be read for, a creation request names something no amount of repo
+    inspection can answer. The second is the definition of a materially
+    ambiguous product request, which is what `deep-interview` is for.
+
+    `_GREENFIELD_POST_INIT_PHRASES` extends the same lane to "I just ran git
+    init, what now" - no build verb, but the same empty-surface shape: nothing
+    a repo read can answer, and a genuine clarification candidate rather than
+    the unrelated low-confidence guesses (ops review, research, code review)
+    a bare "what" otherwise scores against.
+    """
+    if direct_coding_task_applies is None:
+        direct_coding_task_applies = _direct_coding_task_guard_applies(normalized_query, query_tokens)
+    if direct_coding_task_applies:
+        return False
+    # An explicit delivery ask ("implement", "open a PR") means the caller has
+    # already decided; clarification would be a detour, not a service.
+    if _delivery_cycle_terms(normalized_query, query_tokens):
+        return False
+    # "how do I create a virtualenv" asks for instructions; the creation phrase
+    # is incidental to a question about how something is done.
+    if _contains_phrase(normalized_query, _GREENFIELD_QUESTION_OPENERS):
+        return False
+    creation_signal = _contains_phrase(normalized_query, _GREENFIELD_CREATION_PHRASES) or _contains_phrase(
+        normalized_query, _GREENFIELD_POST_INIT_PHRASES
+    )
+    if not creation_signal:
+        return False
+    # A referent that points back at existing work is an edit, however it is
+    # phrased: "make a copy of this file" is not a greenfield product request.
+    if _contains_phrase(normalized_query, _GREENFIELD_EXISTING_REFERENT_PHRASES):
+        return False
+    # An LLM wiki is a surface Hermes ships: its bundled `llm-wiki` skill builds
+    # one, so the request names what it wants and the turn asks instead of
+    # opening an interview (English already asked; Korean, which the weak-
+    # evidence check exempts, dispatched the interview on this guard alone).
+    if llm_wiki_request(normalized_query):
+        return False
+    return not bool(_GREENFIELD_OTHER_LANE_TOKENS & query_tokens)
+
+
+def _deep_interview_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _DEEP_INTERVIEW_PHRASES):
+        return True
+    interview = bool({"interview", "인터뷰"} & query_tokens)
+    clarify = bool({"clarify", "clarifying", "question", "questions", "질문"} & query_tokens)
+    before_plan = _contains_phrase(normalized_query, ("before planning", "before plan", "계획 전에", "플랜 전에"))
+    return (interview or clarify) and before_plan
+
+
+# The words of a message from its command verb on, after the courtesy openers
+# and the address to the assistant ("please", "can you", "omh", "hermes,") that
+# every reader of a request's opening strips (`request_lead.COURTESY_OPENERS`).
+# Used only to NARROW guards: an edit verb that is not the command verb does
+# not make a request an edit.
+def _command_words(normalized_query: str) -> list[str]:
+    return re.findall(r"[a-z0-9#][a-z0-9#+.-]*", after_courtesy(normalized_query.strip()))
+
+
+# Code-shaped objects: the nouns a code edit acts on. The direct code-edit
+# guard needs one; `_CODE_UNIT_TOKENS`, the units of source code among them,
+# is what the file-operation guard declines a file named by.
+_CODE_OBJECT_TOKENS = frozenset(
+    {
+        "api", "branch", "bug", "button", "class", "component", "config", "css", "file",
+        "function", "method", "module", "navbar", "readme", "route", "router", "settings", "test",
+        "tests", "toggle", "variable",
+    }
+)
+_CODE_UNIT_TOKENS = frozenset({"class", "component", "function", "method", "module", "variable"})
+_UI_BUILD_SURFACES = frozenset({"page", "pages", "screen", "screens", "sidebar", "dashboard", "form", "landing", "site", "website"})
+_DIRECT_CODING_EDIT_VERBS = frozenset(
+    {"add", "adjust", "build", "change", "delete", "edit", "fix", "implement", "make", "patch", "remove", "rename", "set", "tweak", "update"}
+)
+_CADENCE_TIME_WORDS = frozenset(
+    {
+        "morning", "evening", "night", "day", "weekday", "week", "month", "hour", "minute",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "am", "pm",
+    }
+)
+
+
+def has_cadence(normalized_query: str, query_tokens: set[str]) -> bool:
+    """A frequency word that schedules: daily/weekly alone, or every/each directly before a time."""
+    words = set(normalized_query.replace(",", " ").split()) | set(query_tokens)
+    if {"daily", "weekly", "monthly", "hourly", "nightly", "매일", "매주", "매월", "아침마다"} & words:
+        return True
+    sequence = normalized_query.replace(",", " ").split()
+    for index, word in enumerate(sequence[:-1]):
+        if word in {"every", "each"}:
+            following = sequence[index + 1]
+            if following in _CADENCE_TIME_WORDS or (following[:-2].isdigit() and following.endswith(("am", "pm"))):
+                return True
+    return False
+
+
+_CADENCE_ADVERBS = frozenset({"every", "each", "daily", "weekly", "monthly", "hourly", "nightly"})
+# Closed-class words that open a clause as its subject. A personal pronoun
+# makes the clause about a person (`I`, `we`); a possessive or an article opens
+# a noun phrase about a thing (`the report`, `our dashboard`). An imperative
+# opens on its verb instead.
+_PERSONAL_SUBJECTS = frozenset({"i", "we", "he", "she", "they", "you", "it"})
+_NOUN_PHRASE_OPENERS = frozenset(
+    {"my", "our", "his", "her", "their", "its", "the", "a", "an", "this", "that", "these", "those", "there"}
+)
+# A directive modal puts an obligation on the subject: `the report should go
+# out`. Said of a person it is advice or narration (`I should drink less`), so
+# it counts only on a noun-phrase subject.
+_DIRECTIVE_MODALS = frozenset({"should", "must"})
+_DIRECTIVE_MODAL_PAIRS = frozenset(
+    {("needs", "to"), ("need", "to"), ("has", "to"), ("have", "to"), ("is", "to"), ("are", "to")}
+)
+# A passive of a delivery verb (`gets sent`, `be emailed`) schedules a thing to
+# reach someone. Other passives (`the road is blocked`) describe a state.
+# Where the main clause ends: a subordinator or complementizer opens another
+# clause, and a reporting verb hands over to the clause it reports. A modal
+# past either belongs to that clause (`the team notices that karen should
+# call`), not to the thing the main clause is about.
+_CLAUSE_BOUNDARIES = frozenset(
+    {"that", "until", "because", "when", "while", "if", "unless", "after", "before", "since", "so"}
+)
+_REPORTING_VERBS = frozenset(
+    {"say", "says", "said", "notice", "notices", "noticed", "think", "thinks", "thought",
+     "feel", "feels", "felt", "know", "knows", "knew"}
+)
+_PASSIVE_AUXILIARIES = frozenset({"get", "gets", "got", "be", "is", "are", "being"})
+_DELIVERY_PARTICIPLES = frozenset(
+    {"sent", "emailed", "mailed", "posted", "delivered", "shared", "published", "forwarded"}
+)
+# A request put to the assistant in so many words, whatever the clause opens on.
+_REQUEST_FRAMES = (
+    "please", "can you", "could you", "would you", "will you", "i want", "we want", "i need", "we need",
+    "i would like", "i'd like", "remind me", "help me", "let us", "let's",
+)
+
+
+def is_cadence_phrase(phrase: str) -> bool:
+    """A phrase made only of a frequency and its time (`every morning`, `each monday`).
+
+    It says when something happens and nothing about what; `daily digest`
+    names a job and is not one.
+    """
+    words = normalized_phrase(phrase).split()
+    return (
+        bool(words)
+        and all(word in _CADENCE_ADVERBS or word in _CADENCE_TIME_WORDS for word in words)
+        and has_cadence(" ".join(words), set(words))
+    )
+
+
+def reads_as_a_request(message: str) -> bool:
+    """True when the message puts something to the assistant rather than reporting.
+
+    A request frame (`can you`, `remind me`) anywhere is a request. Otherwise
+    the main clause decides, after a courtesy opener and a leading cadence
+    (`every morning, ...`):
+
+    - an imperative opens on its verb: a request;
+    - a clause about a person (`every morning I ...`) is a report, even with a
+      modal (`I should really ...`);
+    - a clause about a thing (`the report ...`, `our snapshot ...`) is a
+      request only when it carries a directive modal (`should`, `needs to`)
+      or a passive of a delivery verb (`gets sent`) in its own main clause,
+      before any subordinator or reporting verb; otherwise it reports
+      (`each day the bus is late`).
+
+    A question is left to the rest of the router, which already reads it.
+    ASCII only: a message with no Latin words has no words here and reads as
+    no request, so callers must exempt non-ASCII input before asking.
+    """
+    normalized = normalized_phrase(message)
+    if "?" in message or contains_boundary_phrase(normalized, _REQUEST_FRAMES):
+        return True
+    words = _command_words(normalized)
+    while words and words[0] in _CADENCE_ADVERBS:
+        words = words[2:] if words[0] in {"every", "each"} else words[1:]
+    if not words or words[0] in _PERSONAL_SUBJECTS:
+        return False
+    if words[0] not in _NOUN_PHRASE_OPENERS:
+        return True
+    # Only the main clause. The opener itself may be `that` (`that report
+    # should ...`), so the cut starts after it.
+    for index in range(1, len(words)):
+        if words[index] in _CLAUSE_BOUNDARIES or words[index] in _REPORTING_VERBS:
+            words = words[:index]
+            break
+    pairs = list(zip(words, words[1:]))
+    return (
+        bool(_DIRECTIVE_MODALS & set(words))
+        or any(pair in _DIRECTIVE_MODAL_PAIRS for pair in pairs)
+        or any(first in _PASSIVE_AUXILIARIES and second in _DELIVERY_PARTICIPLES for first, second in pairs)
+    )
+
+
+def _direct_coding_task_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    visual_summary_applies: bool | None = None,
+) -> bool:
+    if _contains_phrase(
+        normalized_query,
+        (
+            "before coding",
+            "before code",
+            "before implementation",
+            "before writing code",
+            "repro plan before coding",
+            "reproduction plan before coding",
+            "구현 전에",
+            "코딩 전에",
+            # A check verb asks for verification, not an edit.
+            *_CHECK_REQUEST_PHRASES,
+        ),
+    ):
+        return False
+    # In English the edit verb must be the command verb, not a word further on
+    # ("compare how it looked before my CSS change" has no edit command).
+    edit_verbs = _DIRECT_CODING_EDIT_VERBS & query_tokens
+    # A delegation to a named coding agent ("have codex fix ...") puts the
+    # edit verb after the agent; that is still the command.
+    if normalized_query.isascii() and not _contains_named_coding_agent_phrase(normalized_query):
+        words = _command_words(normalized_query)
+        # The command verb, a verb introduced as the task ("use X to fix",
+        # "help me fix"), or a second command joined by "and"/"then".
+        commanded = set(words[:1]) | {words[i] for i in range(1, len(words)) if words[i - 1] in {"to", "me", "and", "then"}}
+        edit_verbs = edit_verbs & commanded
+    if normalized_query.isascii():
+        # "set up" is setup, not an edit; building a new page or screen is a
+        # frontend build; and a question about what a named coding agent can
+        # do asks nothing to be changed.
+        if _contains_phrase(normalized_query, ("set up", "setup")) and not (_CODE_OBJECT_TOKENS - {"api"}) & query_tokens:
+            edit_verbs = edit_verbs - {"set"}
+        if edit_verbs & {"build", "create"} and _UI_BUILD_SURFACES & query_tokens:
+            edit_verbs = edit_verbs - {"build", "create"}
+        if normalized_query.lstrip().startswith(_AGENT_CAPABILITY_QUESTION_OPENERS) and _contains_named_coding_agent_phrase(
+            normalized_query
+        ):
+            edit_verbs = set()
+    action = bool(edit_verbs) or _contains_phrase(
+        normalized_query,
+        (
+            "바꿔",
+            "고쳐",
+            "수정",
+            "추가",
+            "구현",
+            "개선",
+            "삭제",
+            "제거",
+            "변경",
+            "넣어",
+            "만들어",
+        ),
+    )
+    if not action:
+        return False
+    if _workspace_file_operator_guard_applies(normalized_query, query_tokens):
+        return False
+
+    # The object must be code-shaped. Everyday nouns that also name a
+    # document or UI surface (`style`, `title`, `mode`, `docs`, `login`,
+    # `log`, `output`, `setup`, `ux`) made "make the slide title shorter" or
+    # "update the style of this memo" a one-cycle code edit; they still count
+    # inside the phrases below ("dark mode", "readme title", "login bug",
+    # "setup log"). `setting` is the verb in "setting up", and `api` counts
+    # only as an API, not as an API key.
+    object_tokens = (
+        query_tokens - {"api"} if _contains_phrase(normalized_query, ("api key", "api keys")) else query_tokens
+    )
+    concrete_surface = bool(
+        (_CODE_OBJECT_TOKENS | {"로그", "출력", "테스트"})
+        & object_tokens
+    ) or _contains_phrase(
+        normalized_query,
+        (
+            "button color",
+            "dark mode",
+            "settings button",
+            "navbar",
+            "readme title",
+            "rename this variable",
+            "setup log",
+            "setup logs",
+            "setup output",
+            "setup ux",
+            "test passes",
+            "tests pass",
+            "until tests pass",
+            "login bug",
+            "버튼 색",
+            "버그 고쳐",
+            "다크모드",
+            "토글 추가",
+            "readme 제목",
+            "리드미 제목",
+            "변수명",
+            "setup 로그",
+            "setup 출력",
+            "셋업 로그",
+            "셋업 출력",
+            "테스트 통과",
+            "통과할때까지",
+            "통과할 때까지",
+        ),
+    )
+    if not concrete_surface:
+        return False
+
+    review_only = _contains_phrase(
+        normalized_query,
+        (
+            "claim matches",
+            "review before release",
+            "before release",
+            "릴리즈 전에",
+            "주장과 실제",
+            "맞는지 검토",
+        ),
+    )
+    if review_only:
+        return False
+
+    if _cached_visual_summary_applies(normalized_query, query_tokens, visual_summary_applies):
+        return False
+    if _materials_package_guard_applies(
+        normalized_query,
+        query_tokens,
+        visual_summary_applies=visual_summary_applies,
+    ):
+        return False
+    if _source_finder_guard_applies(
+        normalized_query,
+        query_tokens,
+        visual_summary_applies=visual_summary_applies,
+    ):
+        return False
+    if _paper_learning_guard_applies(
+        normalized_query,
+        query_tokens,
+        visual_summary_applies=visual_summary_applies,
+    ):
+        return False
+    if _github_event_ops_guard_applies(normalized_query, query_tokens):
+        return False
+    if _coding_progress_status_guard_applies(normalized_query, query_tokens):
+        return False
+    if _release_claim_review_guard_applies(normalized_query, query_tokens):
+        return False
+    if _doctor_health_guard_applies(normalized_query, query_tokens):
+        return False
+    if _safe_feature_plan_guard_applies(normalized_query, query_tokens):
+        return False
+    if _risky_refactor_guard_applies(normalized_query, query_tokens):
+        return False
+    if _cleanup_refactor_guard_applies(normalized_query, query_tokens):
+        return False
+    return True
+
+
+_REPLY_VERBS = frozenset({"reply", "respond", "answer", "apologize", "apologise"})
+_FILING_TARGETS = frozenset({"ticket", "tickets", "jira", "linear", "issue", "github"})
+_FILING_ACTIONS = frozenset({"turn", "file", "open", "create", "log", "raise", "put"})
+
+
+def _feedback_before_coding_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    direct_coding_task_applies: bool | None = None,
+    named_coding_agent_delivery_applies: bool | None = None,
+) -> bool:
+    if _explicit_executor_delegation_requested(normalized_query, query_tokens):
+        return False
+    if named_coding_agent_delivery_applies is None:
+        named_coding_agent_delivery_applies = named_coding_agent_delivery_requested(normalized_query, query_tokens)
+    # A named coding agent plus a delivery request outranks generic issue/bug wording, but
+    # an explicit customer-report phrase is still real feedback that must be triaged first.
+    if named_coding_agent_delivery_applies and not _contains_phrase(normalized_query, _FEEDBACK_TRIAGE_PHRASES):
+        return False
+    if _contains_phrase(normalized_query, BROWSER_VISUAL_QA_PHRASES) and not _contains_phrase(
+        normalized_query,
+        CUSTOMER_SYMPTOM_REPORT_PHRASES,
+    ):
+        return False
+    if _gateway_intent_guard_applies(normalized_query, query_tokens):
+        return False
+    if _github_event_ops_guard_applies(normalized_query, query_tokens):
+        return False
+    if _doctor_health_guard_applies(normalized_query, query_tokens):
+        return False
+    if direct_coding_task_applies is None:
+        direct_coding_task_applies = _direct_coding_task_guard_applies(normalized_query, query_tokens)
+    if direct_coding_task_applies:
+        return False
+    planning_before_coding = _contains_phrase(
+        normalized_query,
+        ("before coding", "before code", "before implementation", "before writing code", "구현 전에", "코딩 전에"),
+    )
+    if _explicit_delivery_or_implementation_requested(normalized_query, query_tokens) and not planning_before_coding:
+        return False
+    # Answering the customer is support, and turning a report into a ticket
+    # or an issue is filing; triage is deciding what the report means.
+    if _REPLY_VERBS & query_tokens or (_FILING_TARGETS & query_tokens and _FILING_ACTIONS & query_tokens):
+        return False
+    # A test command is QA, and memory that grows or leaks is performance.
+    if _command_words(normalized_query)[:1] == ["test"]:
+        return False
+    if "memory" in query_tokens and (_SYSTEM_MEMORY_WORDS | {"grow", "grows", "growing"}) & query_tokens:
+        return False
+    if _contains_phrase(normalized_query, _FEEDBACK_TRIAGE_PHRASES):
+        return True
+    source_signal = bool(_FEEDBACK_TRIAGE_SOURCE_TOKENS & query_tokens)
+    product_context = bool(_FEEDBACK_TRIAGE_PRODUCT_TOKENS & query_tokens)
+    issue_signal = bool(_FEEDBACK_TRIAGE_ISSUE_TOKENS & query_tokens)
+    decision_signal = bool(_FEEDBACK_TRIAGE_DECISION_TOKENS & query_tokens)
+    # A product noun beside a defect noun is a topic, not a report: nobody in
+    # it handed anything over. It stands in for a report only while the
+    # message is not itself a command to change something -- "fix the crash
+    # in checkout" asks for the edit, whoever turns out to own it. A named
+    # reporter (`users`, `customer`) or a feedback phrase stays a report.
+    command = _command_words(normalized_query)[:1] if normalized_query.isascii() else []
+    commanded_edit = bool(command) and command[0] in _DIRECT_CODING_EDIT_VERBS
+    return (source_signal and (issue_signal or decision_signal)) or (
+        product_context and issue_signal and not commanded_edit
+    )
+
+
+def _workflow_learning_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _WORKFLOW_LEARNING_PHRASES):
+        return True
+    codegraph_refresh_signal = bool({"codegraph", "codemap", "codemaps", "코드그래프", "코드맵"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        (
+            "codegraph refresh",
+            "refresh codegraph",
+            "refresh the codegraph",
+            "update codegraph",
+            "update the codegraph",
+            "update codemaps",
+            "refresh codemap",
+            "code map",
+            "stale code index",
+            "refresh code index",
+            "codegraph index",
+            "codemap index",
+            "코드그래프 갱신",
+            "코드맵 갱신",
+            "코드 인덱스 갱신",
+        ),
+    )
+    explicit_learning_signal = bool({"learn", "learning", "regression", "회귀", "학습"} & query_tokens)
+    if codegraph_refresh_signal and not explicit_learning_signal:
+        return False
+    capability_terms = bool({"learning", "trace", "eval", "regression", "patch"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        (
+            "workflow learning",
+            "workflow trace",
+            "skill patch",
+            "routing regression",
+            "route regression",
+        ),
+    )
+    if _omh_capability_question(normalized_query) and capability_terms:
+        return True
+    learning = bool({"learn", "learning", "학습"} & query_tokens)
+    workflow_or_skill = bool({"workflow", "run", "trace", "skill", "routing", "route", "워크플로우", "스킬", "라우팅"} & query_tokens)
+    future_improvement = bool({"improve", "improvement", "next", "future", "regression", "개선", "회귀"} & query_tokens)
+    feedback_action = bool(_WORKFLOW_LEARNING_ACTION_TOKENS & query_tokens)
+    if learning and workflow_or_skill and feedback_action:
+        return True
+    if future_improvement and workflow_or_skill and bool(_WORKFLOW_LEARNING_CONTEXT_TOKENS & query_tokens):
+        return True
+    return False
+
+
+def _omh_quality_improvement_guard_applies(normalized_query: str) -> bool:
+    return classify_omh_quality_intent(normalized_query).applies
+
+
+def _safe_feature_plan_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    safe_signal = bool({"safe", "safely", "safety", "안전", "안전하게"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("safe feature", "safely add a feature", "safe plan", "안전하게 기능", "안전한 기능"),
+    )
+    feature_change = bool({"feature", "features", "기능"} & query_tokens) and (
+        bool({"add", "implement", "change", "build", "추가", "구현"} & query_tokens)
+        or _contains_phrase(normalized_query, ("add a feature", "feature change", "기능 추가", "기능 안전하게 넣"))
+    )
+    scope_or_handoff = bool({"repo", "repository", "handoff", "plan", "codebase", "executor"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("this repo", "this repository", "before handoff", "request-to-handoff", "코드베이스", "핸드오프"),
+    )
+    return safe_signal and feature_change and (
+        scope_or_handoff
+        or _contains_phrase(
+            normalized_query,
+            (
+                "safely add a feature",
+                "add a feature safely",
+                "feature safely",
+                "safe feature",
+                "안전하게 기능",
+                "안전한 기능",
+                "기능 안전하게",
+            ),
+        )
+    )
+
+
+def _persistent_completion_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    completion = _contains_phrase(
+        normalized_query,
+        (
+            "finish until",
+            "until done",
+            "until the smoke test passes",
+            "until smoke test passes",
+            "until the test passes",
+            "until tests pass",
+            "until a blocker",
+            "or a blocker is recorded",
+            "blocker is recorded",
+        ),
+    )
+    pass_or_block = bool({"pass", "passes", "blocker", "blocked", "done"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("smoke test", "stop condition", "completion owner", "완료될 때까지", "막히면"),
+    )
+    return completion and pass_or_block
+
+
+def _research_brief_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    compare = bool({"compare", "comparison", "benchmark", "evaluate", "vendors", "vendor"} & query_tokens)
+    evidence = bool({"notes", "evidence", "confidence", "gaps", "sources", "customer"} & query_tokens)
+    research_subject = bool({"vendor", "vendors", "market", "competitor", "analytics", "customer"} & query_tokens)
+    phrase = _contains_phrase(
+        normalized_query,
+        (
+            "compare three",
+            "compare vendors",
+            "compare products",
+            "using customer notes",
+            "confidence gaps",
+            "research brief",
+        ),
+    )
+    business_subject = bool({"vendor", "vendors", "market", "competitor", "analytics"} & query_tokens)
+    if phrase:
+        return True
+    if _research_department_guard_applies(normalized_query, query_tokens):
+        return False
+    return (compare and research_subject and evidence) or (compare and business_subject)
+
+
+def _strategy_brief_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    # Deciding which features go on a roadmap is product planning, and a brief
+    # on a market is research; the strategy lane is business positioning.
+    if {"feature", "features", "roadmap", "backlog"} & query_tokens:
+        return False
+    if {"market", "markets", "competitors", "competitor"} & query_tokens and {"brief", "overview", "summary"} & query_tokens:
+        return False
+    if _contains_phrase(
+        normalized_query,
+        (
+            "strategy report",
+            "strategy brief",
+            "strategy memo",
+            "research into a strategy report",
+            "turn this research into a strategy report",
+            "조사해서 전략 보고서",
+            "전략 보고서",
+            "전략 리포트",
+            "전략 브리프",
+            "전략 메모",
+        ),
+    ):
+        return True
+    strategy_action = bool({"decide", "prioritize", "strategy", "positioning", "choose"} & query_tokens)
+    business_target = bool(
+        {
+            "buyers",
+            "segments",
+            "enterprise",
+            "founders",
+            "market",
+            "onboarding",
+            "pricing",
+            "positioning",
+            "roadmap",
+        }
+        & query_tokens
+    )
+    tradeoff = _contains_phrase(
+        normalized_query,
+        ("whether", "or", "rather than", "prioritize", "decide whether", "전략", "우선순위", "결정"),
+    )
+    return strategy_action and business_target and tradeoff
+
+
+def _app_delivery_loop_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    idea = "idea" in query_tokens or _contains_phrase(normalized_query, ("this idea", "feature idea", "제품 아이디어"))
+    path = _contains_phrase(
+        normalized_query,
+        (
+            "scoped plan",
+            "implementation handoff",
+            "qa gate",
+            "release path",
+            "idea to deploy",
+            "idea-to-deploy",
+        ),
+    )
+    delivery_terms = len({"plan", "handoff", "qa", "release", "deploy"} & query_tokens) >= 3
+    if idea and (path or delivery_terms):
+        return True
+    return _greenfield_project_bootstrap_requested(normalized_query, query_tokens)
+
+
+def _greenfield_project_bootstrap_requested(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(
+        normalized_query,
+        (
+            "bootstrap the project",
+            "bootstrap this project",
+            "bootstrap a new project",
+            "bootstrap this repo",
+            "bootstrap a new repo",
+            "scaffold a new project",
+            "scaffold this project",
+            "set up a new repo",
+            "set up a new repository",
+        ),
+    ):
+        return True
+    # A fully-specified bootstrap-file ask ("add a LICENSE and .gitignore to
+    # this project", "create a new repo with README, LICENSE and CI") already
+    # names what it wants; nothing about it is materially ambiguous, so it
+    # dispatches straight to the delivery loop's bootstrap pass instead of
+    # detouring through deep-interview. Requiring an add/create/set-up action
+    # phrase keeps a single-file edit ("add this rule to .gitignore") or a
+    # troubleshooting/concept question ("why does my .gitignore not work",
+    # "explain what a LICENSE file is") from ever reaching this branch.
+    if not _contains_phrase(normalized_query, _PROJECT_BOOTSTRAP_ACTION_PHRASES):
+        return False
+    if len(_PROJECT_BOOTSTRAP_FILE_NOUN_TOKENS & query_tokens) >= 2:
+        return True
+    # A generic "standard project files" ask names no file by noun, but paired
+    # with an explicitly empty/new/bare repo it is just as concrete.
+    return _contains_phrase(normalized_query, _PROJECT_BOOTSTRAP_GENERIC_FILE_PHRASES) and _contains_phrase(
+        normalized_query, _PROJECT_BOOTSTRAP_EMPTY_REPO_PHRASES
+    )
+
+
+def _cto_loop_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, ("cto loop", "cto-loop", "cto operating model")):
+        return True
+    role_names = ("pm", "cto", "dev", "qa", "security", "ops")
+    named_roles = {role for role in role_names if role in query_tokens or _contains_phrase(normalized_query, (role,))}
+    launch_or_risk = bool({"launch", "release", "billing", "risky", "risk"} & query_tokens)
+    loop = "loop" in query_tokens or _contains_phrase(normalized_query, ("operating loop", "leadership loop"))
+    return len(named_roles) >= 4 and loop and launch_or_risk
+
+
+def _adversarial_qa_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    # A question about what a named coding agent can do is not a QA run.
+    if normalized_query.lstrip().startswith(_AGENT_CAPABILITY_QUESTION_OPENERS) and _contains_named_coding_agent_phrase(
+        normalized_query
+    ):
+        return False
+    qa_context = bool({"test", "tests", "qa", "wizard"} & query_tokens)
+    adversarial = bool({"hostile", "adversarial", "stale", "missing", "invalid", "broken"} & query_tokens)
+    scenario_phrase = _contains_phrase(
+        normalized_query,
+        (
+            "hostile install",
+            "hostile paths",
+            "stale config",
+            "missing path",
+            "missing PATH",
+            "adversarial qa",
+            "hostile cases",
+            "qa scenario",
+            "user qa scenario",
+            "actual user qa",
+            "실제 사용자처럼 qa",
+            "qa 시나리오",
+            "사용자처럼 qa",
+            "실제 사용자처럼 테스트",
+        ),
+    )
+    if scenario_phrase:
+        return True
+    return qa_context and adversarial
+
+
+# Token and cost usage said in Korean. `ko.json` gives this card no bare 토큰 or
+# 비용 trigger -- they dispatched it for an auth token's storage and for the cost
+# of a function call -- so these phrases carry the usage reading. Unlike the
+# phrases above, each is read as a whole word ("토큰 소비" is not "토큰 소비자"),
+# and only in a sentence shaped like a look at the usage
+# (`_KOREAN_USAGE_REPORT_PREDICATES`), as the English token arm needs a status
+# or runtime word.
+_OPS_OBSERVABILITY_KOREAN_USAGE_PHRASES = tuple(
+    normalized_phrase(phrase)
+    for phrase in ("토큰 사용량", "토큰 사용 추이", "토큰 소모", "토큰 소모량", "토큰 소비", "토큰 소비량", "비용 모니터링")
+)
+# The final predicates a usage phrase counts under, each read as the start of
+# the sentence's final predicate ("보여주세요", "확인해줘"):
+#   보여, 알려 -- show me, tell me: ask for the figures;
+#   확인, 비교, 모니터링, 추적 -- check, compare, monitor, track: ask to look
+#     at them;
+#   얼마, 어때 -- how much, how is it: ask about the amount;
+#   리포트 -- the report itself, said as the last word;
+#   많, 빨라 -- is a lot, is fast: say how large the usage is, the Korean shape
+#     of "too many tokens".
+# 요약 (summarize) is not listed: the token arm below already reads it as a
+# status word, beside the 토큰 or 비용 every usage phrase carries. Every other
+# final predicate leaves the phrase uncounted: work (만들어줘, 추가해줘, 고쳐줘,
+# 파싱해줘, 구현해줘, 짜줘, 줄여줘, 정리해줘, which also means "clean up") and any
+# other question shape (어떻게 돼?, 궁금해) alike. Only the final predicate is
+# read: "기능별" and "함수별" earlier in the sentence modify the usage asked about.
+_KOREAN_USAGE_REPORT_PREDICATES = tuple(
+    normalized_phrase(stem)
+    for stem in ("보여", "알려", "확인", "비교", "모니터링", "추적", "얼마", "어때", "리포트", "많", "빨라")
+)
+# Last words that only finish the word before them, matched whole: 해 said
+# apart from its noun ("모니터링 해줘", "추적 해 줘") and 나왔/나와 after an amount
+# ("얼마 나왔어", "많이 나와"). A longer word that merely starts the same way is a
+# predicate of its own: 해제해줘 (turn off), 해결, 하지마 (don't).
+_KOREAN_PREDICATE_TAILS = frozenset(
+    normalized_phrase(tail)
+    for tail in (
+        "해", "해요", "해줘", "해줘요", "해주세요", "해줄래", "해줄래요", "해봐", "해봐요", "하세요",
+        "나왔어", "나왔어요", "나왔나", "나왔니", "나와", "나와요",
+    )
+)
+# The auxiliary 주다 written apart from its verb, the standard spelling ("보여
+# 주세요", "알려 줘", "확인해 주세요", "추적 해 줘"): the word before it is the
+# predicate, whatever it is, and the report check reads that word.
+_KOREAN_SPLIT_REQUEST_ENDINGS = frozenset(
+    normalized_phrase(ending) for ending in ("줘", "줘요", "주세요", "줄래", "줄래요")
+)
+_KOREAN_SENTENCE_END_PUNCTUATION = " ?!.~…"
+# What may follow a Korean word without making it a longer one: a noun
+# particle that ends there ("소비가", not "소비가격"), or 하/해 making it a verb
+# ("모니터링해줘", "소비하는").
+_KOREAN_WORD_PARTICLES = tuple(normalized_phrase(particle) for particle in KOREAN_NOUN_PARTICLES)
+_KOREAN_VERBALIZERS = tuple(normalized_phrase(verbalizer) for verbalizer in ("하", "해"))
+
+
+def _is_hangul(character: str) -> bool:
+    # Folded text carries conjoining jamo; composed syllables are checked too.
+    return "\u1100" <= character <= "\u11ff" or "\uac00" <= character <= "\ud7a3"
+
+
+def _korean_word_ends_at(normalized_query: str, end: int) -> bool:
+    rest = normalized_query[end:]
+    if not rest or not _is_hangul(rest[0]) or rest.startswith(_KOREAN_VERBALIZERS):
+        return True
+    for particle in _KOREAN_WORD_PARTICLES:
+        if rest.startswith(particle):
+            after = rest[len(particle):]
+            if not after or not _is_hangul(after[0]):
+                return True
+    return False
+
+
+def _korean_final_predicate(words: list[str]) -> str:
+    if len(words) > 1 and words[-1] in _KOREAN_SPLIT_REQUEST_ENDINGS:
+        words = words[:-1]
+    if len(words) > 1 and words[-1] in _KOREAN_PREDICATE_TAILS:
+        return words[-2]
+    return words[-1] if words else ""
+
+
+def _korean_usage_request(normalized_query: str) -> bool:
+    """A Korean usage phrase in a sentence that asks to see the usage.
+
+    The phrase counts when the sentence's final predicate is a report form
+    (`_KOREAN_USAGE_REPORT_PREDICATES`), or when the sentence ends on the
+    phrase itself ("이번 주 토큰 사용량", "토큰 사용량은?"), a noun-phrase question.
+    """
+    text = normalized_query.rstrip(_KOREAN_SENTENCE_END_PUNCTUATION)
+    last_word_start = text.rfind(" ") + 1
+    asks_to_see = _korean_final_predicate(text.split()).startswith(_KOREAN_USAGE_REPORT_PREDICATES)
+    for phrase in _OPS_OBSERVABILITY_KOREAN_USAGE_PHRASES:
+        start = text.find(phrase)
+        while start != -1:
+            end = start + len(phrase)
+            if _korean_word_ends_at(text, end) and (asks_to_see or end > last_word_start):
+                return True
+            start = text.find(phrase, start + 1)
+    return False
+
+
+def _ops_observability_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _public_plugin_connector_readiness_requested(normalized_query):
+        return False
+    operator_context = _contains_phrase(normalized_query, _OPS_OBSERVABILITY_OPERATOR_CONTEXT) or _contains_phrase(
+        normalized_query,
+        PUBLIC_PLUGIN_CONNECTOR_ALIAS_PHRASES,
+    )
+    if ops_observability_external_blocked(normalized_query):
+        return False
+    if _contains_phrase(normalized_query, _OPS_OBSERVABILITY_PHRASES):
+        return True
+    if _korean_usage_request(normalized_query):
+        return True
+    telemetry = bool(_OPS_OBSERVABILITY_TOKENS & query_tokens)
+    runtime_context = operator_context
+    # No "알려줘" here: it is Korean's ordinary "tell me", which the English list
+    # does not carry either, and with it any 토큰 or 비용 question ("토큰 저장
+    # 방식 알려줘", "이 알고리즘 시간 비용 알려줘") read as a usage report.
+    status_intent = _contains_phrase(
+        normalized_query,
+        ("status", "show", "report", "summary", "보여줘", "상태", "요약"),
+    )
+    if ops_observability_generic_metrics_blocked(normalized_query, query_tokens):
+        return False
+    return telemetry and (runtime_context or status_intent)
+
+
+def ops_observability_external_blocked(normalized_query: str) -> bool:
+    if _contains_phrase(normalized_query, _OPS_OBSERVABILITY_CONNECTOR_READINESS_BLOCKERS):
+        return True
+    blocker_override_context = _contains_phrase(normalized_query, _OPS_OBSERVABILITY_BLOCKER_OVERRIDE_CONTEXT)
+    return _contains_phrase(normalized_query, _OPS_OBSERVABILITY_EXTERNAL_BLOCKERS) and not blocker_override_context
+
+
+def ops_observability_generic_metrics_blocked(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _OPS_OBSERVABILITY_OPERATOR_CONTEXT) or _contains_phrase(
+        normalized_query,
+        PUBLIC_PLUGIN_CONNECTOR_ALIAS_PHRASES,
+    ):
+        return False
+    generic_metrics_only = bool(_OPS_OBSERVABILITY_GENERIC_METRIC_TOKENS & query_tokens) and not bool(
+        (_OPS_OBSERVABILITY_TOKENS - _OPS_OBSERVABILITY_GENERIC_METRIC_TOKENS) & query_tokens
+    )
+    status_intent = _contains_phrase(
+        normalized_query,
+        ("status", "show", "report", "summary", "보여줘", "알려줘", "상태", "요약"),
+    )
+    return generic_metrics_only and status_intent
+
+
+def _cleanup_refactor_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    cleanup = bool({"cleanup", "clean", "remove", "dedupe", "deduplicate", "simplify", "refactor", "refactoring"} & query_tokens)
+    code_surface = bool({"code", "router", "routing", "branches", "implementation"} & query_tokens)
+    behavior_lock = bool({"regression", "tests", "test", "behavior"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("lock behavior", "regression tests", "before refactoring"),
+    )
+    phrase = _contains_phrase(
+        normalized_query,
+        ("remove duplicated", "remove duplicate", "clean up duplicated", "cleanup duplicated", "duplicated router"),
+    )
+    return (cleanup or phrase) and code_surface and behavior_lock
+
+
+def _durable_research_goal_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    durable = _contains_phrase(
+        normalized_query,
+        (
+            "keep researching",
+            "continue researching",
+            "until the evidence gaps are closed",
+            "until evidence gaps are closed",
+            "evidence gaps are closed or logged",
+            "durable research",
+        ),
+    )
+    research = bool({"research", "researching", "evidence", "gaps", "sources"} & query_tokens)
+    stop_condition = _contains_phrase(normalized_query, ("until", "closed or logged", "checkpoint", "stop condition"))
+    return durable and research and stop_condition
+
+
+def _loop_goal_guard_applies(
+    normalized_query: str, query_tokens: set[str], loop_timer: str = LOOP_TIMER_NONE
+) -> bool:
+    # A loop on a timer is Hermes' native `/loop`, and a code or media loop on
+    # one is a question about it; neither is the goal loop, whatever goal words
+    # the prompt carries ("/loop 30m keep improving the docs until the repo
+    # hits 10k stars" is the command the person typed). The verdict
+    # (`hermes_session_commands.loop_timer_verdict`) is read once on the
+    # query's executable text and handed in, never re-derived from this
+    # collapsed spelling, where a gateway's block ends are single spaces.
+    if loop_timer in LOOP_TIMERS_ANSWERED_DIRECTLY:
+        return False
+    explicit_loop = "loop" in query_tokens or _contains_phrase(
+        normalized_query,
+        ("loopable", "loop engineering", "goal loop", "루프", "반복해서", "계속 개선", "계속해서 개선"),
+    )
+    repeated_improvement = bool(LOOP_REPEATED_IMPROVEMENT_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, LOOP_REPEATED_IMPROVEMENT_PHRASES
+    )
+    product_or_oss_goal = bool(LOOP_PRODUCT_GOAL_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, LOOP_PRODUCT_GOAL_PHRASES
+    )
+    north_star = bool(LOOP_NORTH_STAR_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, LOOP_NORTH_STAR_PHRASES
+    )
+    observability_context = bool(
+        {
+            "token",
+            "tokens",
+            "cost",
+            "latency",
+            "history",
+            "telemetry",
+            "observability",
+            "usage",
+            "비용",
+            "지연시간",
+            "토큰",
+            "관측성",
+        }
+        & query_tokens
+    ) or _contains_phrase(
+        normalized_query,
+        ("run history", "token cost", "cost latency", "루프 비용", "지연시간 상태", "비용이랑 지연시간"),
+    )
+    if explicit_loop and observability_context and not (north_star or repeated_improvement):
+        return False
+    if is_explicit_one_off_request(normalized_query, query_tokens) and not (explicit_loop or repeated_improvement or north_star):
+        return False
+    return explicit_loop or (repeated_improvement and (product_or_oss_goal or north_star)) or (north_star and product_or_oss_goal)
+
+
+def _scheduled_ops_blueprint_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if is_explicit_one_off_request(normalized_query, query_tokens):
+        return False
+    # A digest of the user's own mail, inbox, or calendar is the morning
+    # brief's job, not a generic scheduled blueprint.
+    if {"inbox", "mail", "email", "emails", "calendar"} & query_tokens and {"brief", "digest", "summary", "summarize", "recap"} & query_tokens:
+        return False
+    if _SCHEDULED_OPS_EXPLICIT_TOKENS & query_tokens:
+        return True
+    # `recurring` and `repeat` describe a thing as often as they schedule one
+    # (recurring themes, repeat an answer); alone they no longer claim a
+    # scheduled job.
+    if _SCHEDULED_OPS_STRONG_TOKENS & query_tokens and (
+        _SCHEDULED_OPS_CADENCE_TOKENS & query_tokens or _SCHEDULED_OPS_CONTEXT_TOKENS & query_tokens
+    ):
+        return True
+    if _SCHEDULED_OPS_CADENCE_TOKENS & query_tokens and _SCHEDULED_OPS_CONTEXT_TOKENS & query_tokens:
+        return True
+    return _contains_phrase(normalized_query, _SCHEDULED_OPS_PHRASES)
+
+
+def _explicit_scheduled_ops_blueprint_requested(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _EXPLICIT_SCHEDULED_OPS_BLUEPRINT_PHRASES):
+        return True
+    if _contains_phrase(normalized_query, ("automate this", "automate workflow", "자동화해줘", "자동화 해줘")):
+        return True
+    if _SCHEDULED_OPS_STRONG_TOKENS & query_tokens and (
+        _SCHEDULED_OPS_CADENCE_TOKENS & query_tokens or _SCHEDULED_OPS_CONTEXT_TOKENS & query_tokens
+    ):
+        return True
+    blueprint = "blueprint" in query_tokens
+    scheduled_context = bool(_SCHEDULED_OPS_STRONG_TOKENS & query_tokens) or bool(
+        _SCHEDULED_OPS_CADENCE_TOKENS & query_tokens
+    )
+    return blueprint and scheduled_context
+
+
+def _jit_learn_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    # Sibling boundaries are checked before positive cues where the same words
+    # can name both jobs. A sequenced curriculum always belongs to curriculum
+    # design; an explicit immediate-learning question can still use an incident
+    # as context, but studying an incident artifact is investigation, not target
+    # selection.
+    if _contains_phrase(normalized_query, JIT_LEARN_CURRICULUM_EXCLUSION_PHRASES):
+        return False
+    if _contains_phrase(normalized_query, _JIT_LEARN_PHRASES):
+        return True
+    incident_artifact = _contains_phrase(
+        normalized_query,
+        _JIT_LEARN_INCIDENT_ARTIFACT_PHRASES,
+    )
+    incident_investigation = bool(
+        _JIT_LEARN_INCIDENT_INVESTIGATION_TOKENS & query_tokens
+    ) or _contains_phrase(normalized_query, _JIT_LEARN_INCIDENT_LESSON_PHRASES)
+    if incident_artifact and incident_investigation:
+        return False
+    if not bool(_JIT_LEARN_LEARNING_TOKENS & query_tokens):
+        return False
+    resource_kinds = sum(
+        1 for group in _JIT_LEARN_RESOURCE_TOKEN_GROUPS if bool(group & query_tokens)
+    )
+    immediacy = _contains_phrase(normalized_query, _JIT_LEARN_IMMEDIACY_PHRASES)
+    application = _contains_phrase(normalized_query, _JIT_LEARN_APPLICATION_PHRASES)
+    # Two or more of the requested formats plus a live application window is the
+    # well-formed request; immediacy plus a stated application is the
+    # under-specified one. Either way the user is choosing what to learn now.
+    if resource_kinds >= 2 and (immediacy or application):
+        return True
+    return immediacy and application
+
+
+def _paper_learning_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    visual_summary_applies: bool | None = None,
+) -> bool:
+    if _cached_visual_summary_applies(normalized_query, query_tokens, visual_summary_applies):
+        return False
+    if _explicit_material_export_requested(normalized_query, query_tokens):
+        return False
+    if _paper_validation_or_citation_requested(normalized_query, query_tokens):
+        return False
+    if _source_finder_explicit_acquisition_requested(normalized_query, query_tokens):
+        return False
+    if _scheduled_ops_blueprint_guard_applies(normalized_query, query_tokens):
+        recurring_paper_ops = bool(_PAPER_LEARNING_PAPER_TOKENS & query_tokens) or _contains_phrase(
+            normalized_query, ("paper", "논문")
+        )
+        if recurring_paper_ops and not bool(_PAPER_LEARNING_EXPLANATION_TOKENS & query_tokens):
+            return False
+    if _contains_phrase(normalized_query, _PAPER_LEARNING_PHRASES):
+        return True
+    paper_context = bool((_PAPER_LEARNING_PAPER_TOKENS - {"research"}) & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("research paper", "arxiv paper", "paper pdf", "pdf paper", "논문 pdf"),
+    )
+    explanation_context = bool(_PAPER_LEARNING_EXPLANATION_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        (
+            "explain",
+            "understand",
+            "teach me",
+            "learn this",
+            "walk through",
+            "walkthrough",
+            "without dropping details",
+            "내용 줄이지",
+            "설명해줘",
+            "해설해줘",
+            "이해하고 싶",
+        ),
+    )
+    supplied_pdf_context = (
+        bool({"pdf", "피디에프"} & query_tokens)
+        and not bool({"ppt", "pptx", "deck", "slides", "피피티", "슬라이드", "덱"} & query_tokens)
+        and not _contains_phrase(
+            normalized_query,
+            (
+                "pdf deck",
+                "pdf slide",
+                "pdf slide deck",
+                "pdf report",
+                "pdf를 ppt",
+                "pdf를 ppt로",
+                "pdf to ppt",
+                "pdf into ppt",
+            ),
+        )
+    )
+    search_only = bool({"find", "search", "latest", "current", "fresh"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("find papers", "search papers", "latest papers", "current papers", "논문 찾아", "최신 논문"),
+    )
+    capability_question = _omh_capability_question(normalized_query) and not _source_acquisition_capability_context(
+        normalized_query, query_tokens
+    )
+    if capability_question and paper_context and not search_only:
+        return True
+    return (paper_context or supplied_pdf_context) and explanation_context and not search_only
+
+
+# Complete phrases that name READING a document: every entry carries a reading
+# verb (or the skill's own name) and a document noun, so none fires on writing,
+# translating, uploading, debugging, or reviewing one. Bare size phrases
+# ("long document", "large pdf", "whole document", "page by page") are size
+# cues below, never explicit triggers -- measured against origin/main they
+# claimed "write a long document explaining the migration", "large pdf upload
+# keeps failing in production", and "walk me through the site page by page".
+# The generic words inside them are held back from bare-token scoring in
+# `recommend._WHOLE_PHRASE_ONLY_TRIGGER_TOKENS`.
+_LONG_DOCUMENT_EXPLICIT_PHRASES = (
+    "long-document-reading",
+    "long document reading",
+    "chunk this pdf",
+    "pdf in chunks",
+    "pdf too big",
+    "pdf too large",
+    "read this pdf",
+    "summarize this pdf",
+    "process this pdf",
+    "go through this pdf",
+    "read this document",
+    "summarize this document",
+    "process this document",
+    "read this manual",
+    "summarize this manual",
+    "read this contract",
+    "summarize this contract",
+    "read this annual report",
+    "summarize this annual report",
+    "read the whole pdf",
+    "read the entire pdf",
+    "read the whole document",
+    "read the entire document",
+    "read this whole document",
+    "이 pdf 요약",
+    "이 pdf 읽어",
+    "이 문서 요약",
+    "이 문서 읽어",
+    "매뉴얼 요약",
+    "계약서 요약",
+    "계약서 읽어",
+    "연간 보고서 요약",
+    "pdf 전체 읽어",
+    "문서 전체 읽어",
+    "このpdfを要約",
+    "この文書を要約",
+    "この契約書を要約",
+    "マニュアルを要約",
+    "总结这个pdf",
+    "总结这份文档",
+    "总结这份合同",
+    "总结这本手册",
+)
+# Anything here is a sibling's job or not a reading at all: paper tutoring,
+# file production, office conversion, media extraction, legal review, writing,
+# translating, uploading, or debugging a document. Single words are matched as
+# tokens so "paper" does not fire on "newspaper"; the phrases cover the
+# scripts that do not tokenize on whitespace.
+_LONG_DOCUMENT_BLOCKER_PHRASES = (
+    "into a ppt",
+    "into slides",
+    "into a deck",
+    "slide deck",
+    "into csv",
+    "to csv",
+    "action items",
+    "word document",
+    "compare these",
+    "compare two",
+    "create a pdf",
+    "make a pdf",
+    "generate a pdf",
+    "pdf report",
+    "arxiv",
+    "논문",
+    "論文",
+    "论文",
+    "ppt로",
+    "발표자료",
+    "액션아이템",
+    "작성",
+    "번역",
+    "업로드",
+    "실패",
+    "검토",
+    "書いて",
+    "作成",
+    "翻訳",
+    "アップロード",
+    "失敗",
+    "写一",
+    "编写",
+    "翻译",
+    "上传",
+    "失败",
+)
+_LONG_DOCUMENT_BLOCKER_TOKENS = _normalized_token_set(
+    {
+        "paper",
+        "papers",
+        "ppt",
+        "pptx",
+        "deck",
+        "slides",
+        "csv",
+        "xlsx",
+        "spreadsheet",
+        "convert",
+        "export",
+        "merge",
+        "screenshot",
+        "receipt",
+        "image",
+        "audio",
+        "video",
+        "youtube",
+        "write",
+        "writing",
+        "wrote",
+        "author",
+        "draft",
+        "drafting",
+        "compose",
+        "create",
+        "generate",
+        "edit",
+        "editing",
+        "translate",
+        "translation",
+        "translating",
+        "debug",
+        "debugging",
+        "upload",
+        "uploads",
+        "uploading",
+        "failing",
+        "fails",
+        "failed",
+        "failure",
+        "crash",
+        "crashed",
+        "crashes",
+        "ocr",
+        "compliance",
+        "legal",
+    }
+)
+_LONG_DOCUMENT_NOUN_TOKENS = _normalized_token_set(
+    {"pdf", "document", "manual", "contract", "handbook", "specification", "spec", "thesis", "문서", "계약서", "매뉴얼"}
+)
+_LONG_DOCUMENT_NOUN_PHRASES = ("pdf", "文書", "契約書", "マニュアル", "文档", "合同", "手册")
+_LONG_DOCUMENT_SIZE_TOKENS = _normalized_token_set(
+    {"large", "huge", "long", "massive", "giant", "enormous", "big", "lengthy", "whole", "entire", "긴", "대용량", "전체"}
+)
+_LONG_DOCUMENT_SIZE_PHRASES = (
+    "very large",
+    "very long",
+    "hundreds of pages",
+    "too big",
+    "too large",
+    "page by page",
+    "長い",
+    "大きな",
+    "全体",
+    "很长",
+    "大pdf",
+    "整个",
+    "全文",
+)
+_LONG_DOCUMENT_READ_TOKENS = _normalized_token_set(
+    {"read", "reading", "summarize", "summarise", "summarizing", "summary", "process", "digest", "explain", "요약", "정리", "읽어"}
+)
+_LONG_DOCUMENT_READ_PHRASES = ("go through", "要約", "読んで", "読む", "总结", "阅读", "读完", "读一下")
+# A page count that cannot fit one read at typical prose density; below it
+# the document is one `read_file` call and no ledger is needed.
+_LONG_DOCUMENT_PAGE_COUNT_FLOOR = 60
+# Query tokens arrive NFKD-folded, so a Hangul literal only compares after the
+# same fold; `normalized_phrase` is that fold.
+_LONG_DOCUMENT_PAGE_WORDS = ("page", "pages") + tuple(normalized_phrase(word) for word in ("페이지", "ページ", "页"))
+_LONG_DOCUMENT_READ_PREFIXES_KO = tuple(normalized_phrase(word) for word in ("요약", "읽어", "정리"))
+_LONG_DOCUMENT_WORD_PUNCTUATION = ",.;:!?()[]\"'"
+
+
+def _long_document_page_number(word: str) -> int | None:
+    """The page count a word states: `300`, or the upper end of `1-300`."""
+    text = word.strip(_LONG_DOCUMENT_WORD_PUNCTUATION)
+    if text.isdigit():
+        return int(text)
+    start, dash, end = text.partition("-")
+    if dash and start.isdigit() and end.isdigit():
+        return int(end)
+    return None
+
+
+def _long_document_page_count_cue(normalized_query: str) -> bool:
+    """True only when a number of at least the floor sits NEXT TO a page word.
+
+    `300 pages`, `300-page`, `300페이지`, and `pages 1-300` count; a year, a
+    port, or a ticket number elsewhere in the sentence does not ("read the
+    spec, page 12, port 8080" names page 12 and nothing else).
+    """
+    words = [word.strip(_LONG_DOCUMENT_WORD_PUNCTUATION) for word in normalized_query.split()]
+    for index, word in enumerate(words):
+        for page_word in _LONG_DOCUMENT_PAGE_WORDS:
+            # `300-page`, `300페이지`: one word carrying number and page word.
+            if word.endswith(page_word):
+                number = _long_document_page_number(word.removesuffix(page_word).rstrip("-"))
+                if number is not None and number >= _LONG_DOCUMENT_PAGE_COUNT_FLOOR:
+                    return True
+        if word not in _LONG_DOCUMENT_PAGE_WORDS:
+            continue
+        neighbours = [words[index - 1]] if index > 0 else []
+        if index + 1 < len(words):
+            neighbours.append(words[index + 1])
+        for neighbour in neighbours:
+            number = _long_document_page_number(neighbour)
+            if number is not None and number >= _LONG_DOCUMENT_PAGE_COUNT_FLOOR:
+                return True
+    return False
+
+
+def _long_document_reading_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    """Reading a document past one read: a reading verb AND a document noun AND a size or page-count cue.
+
+    An explicit phrase already carries the verb and the noun. Nothing here fires
+    without a reading verb, so writing, translating, uploading, debugging, or
+    reviewing a document for compliance stays with its owner.
+    """
+    if _contains_phrase(normalized_query, _LONG_DOCUMENT_BLOCKER_PHRASES):
+        return False
+    if _LONG_DOCUMENT_BLOCKER_TOKENS & query_tokens:
+        return False
+    if _contains_phrase(normalized_query, _LONG_DOCUMENT_EXPLICIT_PHRASES):
+        return True
+    document_noun = bool(_LONG_DOCUMENT_NOUN_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, _LONG_DOCUMENT_NOUN_PHRASES
+    )
+    size_cue = (
+        bool(_LONG_DOCUMENT_SIZE_TOKENS & query_tokens)
+        or _contains_phrase(normalized_query, _LONG_DOCUMENT_SIZE_PHRASES)
+        or _long_document_page_count_cue(normalized_query)
+    )
+    reading_verb = (
+        bool(_LONG_DOCUMENT_READ_TOKENS & query_tokens)
+        or _contains_phrase(normalized_query, _LONG_DOCUMENT_READ_PHRASES)
+        or any(token.startswith(_LONG_DOCUMENT_READ_PREFIXES_KO) for token in query_tokens)
+    )
+    return document_noun and size_cue and reading_verb
+
+
+def _paper_validation_or_citation_requested(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _PAPER_LEARNING_VALIDATION_PHRASES):
+        return True
+    validation_tokens = {"verify", "validate", "factcheck", "citation", "citations", "proof", "reproduce"}
+    paper_context = bool(_PAPER_LEARNING_PAPER_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("paper", "arxiv", "논문"),
+    )
+    return paper_context and bool(validation_tokens & query_tokens)
+
+
+def _explicit_material_export_requested(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _PAPER_LEARNING_EXPORT_PHRASES):
+        return True
+    action = bool(_MATERIALS_PACKAGE_ACTION_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("make", "turn into", "prepare", "export", "package", "만들", "변환"),
+    )
+    if not action:
+        return False
+    output_formats = _MATERIALS_PACKAGE_FORMAT_TOKENS & query_tokens
+    non_source_pdf_formats = {
+        "ppt",
+        "pptx",
+        "spreadsheet",
+        "excel",
+        "xlsx",
+        "docx",
+        "hwp",
+        "document",
+        "엑셀",
+        "문서",
+        "자료",
+        "첨부",
+    }
+    if output_formats & non_source_pdf_formats:
+        return True
+    return _contains_phrase(
+        normalized_query,
+        (
+            "export a pdf",
+            "export pdf",
+            "as a pdf",
+            "make a pdf",
+            "create a pdf",
+            "package it as a pdf",
+            "pdf로 만들",
+            "pdf로 변환",
+        ),
+    )
+
+
+def _research_department_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if is_explicit_one_off_request(normalized_query, query_tokens):
+        return False
+    if _wiki_capture_destination_request(normalized_query, query_tokens):
+        return False
+    explicit_research_ops = _contains_phrase(normalized_query, _RESEARCH_DEPARTMENT_PHRASES)
+    # A research department named outright keeps its request even when the
+    # digest lands in an LLM wiki; otherwise the LLM wiki is the request.
+    if llm_wiki_request(normalized_query) and not explicit_research_ops:
+        return False
+    if _omh_capability_question(normalized_query) and explicit_research_ops:
+        return True
+    research_infra_setup = _contains_phrase(normalized_query, _RESEARCH_DEPARTMENT_SETUP_PHRASES)
+    if research_infra_setup:
+        research_context = bool(
+            {
+                "research",
+                "source",
+                "sources",
+                "brief",
+                "briefing",
+                "summary",
+                "synthesis",
+                "knowledge",
+                "storage",
+                "store",
+                "리서치",
+                "출처",
+                "자료",
+                "브리핑",
+                "요약",
+                "지식",
+                "저장",
+            }
+            & query_tokens
+        ) or _contains_phrase(
+            normalized_query,
+            (
+                "research result",
+                "research results",
+                "source inbox",
+                "knowledge store",
+                "synthesis tool",
+                "knowledge store research summary",
+                "knowledge storage research summary",
+                "notebooklm knowledge store",
+                "notebooklm knowledge storage",
+                "리서치 결과",
+                "지식 저장",
+                "지식저장소",
+                "지식저장소 리서치",
+                "지식저장소 리서치 요약",
+                "요약 도구",
+            ),
+        )
+        if research_context:
+            return True
+    recurring = (
+        _scheduled_ops_blueprint_guard_applies(normalized_query, query_tokens)
+        or bool({"ongoing", "durable", "24", "daily", "weekly", "monthly", "매일", "매주"} & query_tokens)
+        or _contains_phrase(normalized_query, ("ongoing", "durable", "daily", "weekly", "monthly", "매일", "매주"))
+    )
+    support = bool(_RESEARCH_DEPARTMENT_SUPPORT_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, _RESEARCH_DEPARTMENT_SUPPORT_TOKENS
+    )
+    specific_research_domain = (
+        bool((_RESEARCH_DEPARTMENT_STRONG_TOKENS - {"research", "리서치", "조사"}) & query_tokens)
+        or _contains_phrase(normalized_query, ("경쟁사", "시장", "논문"))
+    )
+    generic_research = bool({"research", "리서치", "조사"} & query_tokens)
+    research = (
+        specific_research_domain
+        or (generic_research and support)
+        or _contains_phrase(normalized_query, _RESEARCH_DEPARTMENT_PHRASES)
+    )
+    collect_synthesize_brief = (
+        bool({"collect", "synthesize", "synthesis"} & query_tokens)
+        and bool({"brief", "briefing", "digest", "news"} & query_tokens)
+    ) or _contains_phrase(
+        normalized_query,
+        ("collect news synthesize", "collect, synthesize", "collect and brief", "synthesize and brief"),
+    )
+    return recurring and (research or collect_synthesize_brief) and (
+        support or specific_research_domain or explicit_research_ops or collect_synthesize_brief
+    )
+
+
+def llm_wiki_request(normalized_query: str) -> bool:
+    """The message names an LLM wiki, the pattern Hermes' bundled `llm-wiki` skill builds.
+
+    That skill ingests sources into, queries, and lints a markdown knowledge
+    base the agent maintains itself; "knowledge base" and "ingest" in such a
+    message are its words, not a research department's or a wiki blueprint's.
+    """
+    return _contains_phrase(normalized_query, ("llm wiki", "llm-wiki", "llm 위키", "llm위키"))
+
+
+def _wiki_capture_destination_request(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(
+        normalized_query,
+        (
+            "research department",
+            "research ops",
+            "research operations",
+            "리서치 부서",
+            "리서치 운영",
+        ),
+    ):
+        return False
+    destination = _contains_phrase(
+        normalized_query,
+        (
+            "external knowledge store",
+            "knowledge store",
+            "knowledge base",
+            "markdown vault",
+            "obsidian",
+            "notion",
+            "google drive",
+            "google docs",
+            "지식 저장소",
+            "지식저장소",
+            "지식 베이스",
+            "마크다운 볼트",
+            "옵시디언",
+            "노션",
+            "구글 드라이브",
+        ),
+    )
+    wiki_target = bool({"wiki", "위키"} & query_tokens) or "wiki" in normalized_query or _contains_phrase(
+        normalized_query,
+        ("project wiki", "wiki note", "wiki notes", "위키로", "위키에", "프로젝트 위키"),
+    )
+    capture = bool({"capture", "record", "notes", "note", "retrieval", "staleness", "structure"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("capture", "record", "leave as wiki", "retrieval hint", "staleness", "남길", "쌓", "구조", "정리", "정리"),
+    )
+    return destination and wiki_target and capture
+
+
+def _source_finder_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    visual_summary_applies: bool | None = None,
+) -> bool:
+    if _explicit_skill_candidate_is_negated(
+        normalized_query,
+        "source-finder",
+        "source finder",
+        "source-acquisition",
+        "source acquisition",
+        "source-intake",
+        "source intake",
+    ):
+        return False
+    if _cached_visual_summary_applies(normalized_query, query_tokens, visual_summary_applies):
+        return False
+    if _explicit_material_export_requested(normalized_query, query_tokens):
+        return False
+    if _scheduled_ops_blueprint_guard_applies(normalized_query, query_tokens):
+        return False
+    if _source_finder_explicit_acquisition_requested(normalized_query, query_tokens):
+        return True
+    if _paper_learning_guard_applies(
+        normalized_query,
+        query_tokens,
+        visual_summary_applies=visual_summary_applies,
+    ):
+        return False
+    if _research_department_guard_applies(normalized_query, query_tokens):
+        return False
+    if _github_event_ops_guard_applies(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _SOURCE_FINDER_EXCLUSION_PHRASES):
+        return False
+    if _paper_validation_or_citation_requested(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _SOURCE_FINDER_PHRASES):
+        return True
+    action = bool(_SOURCE_FINDER_ACTION_TOKENS & query_tokens)
+    source_kind = bool(_SOURCE_FINDER_KIND_TOKENS & query_tokens)
+    multiple_source_kinds = len(_SOURCE_FINDER_KIND_TOKENS & query_tokens) >= 2
+    acquisition_noun = _contains_phrase(
+        normalized_query,
+        (
+            "source candidate",
+            "source candidates",
+            "source material",
+            "source materials",
+            "downloadable source",
+            "downloadable sources",
+            "acquisition status",
+            "출처 후보",
+            "자료 후보",
+            "소스 후보",
+        ),
+    )
+    if _omh_capability_question(normalized_query) and _source_acquisition_capability_context(
+        normalized_query, query_tokens
+    ):
+        return True
+    return action and (source_kind or acquisition_noun or multiple_source_kinds)
+
+
+def _source_finder_explicit_acquisition_requested(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _explicit_skill_candidate_is_negated(
+        normalized_query,
+        "source-finder",
+        "source finder",
+        "source-acquisition",
+        "source acquisition",
+        "source-intake",
+        "source intake",
+    ):
+        return False
+    if _contains_phrase(normalized_query, _SOURCE_FINDER_EXCLUSION_PHRASES):
+        return False
+    if _contains_phrase(normalized_query, _SOURCE_FINDER_PHRASES):
+        return True
+    action = bool(_SOURCE_FINDER_ACTION_TOKENS & query_tokens)
+    source_kind = bool(_SOURCE_FINDER_KIND_TOKENS & query_tokens)
+    return action and source_kind
+
+
+def _omh_capability_question(normalized_query: str) -> bool:
+    return _contains_phrase(
+        normalized_query,
+        (
+            "what can omh do",
+            "what can oh-my-hermes do",
+            "what can i do with omh",
+            "how can omh help",
+            "how can oh-my-hermes help",
+            "can omh help",
+            "can oh-my-hermes help",
+            "omh가 뭐",
+            "omh는 뭐",
+            "omh로 뭐",
+            "omh로 무엇",
+            "omh가 어떻게",
+            "omh는 어떻게",
+        ),
+    )
+
+
+def _source_acquisition_capability_context(normalized_query: str, query_tokens: set[str]) -> bool:
+    if {
+        "dataset",
+        "datasets",
+        "github",
+        "repo",
+        "repos",
+        "repository",
+        "repositories",
+        "oss",
+        "source",
+        "sources",
+        "link",
+        "links",
+        "candidate",
+        "candidates",
+        "데이터셋",
+        "깃허브",
+        "저장소",
+        "레포",
+        "소스",
+        "출처",
+        "링크",
+        "후보",
+    } & query_tokens:
+        return True
+    return _contains_phrase(
+        normalized_query,
+        (
+            "source finding",
+            "source finder",
+            "source acquisition",
+            "source candidate",
+            "source candidates",
+            "source material",
+            "source materials",
+            "find sources",
+            "finding sources",
+            "dataset search",
+            "repo search",
+            "github repos",
+            "github repositories",
+            "출처 찾",
+            "자료 찾",
+            "소스 찾",
+            "데이터셋 찾",
+        ),
+    )
+
+
+def is_explicit_one_off_request(normalized_query: str, query_tokens: set[str]) -> bool:
+    return bool(_ONE_OFF_TOKENS & query_tokens) or _contains_phrase(normalized_query, _ONE_OFF_PHRASES)
+
+
+_HERMES_SETUP_GUIDE_PHRASES = (
+    "model-setup",
+    "set up my models",
+    "set up my model",
+    "configure my models",
+    "configure model provider",
+    "model provider setup",
+    "모델 설정",
+    "모델 프로바이더 설정",
+    "websearch-setup",
+    "web search setup",
+    "set up web search",
+    "make web search cheaper",
+    "reduce web search cost",
+    "web search cheaper",
+    "web search backend",
+    "web extract backend",
+    "web search costs too much",
+    "keyless free web search",
+    "웹 검색 설정",
+    "웹 검색 싸게",
+    "웹 검색 비용",
+    "morning-brief",
+    "morning brief",
+    "모닝 브리핑",
+    "아침 브리핑",
+    "parallel-tools",
+    "parallel tools",
+    "병렬 도구",
+    "병렬 툴",
+)
+
+
+# Said alone, these name Hermes' own setting; with an object ("configure web
+# search for the store's product catalog", "... in our nextjs app") they name
+# the user's app, where the setup guide dispatched. They count only as the
+# whole request, after the courtesy openers (`request_lead.COURTESY_OPENERS`)
+# and before a closing "please" or "thanks".
+_HERMES_SETUP_GUIDE_WHOLE_REQUESTS = ("configure web search",)
+_COURTESY_CLOSERS = frozenset({"please", "pls", "thanks", "thx", "thank", "you"})
+
+# These name Hermes' own web search, and so does a lookup or a code change
+# about it ("compare hermes web search with openai web search, cite
+# sources", "fix the hermes web search tool bug in tools/web_tools.py"),
+# which they took from its own lane. They count only beside a setup verb.
+_HERMES_SETUP_GUIDE_VERB_PHRASES = ("hermes web search", "web search in hermes")
+_HERMES_SETUP_VERBS = frozenset({"configure", "set", "setup", "switch", "change"})
+
+
+def _hermes_setup_guide_requested(normalized_query: str) -> bool:
+    if _contains_phrase(normalized_query, _HERMES_SETUP_GUIDE_PHRASES):
+        return True
+    if _contains_phrase(normalized_query, _HERMES_SETUP_GUIDE_VERB_PHRASES) and (
+        _HERMES_SETUP_VERBS & routing_tokens(normalized_query)
+    ):
+        return True
+    words = _command_words(normalized_query)
+    while words and words[-1].strip(".,!?") in _COURTESY_CLOSERS:
+        words.pop()
+    terms = routing_terms(" ".join(words))
+    return any(terms == routing_terms(request) for request in _HERMES_SETUP_GUIDE_WHOLE_REQUESTS)
+
+
+def employer_hiring_intent(normalized_query: str, query_tokens: set[str]) -> bool:
+    """Separate an organization's recruiting objective from a candidate's role.
+
+    Inputs are the existing executable, normalized routing view: quoted examples
+    do not establish an actor. Occupations and employer targets alone are not a
+    veto; personal career objectives retain their normal routing evidence.
+    """
+    candidate_objectives = ("job search", "own job search", "next role", "next job", "resume", "cv",
+                            "application", "cover letter", "job applications", "job interview", "own next role")
+    candidate_owns_work = contains_boundary_phrase(normalized_query, tuple(
+        f"{owner} {objective}"
+        for owner in ("my", "his", "her", "their")
+        for objective in candidate_objectives
+    ) + ("for myself",))
+    # Role nouns are actor evidence only beside an organizational objective;
+    # neither an article nor a first-person pronoun establishes that boundary.
+    employer_actor = bool({"employer", "company", "client", "recruiter", "hiring"} & query_tokens) or contains_boundary_phrase(
+        normalized_query, ("recruiting team", "recruitment team", "recruitment agency",
+                           "recruiting agency", "staffing agency", "recruitment department", "hiring team")
+    )
+    # A present hiring predicate supplies actor evidence, not a requested
+    # sourcing objective: background hiring must not override personal work.
+    hiring_actor = contains_boundary_phrase(normalized_query, (
+        "am hiring", "are hiring", "is hiring", "we're hiring", "i'm hiring", "we’re hiring", "i’m hiring",
+        "need to hire", "needs to hire",
+    ))
+    # A recruiting purpose attached to the search establishes an organizational
+    # objective regardless of the profession being recruited or the actor's name.
+    # Match the purpose immediately attached to the search, not any hiring
+    # verb later in an employer/target/background clause. Regular -ly adverbs
+    # form an open modifier class; degree and coordination are grammatical
+    # structure, not a vocabulary of professions, actors or example adverbs.
+    modifier = r"(?:(?:more|less|very) )?[^\W\d_]+ly "
+    search_sourcing = bool(re.search(
+        r"\bjob search(?: campaign)? (?:in order )?to "
+        rf"(?:{modifier}(?:(?:and|or) )?)*"
+        r"(?:recruit|hire|source|screen)\b",
+        normalized_query,
+    ))
+    sourcing_objective = search_sourcing or contains_boundary_phrase(normalized_query, (
+        "find candidates", "source candidates", "screen candidates", "recruit candidates", "hire candidates",
+    ))
+    hiring_objective = sourcing_objective or contains_boundary_phrase(normalized_query, (
+        "job search campaign", "hiring campaign", "recruiting campaign", "recruitment campaign",
+    ))
+    # A possessive can refer to the organization's campaign too; it is not
+    # candidate ownership when the requested outcome is sourcing people.
+    if candidate_owns_work and not sourcing_objective:
+        return False
+    return search_sourcing or hiring_actor or (employer_actor and hiring_objective)
+
+
+def _web_research_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    # Career discovery retains its domain method; retrieval is one of its steps.
+    # Generic job/process/search words alone do not establish that intent.
+    if _contains_phrase(normalized_query, ("job search",)):
+        return False
+    if _hermes_setup_guide_requested(normalized_query):
+        return False
+    if _scheduled_ops_blueprint_guard_applies(normalized_query, query_tokens):
+        return False
+    if _delivery_cycle_terms(normalized_query, query_tokens):
+        return False
+    if _github_event_ops_guard_applies(normalized_query, query_tokens):
+        return False
+    if {
+        "web",
+        "search",
+        "sources",
+        "citation",
+        "citations",
+        "links",
+        "official",
+        "upstream",
+    } & query_tokens:
+        return True
+    if "source" in query_tokens and not _contains_phrase(normalized_query, ("open source", "open-source")):
+        return True
+    if {"latest", "current", "freshness"} & query_tokens:
+        freshness_context = bool(
+            {
+                "api",
+                "best",
+                "docs",
+                "documentation",
+                "news",
+                "official",
+                "paper",
+                "papers",
+                "practice",
+                "practices",
+                "research",
+                "source",
+                "sources",
+                "upstream",
+                "version",
+                "web",
+            }
+            & query_tokens
+        ) or _contains_phrase(
+            normalized_query,
+            (
+                "current sources",
+                "current best",
+                "current docs",
+                "current api",
+                "current version",
+                "latest sources",
+                "latest docs",
+                "latest api",
+                "latest version",
+            ),
+        )
+        if freshness_context:
+            return True
+    return _contains_phrase(
+        normalized_query,
+        (
+            "web search",
+            "search the web",
+            "internet search",
+            "find sources",
+            "current sources",
+            "source backed",
+            "웹서치",
+            "웹 서치",
+            "웹 검색",
+            "인터넷 검색",
+            "검색해서",
+            "검색해줘",
+            "찾아봐",
+            "최신 자료",
+            "최신 출처",
+            "자료 찾아",
+        ),
+    )
+
+
+# A point-in-time web request names a cutoff or a historical capture. "as of"
+# alone is not one: a status report ("as of today I'm done") and a definition
+# question both carry it, so every phrase here must meet a web context below
+# before the guard fires.
+_POINT_IN_TIME_WEB_PHRASES = (
+    "as of ",
+    "archived capture",
+    "archived captures",
+    "archived snapshot",
+    "archived version",
+    "archived copy",
+    "archive capture",
+    "archive snapshot",
+    "web archive",
+    "wayback",
+    "then versus now",
+    "then vs now",
+    "then vs. now",
+    "then and now",
+    "as it was on",
+    "as it was in",
+    "as it looked on",
+    "what did the page say",
+    "what was known",
+    "point in time",
+    "point-in-time",
+    "earlier snapshot",
+    "historical capture",
+    "historical snapshot",
+    "historical version",
+    "아카이브 캡처",
+    "아카이브된",
+    "아카이브 스냅샷",
+    "당시 기준",
+    "그 시점 기준",
+    "시점 기준으로",
+    "일 기준으로",
+    "과거 버전",
+    "당시 페이지",
+    "그때 페이지",
+    "웨이백",
+    "그때랑 지금",
+    "당시와 지금",
+    "アーカイブ",
+    "当時の",
+    "時点で",
+    "存档快照",
+    "当时的页面",
+    "截至",
+)
+_POINT_IN_TIME_WEB_CONTEXT_TOKENS = _normalized_token_set(
+    {
+        "web",
+        "page",
+        "pages",
+        "site",
+        "website",
+        "url",
+        "docs",
+        "documentation",
+        "source",
+        "sources",
+        "article",
+        "post",
+        "pricing",
+        "homepage",
+        "changelog",
+        "announcement",
+        "capture",
+        "captures",
+        "archive",
+        "archived",
+        "snapshot",
+        "wayback",
+    }
+)
+_POINT_IN_TIME_WEB_CONTEXT_PHRASES = (
+    "페이지",
+    "웹",
+    "사이트",
+    "아카이브",
+    "캡처",
+    "스냅샷",
+    "출처",
+    "ページ",
+    "ウェブ",
+    "网页",
+    "页面",
+    "存档",
+)
+# Only an explicit PR or merge ask blocks the guard. The wider delivery-cycle
+# token set is not used here because it counts the bare `docs` token, and a
+# docs page is exactly the kind of page an as-of question is about.
+_POINT_IN_TIME_WEB_BLOCKER_PHRASES = (
+    "open a pr",
+    "prepare a pr",
+    "make a pr",
+    "pr ready",
+    "pr-ready",
+    "pull request",
+    "pr까지",
+    "merge",
+    "머지",
+)
+
+
+def _point_in_time_web_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _hermes_setup_guide_requested(normalized_query):
+        return False
+    if _scheduled_ops_blueprint_guard_applies(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _POINT_IN_TIME_WEB_BLOCKER_PHRASES):
+        return False
+    if _github_event_ops_guard_applies(normalized_query, query_tokens):
+        return False
+    if not _contains_phrase(normalized_query, _POINT_IN_TIME_WEB_PHRASES):
+        return False
+    return bool(_POINT_IN_TIME_WEB_CONTEXT_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, _POINT_IN_TIME_WEB_CONTEXT_PHRASES
+    )
+
+
+def point_in_time_web_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    return _point_in_time_web_guard_applies(normalized_query, query_tokens)
+
+
+def _missed_workflow_research_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _scheduled_ops_blueprint_guard_applies(normalized_query, query_tokens):
+        return False
+    if _research_department_guard_applies(normalized_query, query_tokens):
+        return False
+    if not _missed_omh_workflow_context_applies(normalized_query):
+        return False
+    return bool(_MISSED_WORKFLOW_RESEARCH_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, ("리서치", "조사", "자료", "출처", "research")
+    )
+
+
+def _missed_workflow_operating_record_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    visual_summary_applies: bool | None = None,
+) -> bool:
+    if _cached_visual_summary_applies(normalized_query, query_tokens, visual_summary_applies):
+        return False
+    if not _missed_omh_workflow_context_applies(normalized_query):
+        return False
+    meeting_context = bool(_MISSED_WORKFLOW_OPERATING_RECORD_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("회의록", "회의 요약", "meeting notes", "meeting minutes"),
+    )
+    if not meeting_context:
+        return False
+    file_package_context = bool(_MATERIALS_PACKAGE_FORMAT_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("ppt", "pdf", "deck", "slides", "엑셀", "피디에프"),
+    )
+    return not file_package_context
+
+
+def _delivery_cycle_terms(normalized_query: str, query_tokens: set[str]) -> bool:
+    if {
+        "implement",
+        "implementation",
+        "code",
+        "coding",
+        "review",
+        "docs",
+        "documentation",
+        "pull",
+        "merge",
+        "구현",
+        "리뷰",
+        "문서",
+    } & query_tokens:
+        return True
+    return _contains_phrase(
+        normalized_query,
+        (
+            "open a pr",
+            "prepare a pr",
+            "make a pr",
+            "pr ready",
+            "pr-ready",
+            "pull request",
+            "pr까지",
+        ),
+    )
+
+
+def _coding_handoff_status_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    visual_summary_applies: bool | None = None,
+) -> bool:
+    if _cached_visual_summary_applies(normalized_query, query_tokens, visual_summary_applies):
+        return False
+    if _contains_phrase(
+        normalized_query,
+        (
+            "find previous coding session",
+            "recover coding session",
+            "previous codex coding session",
+            "coding session recall",
+            "지난 코딩 세션",
+            "코딩 세션 복구",
+            "세션 기억 복구",
+        ),
+    ):
+        return False
+    if _executor_readiness_check_requested(normalized_query, query_tokens):
+        return False
+    if _coding_session_status_only_guard_applies(normalized_query, query_tokens):
+        return False
+    explicit_phrase = _contains_phrase(normalized_query, _CODING_HANDOFF_PHRASES)
+    executor = bool(_CODING_HANDOFF_EXECUTOR_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("claude code", "coding agent", "코딩 에이전트"),
+    )
+    work = bool(_CODING_HANDOFF_WORK_TOKENS & query_tokens)
+    control = bool(_CODING_HANDOFF_CONTROL_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        _CODING_HANDOFF_CONTROL_PHRASES,
+    )
+    return explicit_phrase or (executor and work and control)
+
+
+def _github_issue_intake_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    # Pre-creation filing only: issue-to-PR and pull-request event language
+    # stays with github-event-ops, classification-only reports with
+    # feedback-triage.
+    if _contains_phrase(
+        normalized_query,
+        (
+            "into a pr",
+            "issue to pr",
+            "for a pr",
+            "pr-ready",
+            "pr ready",
+            "pull request",
+            "pr 만들",
+            "pr로",
+        ),
+    ):
+        return False
+    # A request on a cadence reads issues someone else filed; it files
+    # nothing now. `new github issue` is a substring of `new github issues`,
+    # so the explicit filing phrase alone handed any recurring digest of
+    # issues a +44 filing boost. A cadence (a frequency word, or "every" plus
+    # a time) or a scheduling cue takes the filing guard off.
+    if has_cadence(normalized_query, query_tokens) or _scheduled_ops_blueprint_guard_applies(
+        normalized_query, query_tokens
+    ):
+        return False
+    if _contains_phrase(normalized_query, _GITHUB_ISSUE_INTAKE_EXPLICIT_PHRASES):
+        return True
+    github_context = _contains_phrase(normalized_query, ("github", "깃허브", "repository", "repo", "저장소", "레포"))
+    issue_target = _contains_phrase(normalized_query, ("issue", "이슈", "bug report", "버그 리포트"))
+    filing_verb = bool(_GITHUB_ISSUE_INTAKE_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("올려", "등록", "생성", "만들어"),
+    )
+    return github_context and issue_target and filing_verb
+
+
+def _github_event_ops_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _visual_summary_guard_applies(normalized_query, query_tokens):
+        return False
+    # Event ops reacts to one event. A cadence makes it a scheduled digest,
+    # and turning an issue into a plan or spec is planning.
+    if has_cadence(normalized_query, query_tokens):
+        return False
+    if {"plan", "spec", "roadmap"} & query_tokens and _contains_phrase(normalized_query, ("into a", "into the")):
+        return False
+    if _github_issue_intake_guard_applies(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _SECURITY_EVENT_OVER_GITHUB_EVENT_PHRASES):
+        return False
+    if _contains_phrase(normalized_query, _MOBILE_RELEASE_OVER_GITHUB_EVENT_PHRASES):
+        return False
+    if _contains_phrase(normalized_query, _GITHUB_EVENT_OPS_PHRASES):
+        return True
+    github_context = _contains_phrase(normalized_query, ("github", "깃허브"))
+    ci_event = bool({"ci", "build", "job"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        (
+            "ci failed",
+            "ci 실패",
+            "ci가 실패",
+            "ci 실패했",
+            "ci 실패했어",
+            "failed ci",
+            "failing ci",
+            "ci failing",
+            "ci is red",
+            "red ci",
+            "job failed",
+            "job failing",
+            "build failed",
+            "test job failed",
+            "latest push",
+        ),
+    )
+    issue_or_pr = bool(_GITHUB_EVENT_OPS_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("issue", "pull request", "pr", "이슈"),
+    )
+    event_or_pr_prep = _contains_phrase(
+        normalized_query,
+        (
+            "opened",
+            "pr opened",
+            "pr 열렸",
+            "pr 열리",
+            "failed ci",
+            "ci failed",
+            "ci 실패",
+            "ci가 실패",
+            "ci 실패했",
+            "ci 실패했어",
+            "failing ci",
+            "ci failing",
+            "ci is red",
+            "red ci",
+            "job failed",
+            "job failing",
+            "build failed",
+            "test job failed",
+            "reviewer left comments",
+            "pr comments",
+            "latest push",
+            "label",
+            "labeling",
+            "review",
+            "to pr",
+            "into a pr",
+            "pr 만들",
+            "pr로",
+            "pr 준비",
+            "열렸",
+            "열리",
+            "들어온",
+            "들어오면",
+            "라벨",
+            "라벨링",
+        ),
+    )
+    event_context = _contains_phrase(
+        normalized_query,
+        (
+            "opened",
+            "pr opened",
+            "pr 열렸",
+            "pr 열리",
+            "failed ci",
+            "ci failed",
+            "ci 실패",
+            "ci가 실패",
+            "ci 실패했",
+            "ci 실패했어",
+            "failing ci",
+            "ci failing",
+            "ci is red",
+            "red ci",
+            "job failed",
+            "job failing",
+            "build failed",
+            "test job failed",
+            "label",
+            "labeling",
+            "latest push",
+            "열렸",
+            "열리",
+            "들어온",
+            "들어오면",
+            "라벨",
+            "라벨링",
+        ),
+    )
+    return (issue_or_pr or ci_event) and event_or_pr_prep and (github_context or event_context or ci_event)
+
+
+# A request to check or confirm something, not to change or produce it.
+_CHECK_REQUEST_PHRASES = ("make sure", "ensure", "verify", "confirm", "double check", "double-check")
+# The materials lane claims a document request on a format noun ("slide deck",
+# "pdf"). An English request must also ask for something to be produced or
+# processed; a document to be checked, judged, or located is another lane's.
+_MATERIALS_PRODUCTION_VERBS = frozenset(
+    {
+        "make", "create", "turn", "convert", "export", "build", "generate", "draft", "prepare",
+        "produce", "package", "summarize", "extract", "compare", "put", "combine", "merge", "format",
+        "translate", "fill", "update", "edit", "write", "attach",
+    }
+)
+
+
+def asks_to_produce_materials(normalized_query: str, ascii_query: bool) -> bool:
+    if not ascii_query:
+        return True
+    if _contains_phrase(normalized_query, _CHECK_REQUEST_PHRASES):
+        return False
+    words = set(normalized_query.replace(",", " ").replace(".", " ").split())
+    # "as a deck", "into slides": the target format is named as the output.
+    return bool(_MATERIALS_PRODUCTION_VERBS & words) or bool({"as", "into"} & words)
+
+
+def _materials_package_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    visual_summary_applies: bool | None = None,
+) -> bool:
+    if _cached_visual_summary_applies(normalized_query, query_tokens, visual_summary_applies):
+        return False
+    if not asks_to_produce_materials(normalized_query, normalized_query.isascii()):
+        return False
+    if _contains_phrase(normalized_query, ("report package", "leadership status deck", "monthly leadership status")):
+        return False
+    if _contains_phrase(normalized_query, _MATERIALS_PACKAGE_PHRASES):
+        return True
+    format_hits = len(_MATERIALS_PACKAGE_FORMAT_TOKENS & query_tokens)
+    action = bool(_MATERIALS_PACKAGE_ACTION_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("make", "turn into", "prepare", "export", "만들", "정리", "준비", "공유"),
+    )
+    non_pdf_output_formats = {
+        "ppt",
+        "pptx",
+        "spreadsheet",
+        "excel",
+        "xlsx",
+        "deck",
+        "slides",
+        "doc",
+        "docx",
+        "csv",
+        "hwp",
+        "document",
+        "피피티",
+        "슬라이드",
+        "덱",
+        "워드",
+        "엑셀",
+        "문서",
+    }
+    if action and _MATERIALS_PACKAGE_FORMAT_TOKENS & query_tokens & non_pdf_output_formats:
+        return True
+    return format_hits >= 2 and action
+
+
+def memory_new_scope_overroutes_curation(normalized_query: str) -> bool:
+    """True when a scope noun is the only memory-new signal and the request is curation.
+
+    `project memory` on its own is a capture request, but `clean up my stale project
+    memory` is existing-memory curation that merely names the same scope. Without this
+    split the scope noun wins and suppresses `MEMORY_CURATION_GUARD`, so adding a scope
+    word to a curation request silently flips it to capture.
+    """
+    if _contains_phrase(normalized_query, MEMORY_NEW_CAPTURE_PHRASES):
+        return False
+    return _contains_phrase(normalized_query, MEMORY_NEW_SCOPE_PHRASES) and _contains_phrase(
+        normalized_query, MEMORY_CURATION_INTENT_PHRASES
+    )
+
+
+def _memory_new_guard_applies(normalized_query: str) -> bool:
+    if _contains_phrase(normalized_query, MEMORY_NEW_CAPTURE_PHRASES):
+        return True
+    if memory_new_scope_overroutes_curation(normalized_query):
+        return False
+    return _contains_phrase(normalized_query, MEMORY_NEW_SCOPE_PHRASES)
+
+
+_SYSTEM_MEMORY_WORDS = frozenset(
+    {"usage", "leak", "leaks", "leaking", "heap", "ram", "oom", "rss", "allocation", "allocations", "gc", "footprint"}
+)
+
+
+def _memory_curation_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _public_plugin_connector_readiness_requested(normalized_query):
+        return False
+    if is_omh_docs_question(normalized_query):
+        return False
+    literature_review = _contains_phrase(normalized_query, ("literature review", "문헌 검토", "논문들 검토"))
+    paper_context = bool({"paper", "papers", "논문"} & query_tokens)
+    if literature_review and paper_context:
+        return False
+    # Memory as a machine resource (usage, leaks, heap, RAM) is not an
+    # agent's memory store.
+    if _SYSTEM_MEMORY_WORDS & query_tokens:
+        return False
+    context = bool(_MEMORY_CURATION_CONTEXT_TOKENS & query_tokens)
+    hermes_context = _contains_phrase(normalized_query, ("hermes", "헤르메스"))
+    omh_context = _contains_phrase(normalized_query, ("omh", "oh-my-hermes", "oh my hermes"))
+    memory_context = bool(_MEMORY_STORE_TOKENS & query_tokens)
+    if _scheduled_ops_blueprint_guard_applies(normalized_query, query_tokens) and not (
+        hermes_context or omh_context or memory_context
+    ):
+        return False
+    if _contains_phrase(normalized_query, _MEMORY_CURATION_PHRASES):
+        return True
+    cleanup = _contains_phrase(
+        normalized_query,
+        (
+            "cleanup",
+            "curate",
+            "review",
+            "inspect",
+            "check",
+            "health",
+            "update",
+            "updates",
+            "record",
+            "what to keep",
+            "keep",
+            "정리",
+            "점검",
+            "검사",
+            "검토",
+            "관리",
+            "업데이트",
+            "피드백",
+        ),
+    )
+    stale = _contains_phrase(normalized_query, ("stale", "old", "duplicate", "conflicting", "overlap", "collision", "오래된", "중복", "충돌", "겹", "압축"))
+    capability_intent = bool(_CAPABILITY_INTENT_TOKENS & query_tokens)
+    return memory_context and context and (cleanup or stale or capability_intent or hermes_context or omh_context)
+
+
+def _agent_board_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _AGENT_BOARD_PHRASES):
+        return True
+    multi_agent = _contains_phrase(
+        normalized_query,
+        ("multiple agents", "multi agent", "multiple hermes", "여러 에이전트", "여러 명", "agent 여러"),
+    )
+    board_or_roles = bool({"board", "kanban", "role", "roles", "보드", "역할", "칸반"} & query_tokens)
+    team_context = bool(_AGENT_BOARD_CONTEXT_TOKENS & query_tokens)
+    coordination = bool({"coordinate", "assign", "handoff", "route", "조율", "배정", "분배"} & query_tokens)
+    named_roles = len({"pm", "cto", "qa", "security", "ops", "release"} & query_tokens) >= 2
+    agents = bool({"agent", "agents", "에이전트"} & query_tokens)
+    return (team_context and multi_agent and board_or_roles) or (coordination and agents and named_roles)
+
+
+def _gateway_intent_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    platform = bool({"discord", "slack", "telegram", "whatsapp", "signal", "gateway", "platform"} & query_tokens)
+    policy = bool(
+        {
+            "route",
+            "routing",
+            "thread",
+            "delivery",
+            "silent",
+            "silently",
+            "quiet",
+            "quietly",
+            "attachment",
+            "file",
+            "status",
+            "origin",
+            "update",
+            "updates",
+        }
+        & query_tokens
+    )
+    gateway_context = _deliverable_gateway_context_applies(normalized_query, query_tokens) or bool(
+        {
+            "message",
+            "messages",
+            "workflow",
+            "card",
+            "thread",
+            "attachment",
+            "file",
+            "voice",
+            "origin",
+            "delivery",
+            "status",
+            "update",
+            "updates",
+        }
+        & query_tokens
+    ) or _contains_phrase(
+        normalized_query,
+        (
+            "file attachment",
+            "sent an attachment",
+            "update the thread",
+            "thread quietly",
+            "voice note",
+            "workflow card",
+            "gateway routing",
+            "route this telegram message",
+            "route this discord message",
+            "route this slack message",
+        ),
+    )
+    if _omh_capability_question(normalized_query) and platform and (
+        {"gateway", "routing", "route"} & query_tokens
+        or _contains_phrase(normalized_query, ("gateway routing", "message routing", "platform routing"))
+    ):
+        return True
+    return platform and policy and gateway_context
+
+
+def _hermes_coding_team_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    hermes_owner = _contains_phrase(
+        normalized_query,
+        (
+            "hermes itself",
+            "hermes coding",
+            "hermes-owned coding",
+            "hermes only",
+            "hermes만으로",
+            "hermes 만으로",
+            "헤르메스가 코딩",
+            "헤르메스만으로",
+            "헤르메스 만으로",
+            "헤르메스가 직접",
+        ),
+    )
+    coding = bool({"code", "coding", "implement", "implementation", "refactor", "fix"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("코딩", "구현", "개발"),
+    )
+    team_runtime = bool({"worker", "workers", "worktree", "worktrees", "team", "swarm", "parallel"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("coding team", "코딩팀", "코딩 팀", "팀처럼", "팀으로", "팀 모드", "팀 작업"),
+    )
+    return hermes_owner and coding and team_runtime
+
+
+def _coding_progress_status_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _github_event_ops_guard_applies(normalized_query, query_tokens):
+        return False
+    if _executor_readiness_check_requested(normalized_query, query_tokens):
+        return False
+    if _coding_session_status_only_guard_applies(normalized_query, query_tokens):
+        return True
+    if _contains_phrase(normalized_query, _CODING_PROGRESS_STATUS_PHRASES):
+        return True
+    executor = _contains_phrase(
+        normalized_query,
+        ("codex", "claude code", "coding agent", "executor", "코덱스", "클로드", "코딩 에이전트"),
+    )
+    progress = bool(_CODING_PROGRESS_STATUS_TOKENS & query_tokens) and _contains_phrase(
+        normalized_query,
+        ("progress", "status", "running", "where", "어디까지", "진행", "상태"),
+    )
+    return executor and progress
+
+
+def _coding_session_status_only_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    executor = _contains_phrase(
+        normalized_query,
+        ("codex", "claude code", "coding agent", "executor", "코덱스", "클로드", "코딩 에이전트"),
+    )
+    return executor and _contains_phrase(normalized_query, _CODING_SESSION_STATUS_ONLY_PHRASES)
+
+
+def _release_claim_review_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _reliability_review_context_applies(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _RELEASE_CLAIM_REVIEW_PHRASES):
+        return True
+    review_intent = bool(_RELEASE_CLAIM_REVIEW_TOKENS & query_tokens)
+    claim_or_release = _contains_phrase(
+        normalized_query,
+        ("claim", "readme", "release", "doctor", "harness", "주장", "릴리즈"),
+    )
+    compare_or_verify = _contains_phrase(normalized_query, ("match", "matches", "verify", "review", "맞는지", "검토", "통과"))
+    return review_intent and claim_or_release and compare_or_verify
+
+
+def _doctor_health_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    code_change_context = {"implementation", "router"} & query_tokens and {
+        "fix",
+        "code",
+        "change",
+        "수정",
+        "구현",
+    } & query_tokens
+    if code_change_context:
+        return False
+    if _contains_phrase(
+        normalized_query,
+        (
+            "after omh update",
+            "omh update says setup",
+            "setup is next",
+            "skills still look stale",
+            "skills look stale",
+            "update version unchanged",
+            "update version stayed",
+            "version unchanged after update",
+            "version stayed the same after update",
+            "same version after update",
+            "hermes skills still",
+            "hermes skills list does not show",
+            "hermes skills list does not show omh",
+            "skills list does not show omh",
+            "hermes cannot see the skills",
+            "hermes can't see the skills",
+            "hermes에서 omh가 안 보여",
+            "hermes에서 omh 안 보여",
+            "hermes에서 omh가 안보여",
+            "hermes에서 omh 안보여",
+            "omh가 안 보여",
+            "omh 안 보여",
+            "omh가 안보여",
+            "omh 안보여",
+            "cannot see the skills",
+            "can't see the skills",
+            "setup says done but hermes cannot see",
+            "setup says done but hermes can't see",
+            "install looks broken",
+            "setup looks broken",
+            "registration looks broken",
+            "omh가 이상",
+            "설치가 이상",
+            "셋업이 이상",
+            "스킬이 안 보여",
+            "스킬이 stale",
+            "update 했는데 버전이 그대로",
+            "업데이트 했는데 버전이 그대로",
+            "업데이트했는데 버전이 그대로",
+            "버전이 그대로야",
+            "버전 그대로야",
+        ),
+    ):
+        return True
+    omh_context = _contains_phrase(normalized_query, ("omh", "oh-my-hermes", "oh my hermes", "hermes skills"))
+    maintenance = bool(
+        {
+            "install",
+            "setup",
+            "update",
+            "doctor",
+            "health",
+            "registration",
+            "installed",
+            "stale",
+            "skills",
+            "path",
+            "설치",
+            "셋업",
+            "업데이트",
+            "닥터",
+            "스킬",
+            "등록",
+            "상태",
+        }
+        & query_tokens
+    ) or _contains_phrase(
+        normalized_query,
+        (
+            "설치",
+            "셋업",
+            "업데이트",
+            "닥터",
+            "스킬",
+            "등록",
+            "상태",
+        ),
+    )
+    confusion = _contains_phrase(
+        normalized_query,
+        (
+            "still",
+            "stale",
+            "missing",
+            "not found",
+            "not show",
+            "does not show",
+            "doesn't show",
+            "not visible",
+            "broken",
+            "doesn't work",
+            "not working",
+            "says setup",
+            "look stale",
+            "looks stale",
+            "안 보여",
+            "안됨",
+            "안 돼",
+            "이상",
+            "깨짐",
+        ),
+    )
+    simple_health_question = _contains_phrase(
+        normalized_query,
+        (
+            "is setup ok",
+            "is install ok",
+            "is installation ok",
+            "setup ok",
+            "install ok",
+            "installation ok",
+            "is it set up",
+            "did setup work",
+            "did install work",
+            "did update work",
+            "update ok",
+            "update worked",
+            "is update ok",
+            "update 했는데 제대로",
+            "update 제대로 반영",
+            "update 잘 된 거야",
+            "update 잘된 거야",
+            "update 잘 된거야",
+            "update 잘된거야",
+            "setup이 잘 됐",
+            "setup 잘 됐",
+            "셋업 잘 됐",
+            "설치 잘 됐",
+            "설치가 잘 됐",
+            "설치가 제대로 됐",
+            "설치가 제대로 되었",
+            "설치 제대로 됐",
+            "설치 제대로 되었",
+            "설치가 제대로 반영",
+            "update 잘 됐",
+            "update 잘됐",
+            "update 했는데 잘",
+            "update 했는데 버전이 그대로",
+            "업데이트 했는데 버전이 그대로",
+            "업데이트했는데 버전이 그대로",
+            "업데이트 잘 됐",
+            "업데이트 잘됐",
+            "업데이트 했는데 잘",
+            "업데이트했는데 잘",
+            "업데이트 됐는지",
+            "업데이트 됐는지 확인",
+            "업데이트 되었는지",
+            "업데이트 되었는지 확인",
+            "업데이트 제대로",
+            "업데이트가 제대로",
+            "제대로 반영",
+            "setup 다시 해야",
+            "셋업 다시 해야",
+            "설정 다시 해야",
+            "잘 됐는지",
+            "잘되었는지",
+            "잘 됐어",
+            "잘됐어",
+            "잘 된 거야",
+            "잘된 거야",
+            "잘 된거야",
+            "잘된거야",
+        ),
+    )
+    setup_ui_health_question = _contains_phrase(
+        normalized_query,
+        (
+            "setup slow",
+            "setup feels slow",
+            "setup is slow",
+            "setup arrow key",
+            "setup arrow keys",
+            "setup keyboard",
+            "setup에서 화살표",
+            "setup 화살표",
+            "셋업에서 화살표",
+            "화살표 누르면 느려",
+            "setup에서 위아래키",
+            "setup 위아래키",
+            "셋업에서 위아래키",
+            "위아래키 누르면 느려",
+            "키보드로 이동하면 느려",
+        ),
+    )
+    return simple_health_question or setup_ui_health_question or (omh_context and maintenance and confusion)
+
+
+def _reliability_review_context_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    reliability = bool({"reliability", "slo", "postmortem", "incident"} & query_tokens) or _contains_phrase(
+        normalized_query,
+        (
+            "reliability review",
+            "service reliability",
+            "slo review",
+            "incident review",
+            "incident postmortem",
+            "error budget",
+        ),
+    )
+    review = bool({"review", "check", "검토"} & query_tokens)
+    return reliability and review
+
+
+def _explicit_executor_delegation_requested(normalized_query: str, query_tokens: set[str]) -> bool:
+    named_executor = _contains_phrase(
+        normalized_query,
+        ("codex", "코덱스", "claude code", "클로드", "claude"),
+    )
+    if not named_executor:
+        return False
+    return _contains_phrase(
+        normalized_query,
+        (
+            "한테 시켜",
+            "에게 시켜",
+            "시켜서",
+            "시켜줘",
+            "have codex",
+            "tell codex",
+            "tell claude",
+            "delegate to",
+            "hand this to",
+            "let codex",
+            "let claude",
+        ),
+    )
+
+
+_NAMED_AGENT_HANDOFF_AUTHORING_TOKENS = frozenset({"prompt", "prompts", "brief", "instructions"})
+
+
+def named_coding_agent_delivery_requested(normalized_query: str, query_tokens: set[str]) -> bool:
+    """Explicit coding-agent name plus a coding-delivery request.
+
+    This is the precedence signal that keeps a request like "claude code로 이 이슈 해결해줘"
+    on the coding handoff lane instead of the external-advisor (`ask`) or customer-feedback
+    (`feedback-triage`) lanes. It never dispatches anything; it only selects the prepared
+    coding lane.
+    """
+    if not _contains_named_coding_agent_phrase(normalized_query):
+        return False
+    # Writing the agent's prompt, brief, or instructions is preparing a
+    # handoff to it, not asking it to deliver code now.
+    if _NAMED_AGENT_HANDOFF_AUTHORING_TOKENS & query_tokens:
+        return False
+    # A question about what the agent can do asks for no delivery.
+    if normalized_query.lstrip().startswith(_AGENT_CAPABILITY_QUESTION_OPENERS):
+        return False
+    delivery = _contains_phrase(normalized_query, CODING_DELIVERY_REQUEST_PHRASES) or bool(
+        CODING_DELIVERY_REQUEST_TOKENS & query_tokens
+    )
+    if not delivery:
+        return False
+    if _contains_phrase(
+        normalized_query,
+        ("before coding", "before code", "before implementation", "before writing code", "구현 전에", "코딩 전에"),
+    ):
+        return False
+    if _safe_feature_plan_guard_applies(normalized_query, query_tokens):
+        return False
+    if _risky_refactor_guard_applies(normalized_query, query_tokens):
+        return False
+    if _cleanup_refactor_guard_applies(normalized_query, query_tokens):
+        return False
+    if _coding_progress_status_guard_applies(normalized_query, query_tokens):
+        return False
+    if _github_event_ops_guard_applies(normalized_query, query_tokens):
+        return False
+    if _doctor_health_guard_applies(normalized_query, query_tokens):
+        return False
+    if _release_claim_review_guard_applies(normalized_query, query_tokens):
+        return False
+    return True
+
+
+def _contains_named_coding_agent_phrase(normalized_query: str) -> bool:
+    """Executor-name presence, with per-group matching rules.
+
+    The distinctive executor names keep plain containment. The pi-family-runtime
+    family needs word-boundary checks: "api한테" contains "pi한테", and a word that
+    ends in the runtime's short name contains its runtime phrase, so raw containment named an executor the
+    message never mentioned (see `contains_boundary_phrase` in
+    `routing/executor_cues.py` for the boundary rule).
+
+    Bare "클로드" stays out of `SUBSTRING_NAMED_CODING_AGENT_PHRASES` on purpose
+    (it is an external-advisor name as often as an executor name -- see
+    `_claude_bare_name_delegation_requested` below for the narrow exception).
+    """
+    if _contains_phrase(normalized_query, SUBSTRING_NAMED_CODING_AGENT_PHRASES):
+        return True
+    if contains_boundary_phrase(
+        normalized_query, _normalized_phrase_options(PI_FAMILY_CODING_AGENT_PHRASES)
+    ):
+        return True
+    return _claude_bare_name_delegation_requested(normalized_query)
+
+
+# Bare "클로드" alone is ambiguous (advisor vs. executor), so it never joins
+# `SUBSTRING_NAMED_CODING_AGENT_PHRASES`. The ambiguity disappears once the name
+# co-occurs with an unambiguous delegation verb: "클로드한테 이거 맡겨줘" can only mean
+# "have Claude do it", never "ask Claude about it". The verb list stays narrow to
+# delegation-only shapes -- unlike the broad coding-action stems in
+# `CODING_DELIVERY_REQUEST_PHRASES` (구현/수정/고쳐/...), which can appear inside an
+# advisor-shaped report ("클로드한테 물어봤는데 아직 수정 안됐대") and would reintroduce
+# the same ambiguity bare "클로드" was excluded to avoid.
+_CLAUDE_BARE_NAME_DELEGATION_VERB_PHRASES: tuple[str, ...] = ("맡겨",)
+
+
+def _claude_bare_name_delegation_requested(normalized_query: str) -> bool:
+    if not _contains_phrase(normalized_query, ("클로드",)):
+        return False
+    return _contains_phrase(normalized_query, _CLAUDE_BARE_NAME_DELEGATION_VERB_PHRASES)
+
+
+def _executor_runtime_readiness_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _explicit_executor_delegation_requested(normalized_query, query_tokens):
+        return True
+    # Which executor does better is an evaluation, and the sessions already
+    # open are an inventory; readiness is whether one can run here.
+    if {"better", "compare", "comparison", "versus", "vs", "benchmark"} & query_tokens:
+        return False
+    if {"session", "sessions", "worktree", "worktrees"} & query_tokens and {"list", "all", "open", "show"} & query_tokens:
+        return False
+    if _prompt_import_readiness_context_applies(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _EXECUTOR_RUNTIME_READINESS_PHRASES):
+        return True
+    if _executor_readiness_check_requested(normalized_query, query_tokens):
+        return True
+    if _contains_phrase(
+        normalized_query,
+        (
+            "what coding agents can omh use",
+            "what can omh do for coding agents",
+            "what can omh do for coding agent",
+            "which coding agents can omh use",
+            "what coding agent can omh use",
+            "which coding agent can omh use",
+            "what executors can omh use",
+            "which executors can omh use",
+            "what runtimes can omh use",
+            "which runtimes can omh use",
+        ),
+    ):
+        return True
+    runtime_intent = bool(_EXECUTOR_RUNTIME_READINESS_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        ("runtime", "executor", "handoff", "런타임", "실행", "위임", "넘길", "넘길지"),
+    )
+    named_executor = _contains_phrase(
+        normalized_query,
+        ("codex", "claude code", "coding agent", "omx", RUNTIME_SHORT_NAME, "omc", "코덱스", "클로드"),
+    )
+    selection = _contains_phrase(
+        normalized_query,
+        ("which", "choose", "compare", "vs", "중 어떤", "어떤", "골라", "선택", "정해", "할까", "넘길지"),
+    )
+    run_capability = _contains_phrase(
+        normalized_query,
+        (
+            "can this task run",
+            "can this run",
+            "run in codex",
+            "run in claude",
+            "run with codex",
+            "run with claude",
+        ),
+    )
+    session_action = _contains_phrase(
+        normalized_query,
+        (
+            "open in codex",
+            "open this in codex",
+            "open in claude",
+            "open this in claude",
+            "attach codex session",
+            "attach existing codex session",
+            "attach claude session",
+            "attach existing claude",
+            "resume codex session",
+            "resume claude session",
+            "continue in codex",
+            "continue in claude",
+            "codex로 열어",
+            "코덱스로 열어",
+            "codex로 이 작업 시작",
+            "코덱스로 이 작업 시작",
+            "codex로 작업 시작",
+            "코덱스로 작업 시작",
+            "claude code로 이거 열",
+            "claude code로 이거 열어서",
+            "클로드 코드로 이거 열",
+            "클로드 코드로 이거 열어서",
+            "claude code로 이 작업 시작",
+            "클로드 코드로 이 작업 시작",
+            "claude code로 열어",
+            "클로드 코드로 열어",
+            "codex 세션 붙",
+            "코덱스 세션 붙",
+            "codex 세션 연결",
+            "코덱스 세션 연결",
+            "codex 작업 세션 열어",
+            "코덱스 작업 세션 열어",
+            "claude code 작업 세션 열어",
+            "클로드 코드 작업 세션 열어",
+            "claude code로 이어서",
+            "클로드 코드로 이어서",
+            "codex로 이어서",
+            "코덱스로 이어서",
+        ),
+    )
+    if named_executor and session_action:
+        return True
+    return runtime_intent and named_executor and (selection or run_capability)
+
+
+def _prompt_import_readiness_context_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if not {"prompt", "prompts", "slash", "import", "arguments", "프롬프트", "슬래시", "가져오기"} & query_tokens:
+        return False
+    return _contains_phrase(
+        normalized_query,
+        (
+            "slash prompt",
+            "slash prompts",
+            "prompt import",
+            "prompt imports",
+            "prompt folder",
+            "prompt folders",
+            "prompt directory",
+            "prompt directories",
+            "cli prompt",
+            "cli prompts",
+            "cli agent prompt",
+            "opencode prompt",
+            "claude code prompt",
+            "codex prompt",
+            "gemini cli prompt",
+            "$arguments",
+            "{{args}}",
+            "argument interpolation",
+            "slash command",
+            "슬래시 프롬프트",
+            "프롬프트 가져오기",
+            "프롬프트 폴더",
+            "프롬프트 디렉터리",
+            "프롬프트 인자",
+            "슬래시 명령",
+        ),
+    )
+
+
+def _executor_readiness_check_requested(normalized_query: str, query_tokens: set[str]) -> bool:
+    named_executor = _contains_phrase(
+        normalized_query,
+        ("codex", "claude code", "coding agent", "executor", "코덱스", "클로드", "코딩 에이전트"),
+    )
+    readiness = bool(_EXECUTOR_READINESS_CHECK_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query,
+        (
+            "connection status",
+            "connection check",
+            "readiness check",
+            "ping once",
+            "ping 한번",
+            "first-use",
+            "first use",
+            "one-time check",
+            "one time check",
+            "once before",
+            "연결 상태",
+            "연결 확인",
+            "연결돼",
+            "연결되어",
+            "연결됐",
+            "연결되었",
+            "설치돼",
+            "설치되어",
+            "설치됐",
+            "설치되었",
+            "깔려",
+            "쓸 수",
+            "사용 가능",
+            "한번만 확인",
+            "안되면 물어",
+        ),
+    )
+    return named_executor and readiness
+
+
+def _memory_provider_lifecycle_guard_applies(normalized_query: str) -> bool:
+    return _contains_phrase(normalized_query, MEMORY_PROVIDER_LIFECYCLE_READINESS_PHRASES)
+
+
+def _provider_profile_posture_guard_applies(normalized_query: str) -> bool:
+    return _contains_phrase(
+        normalized_query,
+        (
+            "provider-profile-posture",
+            "provider profile posture",
+            "provider profile readiness",
+            "connector profile posture",
+            "공급자 프로필 상태",
+            "커넥터 프로필 상태",
+        ),
+    )
+
+
+def _toolbelt_readiness_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _hermes_setup_guide_requested(normalized_query):
+        return False
+    # An existing credential being replaced is not a missing one. This lane owns
+    # "I do not have an API key"; rotating the key you already have is a
+    # sequencing and revocation-proof problem, and reading it as a readiness gap
+    # answered "credential rotation sequence and proof the old key is dead" with
+    # a tool inventory.
+    if credential_rotation_guard_applies(normalized_query):
+        return False
+    if _provider_profile_posture_guard_applies(normalized_query):
+        return False
+    if _public_plugin_connector_readiness_requested(normalized_query):
+        return False
+    if _realtime_voice_connector_readiness_requested(normalized_query):
+        return False
+    if _harness_session_inventory_guard_applies(normalized_query, query_tokens):
+        return False
+    if _executor_readiness_check_requested(normalized_query, query_tokens):
+        return False
+    if _doctor_health_guard_applies(normalized_query, query_tokens):
+        return False
+    if _adversarial_qa_guard_applies(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(
+        normalized_query,
+        (
+            "setup log",
+            "setup logs",
+            "setup output",
+            "setup ux",
+            "setup 로그",
+            "setup 출력",
+            "셋업 로그",
+            "셋업 출력",
+            "로그가 너무 어렵",
+            "출력이 너무 어렵",
+        ),
+    ) and _contains_phrase(normalized_query, ("improve", "fix", "개선", "고쳐", "수정")):
+        return False
+    if _contains_phrase(normalized_query, _TOOLBELT_READINESS_PHRASES):
+        return True
+    # `setup` is also one of the missing-or-setup cues below, so on its own it
+    # satisfied both halves, and any sentence about someone's setup read as a
+    # missing tool. The tool has to be named apart from the word `setup`.
+    # Whether a named coding agent can run here is executor readiness.
+    if normalized_query.lstrip().startswith(_AGENT_CAPABILITY_QUESTION_OPENERS) and _contains_named_coding_agent_phrase(
+        normalized_query
+    ):
+        return False
+    # A reported failure without a credential in it is a failure to diagnose,
+    # not a missing tool ("the build fails with a traceback about a missing
+    # module").
+    if _COMMAND_OPERATOR_FAILURE_OUTCOME_TOKENS & query_tokens and not (
+        {"key", "keys", "credential", "credentials", "token", "tokens", "secret", "secrets", "auth"} & query_tokens
+    ):
+        return False
+    # Provider or profile credentials are posture, and a model account is model
+    # setup. `api` alone is a thing to build ("set up the tables and API"),
+    # not a missing tool; an API key or credential is.
+    if {"provider", "providers", "profile", "profiles", "model", "models"} & query_tokens and not (
+        {"plugin", "plugins", "tool", "tools", "connector", "connectors", "mcp", "integration", "generator"} & query_tokens
+    ):
+        return False
+    tool_words = (_TOOLBELT_READINESS_TOKENS - {"setup"}) & query_tokens
+    if tool_words == {"api"} and not _contains_phrase(normalized_query, ("api key", "api keys", "api token", "credential")):
+        tool_words = set()
+    tool_context = bool(tool_words) or _contains_phrase(
+        normalized_query,
+        ("api key", "external tool", "image tool", "image generator", "mcp server", "도구", "커넥터"),
+    )
+    missing_or_setup = _contains_phrase(
+        normalized_query,
+        (
+            "missing",
+            "not connected",
+            "not configured",
+            "not attached",
+            "blocked",
+            "unavailable",
+            "setup",
+            "set up",
+            "connect",
+            "choose",
+            "없어",
+            "없어서",
+            "막혀",
+            "막히",
+            "연결",
+            "안 붙",
+            "설정",
+            "고르",
+        ),
+    )
+    # `credential` names the tool as well as the gap; it counts as the gap only
+    # when some other tool word is the tool.
+    if not missing_or_setup and _contains_phrase(normalized_query, ("credential",)):
+        missing_or_setup = bool(tool_words - {"credential", "credentials"})
+    return tool_context and missing_or_setup
+
+
+def _realtime_voice_connector_readiness_requested(normalized_query: str) -> bool:
+    return _contains_phrase(normalized_query, REALTIME_VOICE_CONNECTOR_READINESS_PHRASES)
+
+
+def _public_plugin_connector_readiness_requested(normalized_query: str) -> bool:
+    if _contains_phrase(normalized_query, PUBLIC_PLUGIN_CONNECTOR_READINESS_EXACT_PHRASES):
+        return True
+    return _contains_phrase(normalized_query, PUBLIC_PLUGIN_CONNECTOR_ALIAS_PHRASES) and _contains_phrase(
+        normalized_query,
+        PUBLIC_PLUGIN_CONNECTOR_READINESS_CONTEXT_PHRASES,
+    )
+
+
+def _harness_session_inventory_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if everyday_sense_phrase_unanchored("harness-session-inventory", normalized_query):
+        return False
+    if _contains_phrase(normalized_query, _HARNESS_SESSION_INVENTORY_PHRASES):
+        return True
+    if not (_HARNESS_SESSION_INVENTORY_TOKENS & query_tokens):
+        return False
+    inventory_or_drift = _contains_phrase(
+        normalized_query,
+        ("inventory", "drift", "adapter", "lifecycle", "인벤토리", "드리프트"),
+    )
+    harness_context = _contains_phrase(
+        normalized_query,
+        (
+            "mcp",
+            "harness",
+            "session",
+            "connector",
+            "worktree",
+            "codex",
+            "claude code",
+            "hermes",
+            "wrapper",
+            "하네스",
+            "세션",
+            "커넥터",
+            "워크트리",
+        ),
+    )
+    return inventory_or_drift and harness_context
+
+
+def _voice_operator_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _VOICE_OPERATOR_PHRASES):
+        return True
+    if _VOICE_OPERATOR_TOKENS & query_tokens and _CAPABILITY_INTENT_TOKENS & query_tokens:
+        return True
+    if _VOICE_OPERATOR_TOKENS & query_tokens and _contains_phrase(
+        normalized_query,
+        ("from mobile", "on mobile", "from phone", "mobile request", "mobile note"),
+    ):
+        return True
+    return bool(_VOICE_OPERATOR_TOKENS & query_tokens) and _contains_phrase(
+        normalized_query,
+        ("clarify", "summarize", "route", "safe", "confirm", "정리", "안전", "확인", "라우팅"),
+    )
+
+
+_EDIT_VERBS = frozenset({"change", "restyle", "redesign", "update", "adjust", "tweak", "make", "match"})
+_APPEARANCE_NOUNS = frozenset(
+    {"style", "styles", "styling", "theme", "color", "colors", "colour", "font", "fonts", "layout", "look", "brand", "branding", "css"}
+)
+
+
+def appearance_edit_request(query_tokens: set[str]) -> bool:
+    """An edit verb plus an appearance noun: a change to how something looks."""
+    return bool(_EDIT_VERBS & query_tokens) and bool(_APPEARANCE_NOUNS & query_tokens)
+
+
+def _browser_operator_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _BROWSER_OPERATOR_LIVE_INCIDENT_BLOCKERS):
+        return False
+    if _contains_phrase(normalized_query, _BROWSER_OPERATOR_VISUAL_QA_BLOCKERS):
+        return False
+    if _contains_phrase(normalized_query, _BROWSER_OPERATOR_PROVIDER_AUTH_BLOCKERS):
+        return False
+    if _contains_phrase(normalized_query, _BROWSER_OPERATOR_PHRASES):
+        return True
+    # Changing how a page looks is a frontend change, not operating a browser
+    # on it: an edit verb plus an appearance noun hands the request on. A
+    # named SaaS app is the connector lane's, not a page to operate.
+    if appearance_edit_request(query_tokens):
+        return False
+    if _CONNECTOR_OPERATOR_CONTEXT_TOKENS & query_tokens:
+        return False
+    browser_context = _BROWSER_OPERATOR_CONTEXT_TOKENS & query_tokens
+    # A word that is both a place and an action (`login`) cannot supply both
+    # halves on its own.
+    browser_action = bool((_BROWSER_OPERATOR_ACTION_TOKENS & query_tokens) - browser_context)
+    if browser_context and browser_action:
+        return True
+    return bool({"url", "link", "페이지", "웹페이지", "링크"} & query_tokens) and _contains_phrase(
+        normalized_query,
+        ("open", "click", "fill", "login", "capture", "열고", "클릭", "로그인", "캡처"),
+    )
+
+
+def _workspace_file_operator_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _memory_provider_lifecycle_guard_applies(normalized_query):
+        return False
+    if _contains_phrase(normalized_query, _WORKSPACE_FILE_OPERATOR_BLOCKERS):
+        return False
+    if _contains_phrase(normalized_query, _WORKSPACE_FILE_OPERATOR_MATERIALS_BLOCKERS):
+        return False
+    if _contains_phrase(normalized_query, _WORKSPACE_FILE_OPERATOR_PHRASES):
+        return True
+    file_context = bool(_WORKSPACE_FILE_OPERATOR_CONTEXT_TOKENS & query_tokens)
+    file_action = bool(_WORKSPACE_FILE_OPERATOR_ACTION_TOKENS & query_tokens)
+    if not (file_context and file_action):
+        return False
+    # A file named by a unit of source code is code to change, not a file to
+    # move.
+    if {"bug", "bugs", "upload", "uploads", "코드", "버그"} & query_tokens or _CODE_UNIT_TOKENS & query_tokens:
+        return False
+    return not _contains_phrase(
+        normalized_query,
+        (
+            "readme title",
+            "readme 제목",
+            "리드미 제목",
+            "file upload",
+            "upload file",
+            "code file",
+            "source file",
+        ),
+    )
+
+
+# A command whose outcome is already reported as a failure is a failure to
+# diagnose, not a command to run. Failure-outcome vocabulary, not phrasings.
+_COMMAND_OPERATOR_FAILURE_OUTCOME_TOKENS = frozenset(
+    {
+        "error", "errors", "erroring", "fail", "fails", "failed", "failing", "failure", "failures",
+        "crash", "crashes", "crashed", "crashing", "exception", "exceptions", "throw", "throws",
+        "thrown", "warning", "warnings", "traceback", "complaint", "complaints", "broken",
+    }
+)
+# A question that opens with a modal or copula and names a coding agent asks
+# what that agent can do; it names no command for OMH to run.
+_AGENT_CAPABILITY_QUESTION_OPENERS = ("can ", "could ", "does ", "do ", "is ", "are ", "will ")
+
+
+def command_request_is_failure_or_agent_question(normalized_query: str, query_tokens: set[str]) -> bool:
+    """A failure to diagnose, or a question about what a coding agent can do."""
+    if _COMMAND_OPERATOR_FAILURE_OUTCOME_TOKENS & query_tokens:
+        return True
+    return normalized_query.lstrip().startswith(_AGENT_CAPABILITY_QUESTION_OPENERS) and _contains_named_coding_agent_phrase(
+        normalized_query
+    )
+
+
+def _command_operator_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _COMMAND_OPERATOR_BLOCKERS):
+        return False
+    if command_request_is_failure_or_agent_question(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _COMMAND_OPERATOR_PHRASES):
+        return True
+    command_context = bool(_COMMAND_OPERATOR_CONTEXT_TOKENS & query_tokens)
+    command_action = bool(_COMMAND_OPERATOR_ACTION_TOKENS & query_tokens)
+    if not (command_context and command_action):
+        return False
+    return not _contains_phrase(
+        normalized_query,
+        (
+            "fix the",
+            "fix failing",
+            "root cause",
+            "failed with",
+            "stack trace",
+            "고쳐",
+            "수정",
+            "원인",
+        ),
+    )
+
+
+def _connector_operator_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _CONNECTOR_OPERATOR_BLOCKERS):
+        return False
+    # A digest on a cadence is a scheduled job, and a deploy command is a
+    # release, not an action in a connected app.
+    if has_cadence(normalized_query, query_tokens):
+        return False
+    if _command_words(normalized_query)[:1] and _command_words(normalized_query)[0] in {"deploy", "ship", "release"}:
+        return False
+    # Preparing provider or profile configuration is posture, not an action
+    # in a connected app.
+    if {"provider", "providers", "profile", "profiles"} & query_tokens and {"configuration", "configurations", "config", "secrets", "keys"} & query_tokens:
+        return False
+    if _gateway_intent_guard_applies(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _CONNECTOR_OPERATOR_PHRASES):
+        return True
+    connector_context = bool(_CONNECTOR_OPERATOR_CONTEXT_TOKENS & query_tokens)
+    connector_action = bool(_CONNECTOR_OPERATOR_ACTION_TOKENS & query_tokens)
+    platform_write = _platform_connector_write_applies(normalized_query, query_tokens)
+    return (connector_context and connector_action) or platform_write
+
+
+def _platform_connector_write_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    platform = bool({"slack", "discord"} & query_tokens)
+    if not platform:
+        return False
+    connector_action = bool(_CONNECTOR_OPERATOR_ACTION_TOKENS & query_tokens)
+    explicit_write_boundary = (
+        bool({"dm", "channel", "approval", "confirmation"} & query_tokens)
+        or _contains_phrase(
+            normalized_query,
+            (
+                "after approval",
+                "after i approve",
+                "confirmation gate",
+                "post this",
+                "send a slack dm",
+                "slack dm",
+                "discord dm",
+            ),
+        )
+    )
+    return connector_action and explicit_write_boundary
+
+
+def _live_info_operator_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _LIVE_INFO_OPERATOR_BLOCKERS):
+        return False
+    if _connector_operator_guard_applies(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _LIVE_INFO_OPERATOR_PHRASES):
+        return True
+    live_context = _LIVE_INFO_OPERATOR_CONTEXT_TOKENS & query_tokens
+    lookup_intent = bool(_LIVE_INFO_OPERATOR_LOOKUP_TOKENS & query_tokens)
+    if not (live_context and lookup_intent):
+        return False
+    # `time`, `rate`, `score`, `price`, `map` and their kin are everyday words
+    # (a decision made last time, a page to rate, risks to map out). Alone
+    # they need a live cue before they read as a lookup: one of
+    # `_LIVE_INFO_OPERATOR_LIVE_CUE_TOKENS`, or "right now", "last night",
+    # "this morning".
+    if live_context - _LIVE_INFO_OPERATOR_EVERYDAY_CONTEXT_TOKENS:
+        return True
+    return bool(_LIVE_INFO_OPERATOR_LIVE_CUE_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, ("right now", "last night", "this morning", "현재", "지금", "오늘")
+    )
+
+
+def _media_input_operator_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _MEDIA_INPUT_OPERATOR_BLOCKERS):
+        return False
+    if _connector_operator_guard_applies(normalized_query, query_tokens):
+        return False
+    if _voice_operator_guard_applies(normalized_query, query_tokens) and not _contains_phrase(
+        normalized_query,
+        _MEDIA_INPUT_OPERATOR_PHRASES,
+    ):
+        return False
+    if _materials_package_guard_applies(normalized_query, query_tokens):
+        return False
+    if _web_research_guard_applies(normalized_query, query_tokens):
+        return False
+    receipt_extraction_phrase = _contains_phrase(normalized_query, _MEDIA_INPUT_RECEIPT_EXTRACTION_PHRASES)
+    extractive_action = bool(_MEDIA_INPUT_EXTRACTIVE_ACTION_TOKENS & query_tokens)
+    if receipt_extraction_phrase:
+        if _visual_summary_guard_applies(normalized_query, query_tokens) and not extractive_action:
+            return False
+        return True
+    if _contains_phrase(normalized_query, _MEDIA_INPUT_OPERATOR_PHRASES):
+        return True
+    context_tokens = _MEDIA_INPUT_CONTEXT_TOKENS & query_tokens
+    visual_context = bool(_MEDIA_INPUT_VISUAL_CONTEXT_TOKENS & query_tokens)
+    non_visual_media_context = bool(context_tokens - _MEDIA_INPUT_VISUAL_CONTEXT_TOKENS)
+    media_action = bool(_MEDIA_INPUT_ACTION_TOKENS & query_tokens)
+    if visual_context and not non_visual_media_context:
+        return extractive_action
+    return bool(context_tokens) and media_action
+
+
+def media_input_operator_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    return _media_input_operator_guard_applies(normalized_query, query_tokens)
+
+
+def jit_learn_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    return _jit_learn_guard_applies(normalized_query, query_tokens)
+
+
+def _content_operator_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _contains_phrase(normalized_query, _CONTENT_OPERATOR_BLOCKERS):
+        return False
+    if _visual_summary_guard_applies(normalized_query, query_tokens):
+        return False
+    if _materials_package_guard_applies(normalized_query, query_tokens):
+        return False
+    if _connector_operator_guard_applies(normalized_query, query_tokens):
+        return False
+    if _media_input_operator_guard_applies(normalized_query, query_tokens):
+        return False
+    if _contains_phrase(normalized_query, _CONTENT_OPERATOR_PHRASES):
+        return True
+    if _web_research_guard_applies(normalized_query, query_tokens):
+        return False
+    content_context = bool(_CONTENT_OPERATOR_CONTEXT_TOKENS & query_tokens)
+    content_action = bool(_CONTENT_OPERATOR_ACTION_TOKENS & query_tokens)
+    quality_context = bool(_CONTENT_OPERATOR_QUALITY_TOKENS & query_tokens)
+    return content_context and content_action and quality_context
+
+
+def _visual_summary_guard_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    # `prepare_routing_text` emits this cue only for bounded Apple-style
+    # product-visual library intent, which must reach the Apple specialist
+    # before generic image-card intake.
+    if _contains_phrase(normalized_query, ("apple product visual",)):
+        return False
+    if _is_short_visual_summary_request(normalized_query):
+        return True
+    if _gateway_intent_guard_applies(normalized_query, query_tokens):
+        return False
+    explicit_visual_phrase = _contains_phrase(normalized_query, _VISUAL_SUMMARY_PHRASES)
+    if explicit_visual_phrase:
+        return True
+    if (
+        _VISUAL_SUMMARY_MODALITY_TOKENS & query_tokens
+        and not _VISUAL_SUMMARY_NON_VISUAL_WORK_TOKENS & query_tokens
+        and _contains_phrase(normalized_query, ("remove the background", "background removal"))
+    ):
+        return True
+    if (
+        _missed_omh_workflow_context_applies(normalized_query)
+        and _VISUAL_SUMMARY_MODALITY_TOKENS & query_tokens
+        and not _VISUAL_SUMMARY_NON_VISUAL_WORK_TOKENS & query_tokens
+    ):
+        return True
+    if (
+        _VISUAL_SUMMARY_CARD_TOKENS & query_tokens
+        and _VISUAL_SUMMARY_OUTPUT_CONTEXT_TOKENS & query_tokens
+        and not any(
+            phrase_is_spoken(normalized_query, normalized_phrase(phrase))
+            for phrase in (*_WORK_ITEM_CARD_PHRASES, *_PAYMENT_CARD_PHRASES)
+        )
+        and not spend_phrase_continues_a_request(normalized_query, "with my card")
+    ):
+        return True
+    if _VISUAL_SUMMARY_NON_VISUAL_WORK_TOKENS & query_tokens:
+        return False
+    if _VISUAL_SUMMARY_MODALITY_TOKENS & query_tokens and _VISUAL_SUMMARY_CAPABILITY_TOKENS & query_tokens:
+        return True
+    if _VISUAL_SUMMARY_MODALITY_TOKENS & query_tokens and _VISUAL_SUMMARY_OUTPUT_CONTEXT_TOKENS & query_tokens:
+        return True
+    if _VISUAL_SUMMARY_OUTPUT_CONTEXT_TOKENS & query_tokens and _contains_phrase(
+        normalized_query,
+        ("summary image", "summary card", "briefing card", "announcement image", "요약 이미지", "요약 카드"),
+    ):
+        return True
+    return False
+
+
+def _cached_visual_summary_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    visual_summary_applies: bool | None,
+) -> bool:
+    if visual_summary_applies is not None:
+        return visual_summary_applies
+    return _visual_summary_guard_applies(normalized_query, query_tokens)
+
+
+def _is_short_visual_summary_request(normalized_query: str) -> bool:
+    compact = normalized_query.strip(" \t\r\n.!?,;:()[]{}\"'`~。？！、，；：")
+    return compact in _VISUAL_SUMMARY_SHORT_REQUEST_PHRASES
+
+
+def _missed_omh_workflow_context_applies(normalized_query: str) -> bool:
+    return has_normalized_missed_omh_workflow_context(normalized_query)
+
+
+def contract_redline_guard_applies(normalized_query: str) -> bool:
+    """A markup or negotiation cue and a contract document together."""
+    return _contains_phrase(normalized_query, _CONTRACT_MARKUP_CUES) and _contains_phrase(
+        normalized_query, _CONTRACT_DOCUMENT_NOUNS
+    )
+
+
+def credential_rotation_guard_applies(normalized_query: str) -> bool:
+    """A rotation verb and a credential noun together; neither alone."""
+    return _contains_phrase(normalized_query, _CREDENTIAL_ROTATION_VERBS) and _contains_phrase(
+        normalized_query, _CREDENTIAL_ROTATION_SUBJECTS
+    )
+
+
+def dependency_upgrade_guard_applies(normalized_query: str) -> bool:
+    """Complete upgrade phrases or a version bump; `upgrade` alone is not this lane."""
+    return _contains_phrase(normalized_query, _DEPENDENCY_UPGRADE_PHRASES) or dependency_bump_spoken(normalized_query)
+
+
+def dependency_bump_spoken(normalized_query: str) -> bool:
+    """A bot-opened bump or a spoken version jump that carries no security event.
+
+    A security advisory, a leaked secret, or a CVE that arrives as a bump is an
+    event for `security-event-response`, not an upgrade.
+    """
+    if _contains_phrase(normalized_query, _SECURITY_EVENT_OVER_GITHUB_EVENT_PHRASES) or "cve" in routing_tokens(
+        normalized_query
+    ):
+        return False
+    return _contains_phrase(normalized_query, _DEPENDENCY_BUMP_PHRASES) or version_jump_spoken(normalized_query)
+
+
+def version_jump_spoken(normalized_query: str) -> bool:
+    """An upgrade verb, two version numbers, and a word of software.
+
+    "upgrade react from 18 to 19" and "bumped express 4.18 to 5.0" qualify;
+    "upgrade my iphone from 14 to 16" has the shape and no software word.
+    """
+    terms = routing_terms(normalized_query)
+    if not _VERSION_JUMP_VERBS & terms or not _VERSION_JUMP_SOFTWARE_ANCHORS & terms:
+        return False
+    versions = {term for term in terms if term.removeprefix("v").isdigit()}
+    return len(versions) >= 2
+
+
+def _generated_artifact_provenance_guard_applies(normalized_query: str) -> bool:
+    """A generated-path question needs both halves: the noun and the provenance."""
+    return _contains_phrase(normalized_query, _GENERATED_ARTIFACT_NOUNS) and _contains_phrase(
+        normalized_query, _GENERATED_PROVENANCE_CUES
+    )
+
+
+def _deliverable_package_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    visual_summary_applies: bool | None = None,
+) -> bool:
+    if _cached_visual_summary_applies(normalized_query, query_tokens, visual_summary_applies):
+        return False
+    if _generated_artifact_provenance_guard_applies(normalized_query):
+        return False
+    if _deliverable_gateway_context_applies(normalized_query, query_tokens):
+        return False
+    explicit_phrase = _contains_phrase(normalized_query, _DELIVERABLE_PHRASES)
+    if explicit_phrase:
+        return True
+    if _DELIVERABLE_STRONG_TOKENS & query_tokens and _DELIVERABLE_FILE_TOKENS & query_tokens:
+        return True
+    return False
+
+
+def _deliverable_gateway_context_applies(normalized_query: str, query_tokens: set[str]) -> bool:
+    gateway_context = bool(_DELIVERABLE_GATEWAY_CONTEXT_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, _DELIVERABLE_GATEWAY_CONTEXT_PHRASES
+    )
+    if not gateway_context:
+        return False
+    deliverable_file_context = bool(_DELIVERABLE_FILE_TOKENS & query_tokens) or _contains_phrase(
+        normalized_query, ("generated pdf", "generated file", "file attachment", "attach file")
+    )
+    return not deliverable_file_context
+
+
+def _delivery_cycle_guard_applies(
+    normalized_query: str,
+    query_tokens: set[str],
+    *,
+    visual_summary_applies: bool | None = None,
+) -> bool:
+    if _cached_visual_summary_applies(normalized_query, query_tokens, visual_summary_applies):
+        return False
+    # Reviewing a pull request is a review, not a request to deliver one.
+    if _command_words(normalized_query)[:1] == ["review"]:
+        return False
+    return _delivery_cycle_terms(normalized_query, query_tokens) and _contains_phrase(
+        normalized_query,
+        (
+            "prepare a pr",
+            "open a pr",
+            "make a pr",
+            "pr-ready",
+            "pr ready",
+            "pull request",
+            "plan implement review docs",
+            "research plan implement",
+            "in one cycle",
+            "계획 구현 리뷰 문서",
+            "기획 구현 리뷰 문서",
+            "pr까지",
+        ),
+    )
+
+
+def _explicit_delivery_or_implementation_requested(normalized_query: str, query_tokens: set[str]) -> bool:
+    if _delivery_cycle_terms(normalized_query, query_tokens):
+        return True
+    return _contains_phrase(
+        normalized_query,
+        (
+            "write the code",
+            "implement the fix",
+            "fix the code",
+            "open the pr",
+            "merge the pr",
+            "코드 작성",
+            "수정 구현",
+            "pr 열",
+            "pr 머지",
+        ),
+    )
+
+
+@lru_cache(maxsize=16384)
+def _contains_phrase(normalized_query: str, phrases: tuple[str, ...] | frozenset[str]) -> bool:
+    for phrase in _normalized_phrase_options(phrases):
+        if phrase in normalized_query:
+            return True
+    return False
+
+
+@lru_cache(maxsize=512)
+def _normalized_phrase_options(phrases: tuple[str, ...] | frozenset[str]) -> tuple[str, ...]:
+    normalized_phrases: list[str] = []
+    for phrase in phrases:
+        normalized = normalized_phrase(phrase)
+        if normalized:
+            normalized_phrases.append(normalized)
+    return tuple(normalized_phrases)

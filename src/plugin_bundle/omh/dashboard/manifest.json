@@ -1,0 +1,5 @@
+{
+  "name": "omh",
+  "api": "plugin_api.py",
+  "tab": {"hidden": true}
+}

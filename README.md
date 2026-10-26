@@ -23,13 +23,14 @@ generated Python modules, translated READMEs, benchmark fixtures and a
 skill catalogue you could not read. The useful ideas — a model per lane, skills
 on demand, evidence before “done” — were buried under that.
 
-OMH keeps those three ideas and deletes everything else:
+OMH keeps those three ideas in a small runnable harness, and keeps the upstream
+packages around for reference:
 
 | | upstream | omh |
 | --- | --- | --- |
 | wheel size | 149 MB install | 62 KB |
-| Python modules | 1,182 | 23 |
-| source lines | ~500k | ~5,300 |
+| Python modules | 1,182 | 23 runnable (+ `src/` reference copy) |
+| source lines | ~500k | ~5,300 runnable |
 | runtime dependencies | none (but wraps Hermes) | **none** |
 | start-up | install + setup + gateway | `python main.py` |
 | provider support | via Hermes | OpenAI-compatible, Anthropic, Ollama, mock |
@@ -49,6 +50,10 @@ python main.py --offline
 # or with a real key
 export OPENAI_API_KEY=sk-...
 python main.py
+
+# keys, models and base URLs can also live in config.toml:
+#   cp config.toml ~/.omh/config.toml   (or: python main.py --init)
+python main.py --init
 ```
 
 Install the `omh` command (optional, still no dependencies):
@@ -196,7 +201,7 @@ Inside the REPL:
 /clear                forget this session's messages
 /cost                 tokens, spend, model
 /doctor               config, providers, credential health
-/init                 write ~/.omh/config.json
+/init                 write ~/.omh/config.toml
 /save                 save now
 /version              print version
 /exit                 leave
@@ -207,49 +212,65 @@ turn; `ctrl-d` exits.
 
 ## Configuration
 
-Config is plain JSON. OMH reads, in order:
+Everything about models — ids, providers, base URLs, weights, prices and keys —
+lives in [`config.toml`](config.toml). There is no model list in Python code.
+OMH reads, in order:
 
-1. `~/.omh/config.json`
-2. `./.omh.json`
-3. `OMH_*` environment variables
-4. CLI flags
+1. the built-in `config.toml`
+2. `~/.omh/config.toml`
+3. `./.omh.toml` (project config; `OMH_CONFIG=/path` also works)
+4. `OMH_*` environment variables
+5. CLI flags
 
 `.env` files in the workspace and `~/.omh/.env` are loaded without overwriting
-real environment variables. `omh --init` writes a fully commented starter file;
-`omh --doctor` shows exactly which file is active.
+real environment variables. `omh --init` copies the commented template to
+`~/.omh/config.toml`; `omh --doctor` shows what is active.
 
-```json
-{
-  "model": "",
-  "approval_mode": "ask",
-  "theme": "hermes",
-  "max_steps": 12,
-  "max_tokens": 4096,
-  "max_tool_output": 20000,
-  "router": {
-    "strategy": "balanced",
-    "max_attempts": 3,
-    "cooldown_s": 20,
-    "hedge_delay_s": 0
-  },
-  "providers": {
-    "openai": {
-      "kind": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "api_key_env": "OPENAI_API_KEY"
-    },
-    "ollama": {
-      "kind": "openai",
-      "base_url": "http://localhost:11434/v1",
-      "requires_key": false
-    }
-  },
-  "models": [
-    { "id": "gpt-4o-mini", "provider": "openai", "weight": 2 },
-    { "id": "llama3.2", "provider": "ollama", "weight": 1 }
-  ]
-}
+```toml
+model = ""                # ""/auto = load balance, or a model id/alias
+approval_mode = "ask"
+theme = "hermes"
+
+[router]
+strategy = "balanced"
+max_attempts = 3
+cooldown_s = 20.0
+hedge_delay_s = 0.0
+max_parallel_tools = 4
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+api_key = ""              # or "${MY_KEY}" or a literal key (do not commit it)
+
+[providers.local]
+kind = "openai"
+base_url = "http://localhost:8000/v1"
+requires_key = false
+
+[[models]]
+id = "gpt-4o-mini"
+provider = "openai"
+label = "gpt-4o-mini"
+weight = 2.0
+context = 128000
+input_cost = 0.15
+output_cost = 0.60
+
+[[models]]
+id = "qwen2.5-coder-32b"
+provider = "local"
+label = "qwen-coder"
+weight = 3.0
+context = 32768
 ```
+
+Add a provider with one `[providers.<name>]` table and a model with one
+`[[models]]` block, then restart (or `/model auto`). Keys can be a literal
+`api_key`, an `api_key_env` variable name, or `api_key = "${VAR}"` which is
+expanded from the environment.
+
 
 Key environment variables:
 
@@ -266,11 +287,13 @@ Key environment variables:
 
 ```
 main.py                 entry point (python main.py)
+config.toml             all models, providers, base URLs, keys, routing
 omh/
   cli.py                argparse, REPL, slash commands, tables
   agent.py              stream → tool calls → repeat, parallel tools
   router.py             weighted balancing, failover, cooldown, hedging
-  config.py             JSON config, env, .env, model pool
+  config.py             TOML config, env, .env, model pool
+  default_config.toml   packaged copy of config.toml (wheel installs)
   providers/
     base.py             messages, tool calls, chunks
     http.py             urllib SSE client + error mapping
@@ -284,8 +307,14 @@ omh/
   ui.py                 spinner, tool cards, prompt, approvals
   errors.py             one error hierarchy
 skills/                 review, debug, refactor, test-first
+src/                    upstream oh-my-hermes packages, kept for reference
 tests/                  stdlib unittest suite
 ```
+
+`src/` is an unmodified copy of upstream `src/` (1,255 files, 23 packages) so
+the routing, coding, evidence and workflow code is available to read or port.
+It is **not** imported by `main.py` and is not included in the wheel; see
+[`src/UPSTREAM.md`](src/UPSTREAM.md).
 
 The loop is deliberately boring: build the message list, trim it, stream a
 completion, append the assistant message, run any tool calls in parallel,
@@ -310,10 +339,12 @@ smoke tests (including a real `python main.py --offline` run).
 ## Provenance
 
 OMH is a ground-up rewrite that reuses ideas (and the turquoise skin palette)
-from [`rlaope/oh-my-hermes`](https://github.com/rlaope/oh-my-hermes). The bulky
-generated skill catalogues, installer scripts, docs site, benchmarks and
-translated READMEs were removed on purpose; the repository now contains only
-code needed to run the agent.
+from [`rlaope/oh-my-hermes`](https://github.com/rlaope/oh-my-hermes). The
+installer scripts, docs site, benchmarks, translated READMEs and generated
+catalogues are not part of the runnable CLI. The upstream `src/` packages are
+kept verbatim under [`src/`](src/UPSTREAM.md) for reference, so the routing,
+coding and workflow machinery is still in the repository; only the 23-module
+`omh/` package and `config.toml` drive the agent.
 
 ## License
 

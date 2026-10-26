@@ -81,7 +81,12 @@ class OpenAIProvider(Provider):
         return self.config.available()
 
     def _url(self) -> str:
-        base = self.config.base_url or "https://api.openai.com/v1"
+        base = self.config.base_url
+        if not base:
+            raise ProviderError(
+                f"{self.name} has no base_url; add it to config.toml",
+                retryable=False,
+            )
         if base.endswith("/chat/completions"):
             return base
         return base.rstrip("/") + "/chat/completions"

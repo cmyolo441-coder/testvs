@@ -1,0 +1,924 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+from typing import Mapping, TypedDict
+
+from ..ingress import CHAT_SOURCES
+from ..routing.action_copy import next_action_label
+from ..wrapper.contract import build_chat_interaction_payload
+
+
+CHAT_CARD_COVERAGE_SCHEMA_VERSION = "chat_card_coverage/v1"
+
+
+@dataclass(frozen=True)
+class ChatCardCoverageCase:
+    id: str
+    title: str
+    message: str
+    expected_skill: str
+    expected_kind: str
+    expected_next_action: str
+    expected_phase: str = ""
+
+
+# Frozen wrapper-card corpus. These are user-facing routes where a generic
+# acknowledgement would make Hermes feel less capable and less explainable.
+CHAT_CARD_COVERAGE_CASES: tuple[ChatCardCoverageCase, ...] = (
+    ChatCardCoverageCase(
+        "context",
+        "Project terminology alignment",
+        "use ulw-context to align the terms this project uses",
+        "context",
+        "project_terms_context",
+        "prepare_project_terms_context",
+    ),
+    ChatCardCoverageCase(
+        "automation-blueprint",
+        "Scheduled ops blueprint",
+        "매일 아침 릴리즈 위험을 확인하고 변화가 있으면 슬랙에 알려줘",
+        "automation-blueprint",
+        "automation_blueprint",
+        "prepare_scheduled_ops_blueprint",
+    ),
+    ChatCardCoverageCase(
+        "agent-board",
+        "Multi-agent board",
+        "우리 팀 Hermes agent 여러 명이 같이 일할 때 역할과 보드를 잡아줘",
+        "agent-board",
+        "agent_board",
+        "prepare_agent_board_card",
+    ),
+    ChatCardCoverageCase(
+        "memory-new",
+        "New memory candidate",
+        "document-harness 프로젝트 메모리 저장해줘",
+        "memory-new",
+        "memory_candidate",
+        "prepare_memory_new",
+    ),
+    ChatCardCoverageCase(
+        "memory-sync",
+        "Memory curation review",
+        "Hermes가 기억하고 있는 프로젝트 맥락이 오래된 것 같아 정리해줘",
+        "memory-sync",
+        "memory_curation",
+        "prepare_memory_sync",
+    ),
+    ChatCardCoverageCase(
+        "decision-recall",
+        "Rejected-decision recall",
+        "Show rejected decisions for this project.",
+        "decision-recall",
+        "decision_recall",
+        "show_rejected_decision_recall",
+    ),
+    ChatCardCoverageCase(
+        "gateway-intent-card",
+        "Gateway intent card",
+        "route Discord Slack Telegram threads with delivery policy",
+        "gateway-intent-card",
+        "gateway_intent",
+        "prepare_gateway_intent_card",
+    ),
+    ChatCardCoverageCase(
+        "deliverable-package",
+        "Deliverable package",
+        "이 보고서를 파일로 만들어서 첨부할 수 있게 준비해줘",
+        "deliverable-package",
+        "deliverable_package",
+        "prepare_deliverable_package",
+    ),
+    ChatCardCoverageCase(
+        "voice-operator",
+        "Voice operator guidance",
+        "does OMH support voice commands?",
+        "voice-operator",
+        "voice_operator",
+        "prepare_voice_operator_card",
+    ),
+    ChatCardCoverageCase(
+        "toolbelt-readiness",
+        "Toolbelt readiness",
+        "can OMH help with MCP setup?",
+        "toolbelt-readiness",
+        "toolbelt_readiness",
+        "prepare_toolbelt_readiness",
+    ),
+    ChatCardCoverageCase(
+        "ops-observability-card",
+        "Ops observability card",
+        "show token cost latency run history for this automation loop",
+        "ops-observability-card",
+        "ops_observability",
+        "prepare_ops_observability_card",
+    ),
+    ChatCardCoverageCase(
+        "run-efficiency",
+        "Local run efficiency",
+        "Show the local run efficiency report.",
+        "run-efficiency",
+        "run_efficiency",
+        "show_run_efficiency_report",
+    ),
+    ChatCardCoverageCase(
+        "provider-profile-posture",
+        "Provider profile posture",
+        "Prepare provider profile posture for this connector.",
+        "provider-profile-posture",
+        "provider_profile_posture",
+        "prepare_provider_profile_posture",
+    ),
+    ChatCardCoverageCase(
+        "operating-rhythm",
+        "Operating rhythm",
+        "회의록 히스토리 관리하고 스크럼 스프린트 회고 운영 리듬 정리해줘",
+        "operating-rhythm",
+        "operating_rhythm",
+        "prepare_operating_record",
+    ),
+    ChatCardCoverageCase(
+        "report-package",
+        "Report package",
+        "create a PPT report package for a monthly leadership status deck",
+        "report-package",
+        "report_package",
+        "prepare_report_package",
+    ),
+    ChatCardCoverageCase(
+        "materials-package",
+        "Materials package",
+        "엑셀 매출 리포트를 PDF로 만들고 렌더 QA까지 준비해줘",
+        "materials-package",
+        "materials_package",
+        "prepare_material_package",
+    ),
+    ChatCardCoverageCase(
+        "reliability-review",
+        "Reliability review",
+        "run an incident postmortem SLO error budget service reliability review",
+        "reliability-review",
+        "reliability_review",
+        "prepare_reliability_review",
+    ),
+    ChatCardCoverageCase(
+        "idea-to-deploy",
+        "Idea to deploy",
+        "take this product idea from plan to deploy and monitor safely",
+        "idea-to-deploy",
+        "app_delivery_loop",
+        "present_app_delivery_loop",
+    ),
+    ChatCardCoverageCase(
+        "cto-loop",
+        "CTO loop",
+        "run a CTO loop for roadmap architecture tradeoffs delivery risk and release readiness",
+        "cto-loop",
+        "cto_loop",
+        "run_cto_loop",
+    ),
+    ChatCardCoverageCase(
+        "deploy-and-monitor",
+        "Deploy and monitor",
+        "deploy and monitor this release with rollback and health checks",
+        "deploy-and-monitor",
+        "deploy_monitor_plan",
+        "prepare_deploy_monitor_plan",
+    ),
+    ChatCardCoverageCase(
+        "research-department",
+        "Research department",
+        "I need a weekly leadership brief from support tickets, competitor news, and release risks",
+        "research-department",
+        "research_department",
+        "prepare_research_department_plan",
+    ),
+    ChatCardCoverageCase(
+        "github-event-ops",
+        "GitHub event ops",
+        "Make this GitHub issue into a PR, run review, update docs, and tell me what changed",
+        "github-event-ops",
+        "github_event_ops",
+        "prepare_github_event_ops_card",
+    ),
+    ChatCardCoverageCase(
+        "github-issue-intake",
+        "GitHub issue intake",
+        "please file this as an issue: omh setup fails on Windows",
+        "github-issue-intake",
+        "github_issue_intake",
+        "prepare_github_issue_intake",
+    ),
+    ChatCardCoverageCase(
+        "executor-runtime-readiness",
+        "Executor runtime readiness",
+        "Should I use Codex or Claude Code for this coding task?",
+        "executor-runtime-readiness",
+        "executor_runtime_readiness",
+        "prepare_executor_runtime_readiness",
+    ),
+    ChatCardCoverageCase(
+        "feedback-triage",
+        "Feedback triage",
+        "결제 실패 이슈가 자주 나와",
+        "feedback-triage",
+        "feedback_triage",
+        "triage_feedback",
+    ),
+    ChatCardCoverageCase(
+        "img-summary",
+        "Image summary",
+        "make a poster explaining cron automation",
+        "img-summary",
+        "img_summary",
+        "prepare_visual_prompt_card",
+    ),
+    ChatCardCoverageCase(
+        "paper-learning",
+        "Paper learning",
+        "논문 PDF를 쉬운 수준으로 섹션별로 해설해줘",
+        "paper-learning",
+        "paper_learning",
+        "prepare_paper_learning",
+    ),
+    ChatCardCoverageCase(
+        "long-document-reading",
+        "Long document reading",
+        "summarize this 300-page vendor contract pdf and list every obligation with a deadline",
+        "long-document-reading",
+        "long_document_reading",
+        "prepare_long_document_reading",
+    ),
+    ChatCardCoverageCase(
+        "source-finder",
+        "Source finder",
+        "find papers datasets github repos and public presentations about agent memory",
+        "source-finder",
+        "source_finder",
+        "prepare_source_finder_plan",
+    ),
+    ChatCardCoverageCase(
+        "web-research",
+        "Web lookup",
+        "web research with citations about current AI agent market trends",
+        "web-research",
+        "web_research",
+        "run_hermes_research",
+    ),
+    ChatCardCoverageCase(
+        "research",
+        "Research",
+        "deep research on comparable open source implementations before the spec",
+        "research",
+        "web_research",
+        "run_hermes_research",
+    ),
+    ChatCardCoverageCase(
+        "workflow-learning",
+        "Workflow learning",
+        "I want Hermes to learn from this workflow and improve the skill next time",
+        "workflow-learning",
+        "workflow_learning",
+        "audit_learning_readiness",
+    ),
+    ChatCardCoverageCase(
+        "agent-ops-review",
+        "Agent ops review",
+        "AI agent 서치및 코딩 품질을 제3자 관리자 입장에서 점검해줘",
+        "agent-ops-review",
+        "agent_ops_review",
+        "show_agent_ops_review",
+    ),
+    ChatCardCoverageCase(
+        "accessibility-audit",
+        "Accessibility Audit",
+        "run an accessibility audit on this page design",
+        "accessibility-audit",
+        "accessibility_audit",
+        "prepare_accessibility_audit",
+    ),
+    ChatCardCoverageCase(
+        "agent-debug",
+        "Agent Debug",
+        "agent-debug",
+        "agent-debug",
+        "agent_debug",
+        "prepare_agent_debug",
+    ),
+    ChatCardCoverageCase(
+        "agent-evaluation",
+        "Agent Evaluation",
+        "agent-evaluation",
+        "agent-evaluation",
+        "agent_evaluation",
+        "prepare_agent_evaluation",
+    ),
+    ChatCardCoverageCase(
+        "browser-operator",
+        "Browser Operator",
+        "browser operator task: open the url and capture the page",
+        "browser-operator",
+        "browser_operator",
+        "prepare_browser_operator_card",
+    ),
+    ChatCardCoverageCase(
+        "build-failure-triage",
+        "Build Failure Triage",
+        "triage this build failure before touching code",
+        "build-failure-triage",
+        "build_failure_triage",
+        "prepare_build_failure_triage",
+    ),
+    ChatCardCoverageCase(
+        "codebase-onboarding",
+        "Codebase Onboarding",
+        "codebase onboarding for this repository",
+        "codebase-onboarding",
+        "codebase_onboarding",
+        "prepare_codebase_onboarding",
+    ),
+    ChatCardCoverageCase(
+        "refactor-plan",
+        "Refactor Plan",
+        "refactor-plan",
+        "refactor-plan",
+        "refactor_plan",
+        "prepare_refactor_plan",
+    ),
+    ChatCardCoverageCase(
+        "inference-serving",
+        "Inference Serving",
+        "serve this model with vllm for the team",
+        "inference-serving",
+        "inference_serving",
+        "prepare_inference_serving",
+    ),
+    ChatCardCoverageCase(
+        "tech-debt-audit",
+        "Tech Debt Audit",
+        "audit our tech debt",
+        "tech-debt-audit",
+        "tech_debt_audit",
+        "prepare_tech_debt_audit",
+    ),
+    ChatCardCoverageCase(
+        "award-bar-score",
+        "Award Bar Score",
+        "score our landing page against the css design awards bar",
+        "award-bar-score",
+        "award_bar_score",
+        "prepare_award_bar_score",
+    ),
+    ChatCardCoverageCase(
+        "codegraph-refresh",
+        "Codegraph Refresh",
+        "codegraph-refresh",
+        "codegraph-refresh",
+        "codegraph_refresh",
+        "prepare_codegraph_refresh",
+    ),
+    ChatCardCoverageCase(
+        "codebase-uml",
+        "Codebase UML",
+        "visualize the codebase as a uml diagram",
+        "codebase-uml",
+        "codebase_uml",
+        "prepare_codebase_uml",
+    ),
+    ChatCardCoverageCase(
+        "command-operator",
+        "Command Operator",
+        "command-operator",
+        "command-operator",
+        "command_operator",
+        "prepare_command_operator_card",
+    ),
+    ChatCardCoverageCase(
+        "connector-operator",
+        "Connector Operator",
+        "connector-operator",
+        "connector-operator",
+        "connector_operator",
+        "prepare_connector_operator_card",
+    ),
+    ChatCardCoverageCase(
+        "content-operator",
+        "Content Operator",
+        "content-operator",
+        "content-operator",
+        "content_operator",
+        "prepare_content_operator_card",
+    ),
+    ChatCardCoverageCase(
+        "context-budget-review",
+        "Context Budget Review",
+        "context-budget-review",
+        "context-budget-review",
+        "context_budget_review",
+        "prepare_context_budget_review",
+    ),
+    ChatCardCoverageCase(
+        "data-analysis",
+        "Data Analysis",
+        "analyze this CSV and summarize the trends",
+        "data-analysis",
+        "data_analysis",
+        "prepare_data_analysis_card",
+    ),
+    ChatCardCoverageCase(
+        "apple-design",
+        "Apple Design",
+        "Review our iOS checkout against Apple HIG and prepare the frontend remediation",
+        "apple-design",
+        "apple_design",
+        "prepare_design_orchestration",
+    ),
+    ChatCardCoverageCase(
+        "design-orchestration",
+        "Design Orchestration",
+        "디자인 맡겨줘",
+        "design-orchestration",
+        "design_orchestration",
+        "prepare_design_orchestration",
+    ),
+    ChatCardCoverageCase(
+        "design-quality-gate",
+        "Design Quality Gate",
+        "design quality gate for this landing page",
+        "design-quality-gate",
+        "design_quality_gate",
+        "prepare_design_quality_gate",
+    ),
+    ChatCardCoverageCase(
+        "external-connector-readiness",
+        "External Connector Readiness",
+        "Check whether Home Assistant can control this device",
+        "external-connector-readiness",
+        "external_connector_readiness",
+        "prepare_external_connector_readiness",
+    ),
+    ChatCardCoverageCase(
+        "failure-signal-audit",
+        "Failure Signal Audit",
+        "failure signal audit",
+        "failure-signal-audit",
+        "failure_signal_audit",
+        "prepare_failure_signal_audit",
+    ),
+    ChatCardCoverageCase(
+        "frontend",
+        "Frontend",
+        "build the frontend for this landing page",
+        "frontend",
+        "frontend_handoff",
+        "prepare_frontend_handoff",
+    ),
+    ChatCardCoverageCase(
+        "harness-session-inventory",
+        "Harness Session Inventory",
+        "harness-session-inventory",
+        "harness-session-inventory",
+        "harness_session_inventory",
+        "prepare_harness_session_inventory",
+    ),
+    ChatCardCoverageCase(
+        "instinct-ledger",
+        "Instinct Ledger",
+        "instinct-ledger",
+        "instinct-ledger",
+        "instinct_ledger",
+        "prepare_instinct_ledger",
+    ),
+    ChatCardCoverageCase(
+        "live-info-operator",
+        "Live Info Operator",
+        "live-info-operator",
+        "live-info-operator",
+        "live_info_operator",
+        "prepare_live_info_operator_card",
+    ),
+    ChatCardCoverageCase(
+        "media-input-operator",
+        "Media Input Operator",
+        "media-input-operator",
+        "media-input-operator",
+        "media_input",
+        "prepare_media_input_card",
+    ),
+    ChatCardCoverageCase(
+        "physical-device-readiness",
+        "Physical Device Readiness",
+        "physical-device-readiness",
+        "physical-device-readiness",
+        "physical_device_readiness",
+        "prepare_physical_device_readiness",
+    ),
+    ChatCardCoverageCase(
+        "production-audit",
+        "Production Audit",
+        "production-audit",
+        "production-audit",
+        "production_audit",
+        "prepare_production_audit",
+    ),
+    ChatCardCoverageCase(
+        "prompt-import-readiness",
+        "Prompt Import Readiness",
+        "prompt-import-readiness",
+        "prompt-import-readiness",
+        "prompt_import_readiness",
+        "prepare_prompt_import_readiness",
+    ),
+    ChatCardCoverageCase(
+        "rules-distill",
+        "Rules Distill",
+        "rules-distill",
+        "rules-distill",
+        "rules_distill",
+        "prepare_rules_distillation",
+    ),
+    ChatCardCoverageCase(
+        "security-safety-review",
+        "Security Safety Review",
+        "security safety review of these changes",
+        "security-safety-review",
+        "security_safety_review",
+        "prepare_security_safety_review",
+    ),
+    ChatCardCoverageCase(
+        "application-threat-model",
+        "Application Threat Model",
+        "build a threat model for our payment service architecture",
+        "application-threat-model",
+        "application_threat_model",
+        "prepare_application_threat_model",
+    ),
+    ChatCardCoverageCase(
+        "live-incident-response",
+        "Live Incident Response",
+        "we have a production outage right now, declare severity and assign an incident commander",
+        "live-incident-response",
+        "live_incident_record",
+        "prepare_live_incident_record",
+    ),
+    ChatCardCoverageCase(
+        "skill-health",
+        "Skill Health",
+        "skill-health",
+        "skill-health",
+        "skill_health",
+        "prepare_skill_health",
+    ),
+    ChatCardCoverageCase(
+        "skill-scout",
+        "Skill Scout",
+        "skill-scout",
+        "skill-scout",
+        "skill_scout",
+        "prepare_skill_scout",
+    ),
+    ChatCardCoverageCase(
+        "ultraqa",
+        "Ultraqa",
+        "ultraqa this feature until the quality gate passes",
+        "ultraqa",
+        "qa_review",
+        "dispatch_to_workflow",
+    ),
+    ChatCardCoverageCase(
+        "verification-gate",
+        "Verification Gate",
+        "verification gate before we call this done",
+        "verification-gate",
+        "verification_gate",
+        "prepare_verification_gate",
+    ),
+    ChatCardCoverageCase(
+        "visual-qa",
+        "Visual Qa",
+        "visual QA this screenshot against the reference",
+        "visual-qa",
+        "visual_qa",
+        "prepare_visual_qa",
+    ),
+    ChatCardCoverageCase(
+        "show-reel", "Show reel", "Create a product showcase video for a Japanese audience.",
+        "show-reel", "show_reel", "prepare_show_reel",
+    ),
+    ChatCardCoverageCase(
+        "workspace-audit",
+        "Workspace Audit",
+        "workspace audit",
+        "workspace-audit",
+        "workspace_audit",
+        "prepare_workspace_audit",
+    ),
+    ChatCardCoverageCase(
+        "finance-analysis",
+        "Finance analysis",
+        "Compare Q2 actuals against budget, explain the biggest expense variances, and flag cash risks for the CFO.",
+        "finance-analysis",
+        "finance_analysis",
+        "prepare_finance_analysis",
+    ),
+    ChatCardCoverageCase(
+        "people-ops",
+        "People operations",
+        "Create an interview scorecard and debrief plan for our first senior support hire.",
+        "people-ops",
+        "people_ops",
+        "prepare_people_ops_brief",
+    ),
+    ChatCardCoverageCase(
+        "legal-compliance-review",
+        "Legal and compliance review",
+        "Review this vendor DPA for data-processing obligations, risky clauses, and questions for counsel.",
+        "legal-compliance-review",
+        "legal_compliance_review",
+        "prepare_legal_compliance_review",
+    ),
+    ChatCardCoverageCase(
+        "support-operations",
+        "Support operations",
+        "Draft a calm reply for this login-outage customer and tell me whether it needs an engineering escalation.",
+        "support-operations",
+        "support_operations",
+        "prepare_support_operations",
+    ),
+    ChatCardCoverageCase(
+        "curriculum-design",
+        "Curriculum design",
+        "Design a six-week onboarding curriculum with learning objectives and practical assessments for new support agents.",
+        "curriculum-design",
+        "curriculum_design",
+        "prepare_curriculum_design",
+    ),
+    ChatCardCoverageCase(
+        "localization-review",
+        "Localization review",
+        "Review our Korean checkout strings for terminology consistency, cultural fit, and context gaps before launch.",
+        "localization-review",
+        "localization_review",
+        "prepare_localization_review",
+    ),
+    ChatCardCoverageCase(
+        "sales-development",
+        "Sales development",
+        "Build a discovery plan and qualification questions for a mid-market prospect considering our support platform.",
+        "sales-development",
+        "sales_development",
+        "prepare_sales_development",
+    ),
+    ChatCardCoverageCase(
+        "product-brief",
+        "Product brief",
+        "Create a PRD and prioritization options for reducing first-time user drop-off in onboarding.",
+        "product-brief",
+        "product_brief",
+        "prepare_product_brief",
+    ),
+    ChatCardCoverageCase(
+        "ultraperf",
+        "Ultraperf performance loop",
+        "checkout is slow - run a performance audit and find the bottleneck",
+        "ultraperf",
+        "ultraperf_loop",
+        "prepare_ultraperf_loop",
+    ),
+    ChatCardCoverageCase(
+        "workspace-file-operator",
+        "Workspace File Operator",
+        "workspace-file-operator",
+        "workspace-file-operator",
+        "workspace_file_operator",
+        "prepare_workspace_file_operator_card",
+    ),
+    # Both of these rendered DOCTOR's card until they declared their own
+    # next_action: an operator-category skill with no policy falls through to
+    # `run_local_operator_check`, so "메모리 기능 꺼줘" routed correctly and then
+    # answered "I can check whether OMH is installed and connected correctly."
+    # These cases exist so the harness proves the reply is about the skill.
+    ChatCardCoverageCase(
+        "capability-toggle",
+        "Capability toggle",
+        "메모리 기능 꺼줘",
+        "capability-toggle",
+        "capability_toggle",
+        "apply_capability_toggle",
+    ),
+    ChatCardCoverageCase(
+        "running-work-board",
+        "Running work board",
+        "지금 뭐 돌고 있어",
+        "running-work-board",
+        "running_work_board",
+        "show_running_work_board",
+    ),
+    ChatCardCoverageCase(
+        "decision-prototype",
+        "Decision prototype",
+        "decision-prototype: test one uncertain cache choice before planning",
+        "decision-prototype",
+        "decision_prototype",
+        "prepare_decision_prototype",
+        "decision_prototype_prepared",
+    ),
+    ChatCardCoverageCase(
+        "lifecycle-growth",
+        "Lifecycle growth",
+        "lifecycle-growth: prepare an onboarding journey and holdout experiment",
+        "lifecycle-growth",
+        "lifecycle_growth",
+        "prepare_lifecycle_growth",
+        "lifecycle_growth_prepared",
+    ),
+    ChatCardCoverageCase(
+        "product-discovery-validation",
+        "Product discovery validation",
+        "product-discovery-validation: test whether this customer problem deserves a PRD",
+        "product-discovery-validation",
+        "product_discovery_validation",
+        "prepare_product_discovery_validation",
+        "product_discovery_validation_prepared",
+    ),
+    ChatCardCoverageCase(
+        "sales-pipeline-review",
+        "Sales pipeline review",
+        "sales-pipeline-review: review this pipeline export for stale deals and forecast calibration",
+        "sales-pipeline-review",
+        "sales_pipeline_review",
+        "prepare_sales_pipeline_review",
+        "sales_pipeline_review_prepared",
+    ),
+    ChatCardCoverageCase(
+        "jit-learn",
+        "Just-in-time learning brief",
+        "what should I learn next to solve my current blocker?",
+        "jit-learn",
+        "jit_learn",
+        "prepare_learning_brief",
+        "learning_target_confirmation",
+    ),
+)
+
+
+class ChatCardCoverageSummary(TypedDict):
+    case_count: int
+    passing_count: int
+    dedicated_card_count: int
+    generic_ack_count: int
+    all_passing: bool
+
+
+class ChatCardCoveragePayload(TypedDict):
+    schema_version: str
+    source: str
+    summary: ChatCardCoverageSummary
+    check_basis: list[str]
+    cases: list[dict[str, object]]
+    claim_boundary: str
+
+
+def build_chat_card_coverage_demo(*, source: str = "discord") -> ChatCardCoveragePayload:
+    if source not in CHAT_SOURCES:
+        raise ValueError(f"unsupported demo source: {source}")
+    rows = [_evaluate_chat_card_case(case, source=source) for case in CHAT_CARD_COVERAGE_CASES]
+    dedicated_count = sum(1 for row in rows if bool(row["dedicated_card"]))
+    passing_count = sum(1 for row in rows if bool(row["passed"]))
+    generic_ack_count = sum(1 for row in rows if row["observed"]["kind"] == "ack")
+    return {
+        "schema_version": CHAT_CARD_COVERAGE_SCHEMA_VERSION,
+        "source": source,
+        "summary": {
+            "case_count": len(rows),
+            "passing_count": passing_count,
+            "dedicated_card_count": dedicated_count,
+            "generic_ack_count": generic_ack_count,
+            "all_passing": bool(rows) and passing_count == len(rows),
+        },
+        "check_basis": [
+            "The selected workflow matches the expected user-facing route.",
+            "The chat response uses a dedicated card kind instead of generic ack.",
+            "The wrapper next action matches the expected workflow action.",
+            "The response includes renderable actions, claim boundary copy, and not-observed evidence.",
+            "This gate checks wrapper-card coverage only; it does not prove live Hermes rendering or execution.",
+        ],
+        "cases": rows,
+        "claim_boundary": (
+            "This is deterministic local wrapper-card coverage, not live Hermes chat, "
+            "executor execution, review, CI, merge, platform delivery, or plugin-load evidence."
+        ),
+    }
+
+
+def format_chat_card_coverage_summary(payload: Mapping[str, object]) -> str:
+    summary = _nested(payload, "summary")
+    rows = _dict_rows(payload.get("cases", []))
+    total = int(summary.get("case_count", len(rows)) or 0)
+    passing = int(summary.get("passing_count", 0) or 0)
+    generic_ack_count = int(summary.get("generic_ack_count", 0) or 0)
+    all_passing = bool(summary.get("all_passing", False))
+    lines = [
+        "OMH chat card coverage",
+        f"Source: {payload.get('source', 'unknown')}",
+        f"Result: {passing}/{total} workflow cards dedicated" + (" (all passing)" if all_passing else ""),
+        f"Generic ack responses: {generic_ack_count}",
+        "",
+        "What this proves:",
+    ]
+    for basis in payload.get("check_basis", []):
+        lines.append(f"- {basis}")
+    lines.extend(["", "Card rollup:"])
+    for row in rows:
+        observed = _nested(row, "observed")
+        status = "ok" if row.get("passed") else "needs attention"
+        next_action = next_action_label(str(observed.get("next_action", "unknown")))
+        lines.append(
+            f"- {row.get('title', 'Untitled card')}: {status}; "
+            f"{observed.get('workflow', 'unknown')} -> {next_action}; card={observed.get('kind', 'unknown')}"
+        )
+    failed = [row for row in rows if not row.get("passed")]
+    if failed:
+        lines.extend(["", "Failures:"])
+        for row in failed:
+            lines.append(f"- {row.get('id', 'unknown')}: {', '.join(row.get('issues', [])) or 'unknown issue'}")
+    lines.extend(
+        [
+            "",
+            f"Boundary: {payload.get('claim_boundary', '')}",
+            "Use --json for the full machine-readable payload.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _evaluate_chat_card_case(case: ChatCardCoverageCase, *, source: str) -> dict[str, object]:
+    interaction = build_chat_interaction_payload(case.message, source=source)
+    route = _nested(interaction, "route")
+    response = _nested(interaction, "chat_response")
+    state = _nested(response, "state")
+    actions = _dict_rows(response.get("actions", []))
+    observed = {
+        "workflow": route.get("selected_skill"),
+        "kind": response.get("kind"),
+        "next_action": interaction.get("next_action"),
+        "phase": state.get("phase"),
+        "route_action": route.get("action"),
+        "confidence": route.get("confidence"),
+        "claim_boundary": response.get("claim_boundary"),
+        "action_count": len(actions),
+        "primary_action_count": sum(1 for action in actions if action.get("style") == "primary"),
+        "evidence_not_observed_count": len(_list_rows(state.get("evidence_not_observed", []))),
+    }
+    issues: list[str] = []
+    if observed["workflow"] != case.expected_skill:
+        issues.append(f"expected workflow {case.expected_skill}, observed {observed['workflow']}")
+    if observed["kind"] != case.expected_kind:
+        issues.append(f"expected kind {case.expected_kind}, observed {observed['kind']}")
+    if observed["kind"] == "ack":
+        issues.append("generic ack response")
+    if observed["next_action"] != case.expected_next_action:
+        issues.append(f"expected next action {case.expected_next_action}, observed {observed['next_action']}")
+    if case.expected_phase and observed["phase"] != case.expected_phase:
+        issues.append(f"expected phase {case.expected_phase}, observed {observed['phase']}")
+    if not str(observed["claim_boundary"] or "").strip():
+        issues.append("missing claim boundary")
+    if not actions:
+        issues.append("missing renderable actions")
+    if not any(action.get("style") == "primary" for action in actions):
+        issues.append("missing primary action")
+    if observed["evidence_not_observed_count"] < 1:
+        issues.append("missing not-observed evidence")
+    return {
+        "id": case.id,
+        "title": case.title,
+        "message_sha256": hashlib.sha256(case.message.encode("utf-8")).hexdigest(),
+        "dedicated_card": observed["kind"] != "ack",
+        "passed": not issues,
+        "expected": {
+            "workflow": case.expected_skill,
+            "kind": case.expected_kind,
+            "next_action": case.expected_next_action,
+            "phase": case.expected_phase or None,
+        },
+        "observed": observed,
+        "issues": issues,
+    }
+
+
+def _nested(payload: Mapping[str, object], key: str) -> dict[str, object]:
+    value = payload.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _dict_rows(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _list_rows(value: object) -> list[object]:
+    if not isinstance(value, list):
+        return []
+    return value

@@ -1,0 +1,661 @@
+from __future__ import annotations
+from ..skills.catalog import omh_skill_install_path
+
+import os
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - absent on Windows.
+    fcntl = None
+
+from ..capability_roadmap import build_capability_gap_roadmap
+from ..config_adapter import external_dir_registered, external_dirs, read_config
+from ..local_store import read_jsonl_objects
+from ..mcp.host_config import mcp_host_config_entry_present
+from ..parity import build_parity_matrix
+from ..paths import OmhPaths
+from ..plugin_observations import (
+    PLUGIN_HOST_ACTIVE_OBSERVATION_EVENTS,
+    PLUGIN_HOST_OBSERVATION_SCHEMA_VERSION,
+    plugin_host_runtime_readiness,
+    read_plugin_host_observations,
+)
+from ..plugin_bundle.omh.buzz_diagnostics import probe_buzz
+from ..plugin_bundle.omh.group_activity_status import read_group_activity_status
+from ..plugin_pack import inspect_plugin_bundle
+from .structural_search import inspect_structural_search
+from ..runtime.artifacts import read_state_result
+from ..targets import summarize_target_registry
+from ..team_readiness import build_team_worker_readiness
+
+PROBE_STATUSES = ("available", "missing", "unknown", "unverified")
+MCP_HOST_SESSION_SCHEMA_VERSION = "omh_mcp_host_session/v1"
+
+
+@dataclass(frozen=True)
+class Capability:
+    name: str
+    status: str
+    evidence: str
+    message: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "evidence": self.evidence,
+            "message": self.message,
+        }
+
+
+def _has_file(path: Path) -> bool:
+    return path.exists() and path.is_file()
+
+
+def _has_dir(path: Path) -> bool:
+    return path.exists() and path.is_dir()
+
+
+def _wrapper_artifacts(paths: OmhPaths) -> list[Path]:
+    artifacts: list[Path] = []
+    if paths.runtime_runs_dir.exists():
+        artifacts.extend(sorted(paths.runtime_runs_dir.glob("*/wrapper.json")))
+    if paths.runtime_wrapper_sessions_dir.exists():
+        artifacts.extend(sorted(paths.runtime_wrapper_sessions_dir.glob("*/session.json")))
+    return artifacts
+
+
+def _has_any_file(paths: list[Path]) -> bool:
+    return any(_has_file(path) for path in paths)
+
+
+def _plugin_smoke_message(plugin: dict) -> str:
+    errors = [str(item) for item in plugin.get("errors", []) if str(item)]
+    if errors:
+        return "; ".join(errors)
+    missing_tools = [str(item) for item in plugin.get("missing_registered_tools", [])]
+    missing_hooks = [str(item) for item in plugin.get("missing_registered_hooks", [])]
+    if missing_tools or missing_hooks:
+        details: list[str] = []
+        if missing_tools:
+            details.append(f"missing tools={missing_tools}")
+        if missing_hooks:
+            details.append(f"missing hooks={missing_hooks}")
+        return "Installed OMH plugin register smoke is incomplete: " + "; ".join(details)
+    return "Installed OMH plugin has not passed fake Hermes register smoke"
+
+
+def _marker_capability(name: str, markers: list[Path], found_message: str, missing_message: str) -> Capability:
+    found = _has_any_file(markers)
+    return Capability(
+        name,
+        "unverified" if found else "unknown",
+        ", ".join(str(path) for path in markers),
+        found_message if found else missing_message,
+    )
+
+
+def _mcp_preference_capability(paths: OmhPaths) -> Capability:
+    state, error = read_state_result(paths)
+    evidence = paths.runtime_state_path.as_posix()
+    if error:
+        return Capability(
+            "mcp_preference",
+            "unknown",
+            evidence,
+            f"Could not read OMH setup state for MCP preference: {error}",
+        )
+    if not isinstance(state, dict):
+        return Capability(
+            "mcp_preference",
+            "unknown",
+            evidence,
+            "No OMH setup state has recorded an MCP bridge preference",
+        )
+    last_setup = state.get("last_setup")
+    mcp_setup = last_setup.get("mcp_setup") if isinstance(last_setup, dict) else None
+    if not isinstance(mcp_setup, dict):
+        return Capability(
+            "mcp_preference",
+            "unknown",
+            evidence,
+            "No OMH setup state has recorded an MCP bridge preference",
+        )
+
+    mode = str(mcp_setup.get("mode", "none"))
+    requested = bool(mcp_setup.get("requested", False))
+    observed = bool(mcp_setup.get("observed", False))
+    if not requested or mode == "none":
+        return Capability(
+            "mcp_preference",
+            "unknown",
+            evidence,
+            "OMH setup state says no optional MCP bridge preference was requested",
+        )
+    if observed:
+        return Capability(
+            "mcp_preference",
+            "available",
+            evidence,
+            f"OMH MCP bridge preference was requested and observed by setup state (mode={mode})",
+        )
+    return Capability(
+        "mcp_preference",
+        "unverified",
+        evidence,
+        f"OMH MCP bridge preference was requested (mode={mode}), but no MCP host session or tool-call evidence is recorded",
+    )
+
+
+def _mcp_bridge_server_capability() -> Capability:
+    return Capability(
+        "mcp_bridge_server",
+        "available",
+        "omh mcp manifest; omh mcp serve",
+        "OMH ships an allowlisted stdio MCP bridge with omh_status, omh_recommend, and omh_probe tools",
+    )
+
+
+def _worktree_creator_capability() -> Capability:
+    return Capability(
+        "worktree_creator",
+        "available",
+        "omh worktree list; omh worktree bind",
+        (
+            "OMH observes worktree isolation, records omh_worktree_observation/v1 workspace-isolation "
+            "evidence, and returns wrapper binding recipes for opening or attaching the selected coding "
+            "agent without launching it; worktree creation is deferred to native Hermes/Git tooling"
+        ),
+    )
+
+
+def _team_worker_readiness_capability(paths: OmhPaths) -> tuple[Capability, dict]:
+    readiness = build_team_worker_readiness(paths)
+    status = str(readiness.get("status", "missing"))
+    presentation_status = str(readiness.get("presentation_status", "unknown"))
+    hermes_visibility = str(readiness.get("hermes_visibility_status", "unknown"))
+    observed_runtime = readiness.get("observed_runtime", {})
+    observed_status = (
+        str(observed_runtime.get("status", "not_observed"))
+        if isinstance(observed_runtime, dict)
+        else "not_observed"
+    )
+    if status == "available":
+        message = (
+            "OMH ships team/swarm worker contract readiness, wrapper actions, and runtime observation ledger support; "
+            f"presentation={presentation_status}, Hermes visibility={hermes_visibility}, observed runtime={observed_status}"
+        )
+        capability_status = "available"
+    else:
+        message = "OMH team/swarm worker contract readiness is missing required local workflow surfaces"
+        capability_status = "missing"
+    return (
+        Capability(
+            "team_worker_readiness",
+            capability_status,
+            "omh runtime team-readiness",
+            message,
+        ),
+        readiness,
+    )
+
+
+def _mcp_bridge_runtime_capability(paths: OmhPaths) -> Capability:
+    state, error = read_state_result(paths)
+    evidence = str(paths.runtime_state_path)
+    if error:
+        return Capability(
+            "mcp_bridge_runtime",
+            "unknown",
+            evidence,
+            f"Could not read OMH MCP bridge runtime observation state: {error}",
+        )
+    bridge = state.get("last_mcp_bridge") if isinstance(state, dict) else None
+    if not isinstance(bridge, dict) or not bridge.get("observed"):
+        return Capability(
+            "mcp_bridge_runtime",
+            "unverified",
+            evidence,
+            "No OMH MCP bridge tool call has been observed in local OMH state",
+        )
+    tool = str(bridge.get("tool", "unknown"))
+    return Capability(
+        "mcp_bridge_runtime",
+        "available",
+        evidence,
+        f"OMH MCP bridge observed a local tool call ({tool}); host-specific load evidence remains separate",
+    )
+
+
+def _mcp_host_config_capability(paths: OmhPaths, markers: list[Path]) -> Capability:
+    state, error = read_state_result(paths)
+    evidence_paths = list(markers)
+    if error:
+        return _marker_capability(
+            "mcp_host_config",
+            evidence_paths,
+            "MCP host config exists, but OMH could not read setup state",
+            f"No MCP host config detected by file probe; setup state could not be read: {error}",
+        )
+    host_configs: list[dict] = []
+    last_setup = state.get("last_setup") if isinstance(state, dict) else None
+    mcp_setup = last_setup.get("mcp_setup") if isinstance(last_setup, dict) else None
+    setup_host_config = mcp_setup.get("host_config") if isinstance(mcp_setup, dict) else None
+    durable_host_config = state.get("last_mcp_host_config_install") if isinstance(state, dict) else None
+    for candidate in (setup_host_config, durable_host_config):
+        if isinstance(candidate, dict) and candidate not in host_configs:
+            host_configs.append(candidate)
+    for host_config in host_configs:
+        path_value = str(host_config.get("path", "")).strip()
+        if path_value:
+            evidence_paths.append(Path(path_value).expanduser())
+        status = str(host_config.get("status", ""))
+        host = str(host_config.get("host", "generic"))
+        written = bool(host_config.get("written", False))
+        config_path = Path(path_value).expanduser() if path_value else None
+        exists = bool(config_path and config_path.exists())
+        entry_present = bool(config_path and mcp_host_config_entry_present(host, config_path))
+        if status in {"updated", "unchanged"} and exists:
+            if not entry_present:
+                return Capability(
+                    "mcp_host_config",
+                    "missing",
+                    path_value,
+                    f"OMH setup reported a {host} MCP host config, but the current file no longer contains the OMH entry",
+                )
+            return Capability(
+                "mcp_host_config",
+                "available",
+                path_value,
+                f"OMH setup prepared the {host} MCP host config at {path_value}; host load/session evidence remains separate",
+            )
+        if status.startswith("dry_run"):
+            return Capability(
+                "mcp_host_config",
+                "unverified",
+                path_value,
+                f"OMH setup planned the {host} MCP host config, but dry-run did not write it",
+            )
+        if written and not exists:
+            return Capability(
+                "mcp_host_config",
+                "missing",
+                path_value,
+                f"OMH setup reported a {host} MCP host config write, but the file is no longer present",
+            )
+    return _marker_capability(
+        "mcp_host_config",
+        evidence_paths,
+        "MCP host config exists, but OMH has not verified a Hermes MCP extension contract or host load event",
+        "No Hermes MCP host config detected by setup state or file probe",
+    )
+
+
+def _mcp_host_session_capability(paths: OmhPaths) -> Capability:
+    records, errors = read_jsonl_objects(paths.runtime_mcp_host_sessions_path)
+    evidence = str(paths.runtime_mcp_host_sessions_path)
+    if errors:
+        return Capability(
+            "mcp_host_session",
+            "unknown",
+            evidence,
+            f"Could not read OMH MCP host session observations: {'; '.join(errors[:3])}",
+        )
+    latest_observed = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("schema_version") == MCP_HOST_SESSION_SCHEMA_VERSION and record.get("observed")
+        ),
+        None,
+    )
+    if latest_observed:
+        host = str(latest_observed.get("host", "unknown"))
+        event = str(latest_observed.get("event", "unknown"))
+        session_id = str(latest_observed.get("session_id", "unknown"))
+        return Capability(
+            "mcp_host_session",
+            "available",
+            evidence,
+            f"MCP host session observed by {host} ({event}, session={session_id})",
+        )
+    if records:
+        return Capability(
+            "mcp_host_session",
+            "unverified",
+            evidence,
+            "MCP host session records exist, but none record observed host load or use",
+        )
+    return Capability(
+        "mcp_host_session",
+        "unverified",
+        evidence,
+        "No MCP host load or session observation has been recorded by a host or wrapper",
+    )
+
+
+def _plugin_runtime_observed_capability(paths: OmhPaths) -> tuple[Capability, bool, bool]:
+    records, errors = read_plugin_host_observations(paths, limit=None)
+    evidence = str(paths.runtime_plugin_host_observations_path)
+    if errors:
+        return (
+            Capability(
+                "plugin_runtime_observed",
+                "unknown",
+                evidence,
+                f"Could not read OMH plugin host observations: {'; '.join(errors[:3])}",
+            ),
+            False,
+            False,
+        )
+    latest = next(
+        (
+            record
+            for record in records
+            if record.get("schema_version") == PLUGIN_HOST_OBSERVATION_SCHEMA_VERSION
+        ),
+        None,
+    )
+    if latest and latest.get("observed"):
+        host = str(latest.get("host", "unknown"))
+        event = str(latest.get("event", "unknown"))
+        session_id = str(latest.get("session_id", "unknown"))
+        readiness = str(latest.get("runtime_readiness") or plugin_host_runtime_readiness(event=event, status="observed"))
+        active = readiness == "active_runtime_observed"
+        return (
+            Capability(
+                "plugin_runtime_observed",
+                "available",
+                evidence,
+                (
+                    f"OMH plugin active runtime observed by {host} ({event}, session={session_id})"
+                    if active
+                    else f"OMH plugin historical runtime event observed by {host} ({event}, session={session_id}); active readiness requires one of {', '.join(PLUGIN_HOST_ACTIVE_OBSERVATION_EVENTS)}"
+                ),
+            ),
+            True,
+            active,
+        )
+    if latest:
+        host = str(latest.get("host", "unknown"))
+        status = str(latest.get("status", "unknown"))
+        event = str(latest.get("event", "unknown"))
+        return (
+            Capability(
+                "plugin_runtime_observed",
+                "unverified",
+                evidence,
+                f"Latest plugin host observation from {host} is {status} ({event}); Hermes plugin runtime is not currently observed",
+            ),
+            False,
+            False,
+        )
+    return (
+        Capability(
+            "plugin_runtime_observed",
+            "unverified",
+            evidence,
+            "No Hermes runtime load/use observation is recorded; local install smoke is not native runtime evidence",
+        ),
+        False,
+        False,
+    )
+
+
+def _dir_capability(name: str, path: Path, found_message: str, missing_message: str) -> Capability:
+    found = _has_dir(path)
+    return Capability(
+        name,
+        "unverified" if found else "unknown",
+        str(path),
+        found_message if found else missing_message,
+    )
+
+
+def _domain_intelligence_store_capability() -> Capability:
+    """Whether this host has the primitives the domain-intelligence store needs.
+
+    The store fails closed without dirfd-anchored opens and advisory locks, and
+    `_bind_root` turns that refusal into `None` so an unavailable expert
+    question never breaks a route. That degradation is correct, but it left a
+    Windows user with a feature that silently never engages and nothing to
+    consult about why. This row is that answer.
+
+    Probed rather than keyed off `os.name`, so it stays true on any host whose
+    Python lacks one of the primitives for its own reasons.
+    """
+    missing: list[str] = []
+    if not (
+        getattr(os, "O_NOFOLLOW", 0)
+        and getattr(os, "O_DIRECTORY", 0)
+        and os.open in os.supports_dir_fd
+        and hasattr(os, "fchmod")
+    ):
+        missing.append("dirfd-anchored opens (O_NOFOLLOW/O_DIRECTORY)")
+    if fcntl is None:
+        missing.append("fcntl advisory locks")
+    if missing:
+        return Capability(
+            "domain_intelligence_store",
+            "missing",
+            f"platform:{sys.platform}",
+            (
+                "Domain intelligence and its chat context attachment are unavailable on this host, "
+                f"which lacks {' and '.join(missing)}; routing is unaffected"
+            ),
+        )
+    return Capability(
+        "domain_intelligence_store",
+        "available",
+        f"platform:{sys.platform}",
+        "Host provides the dirfd and advisory-lock primitives the domain-intelligence store requires",
+    )
+
+
+def _structural_search_capability(*, which: Callable[[str], str | None] | None = None) -> Capability:
+    """Presence-only capability row for ast-grep, cloning the `probe_buzz` pair.
+
+    A `shutil.which` lookup is conclusive within its own claim, so absence is
+    `"missing"` (we looked and it was not there), never `"unknown"`; presence
+    is `"unverified"` because the binary was not executed. The reason code
+    lands in the `evidence` field, matching the Buzz capability row.
+    """
+    structural = inspect_structural_search(which=which)
+    return Capability(
+        "structural_code_search",
+        "unverified" if structural["found"] else "missing",
+        str(structural["reason_code"]),
+        (
+            f"Structural search tool ast-grep resolved at {structural['path']}; presence only, "
+            "the binary was not executed"
+            if structural["found"]
+            else "Structural search tool ast-grep is not on PATH; code exploration continues with grep/ripgrep"
+        ),
+    )
+
+
+def probe_capabilities(paths: OmhPaths, *, include_parity: bool = False, include_roadmap: bool = False) -> dict:
+    config_text = read_config(paths.hermes_config_path)
+    configured_dirs = external_dirs(config_text)
+    skills_registered = external_dir_registered(configured_dirs, paths.skills_dir)
+    capabilities: list[Capability] = []
+    buzz = probe_buzz(paths)
+    capabilities.append(
+        Capability(
+            "buzz_platform_diagnostics",
+            str(buzz["status"]),
+            str(buzz["reason_code"]),
+            (
+                f"Buzz local probe: configured={str(buzz['configured']).lower()}; "
+                f"credential_present={str(buzz['credential_present']).lower()}; "
+                f"installed={str(buzz['installed']).lower()}; cli_execution=not_attempted"
+            ),
+        )
+    )
+    capabilities.append(_structural_search_capability())
+    managed_skill_path = paths.skills_dir / omh_skill_install_path("oh-my-hermes") / "SKILL.md"
+
+    capabilities.append(
+        Capability(
+            "external_skill_dirs",
+            "available" if skills_registered else ("missing" if paths.hermes_config_path.exists() else "unknown"),
+            str(paths.hermes_config_path),
+            "Hermes config registers the managed skill directory" if skills_registered else "Managed skill directory is not registered in this Hermes config",
+        )
+    )
+    capabilities.append(
+        Capability(
+            "managed_skills",
+            "available" if _has_file(managed_skill_path) else "missing",
+            str(paths.skills_dir),
+            "Managed oh-my-hermes skill is installed" if _has_file(managed_skill_path) else "Managed skills are not installed",
+        )
+    )
+    hooks_markers = [paths.hermes_home / "hooks.yaml", paths.hermes_home / "hooks.json"]
+    capabilities.append(
+        _marker_capability(
+            "native_hooks",
+            hooks_markers,
+            "Hook-like files exist, but omh has no stable Hermes hook contract to claim native integration",
+            "No stable Hermes hook surface detected by file probe",
+        )
+    )
+    capabilities.append(
+        _dir_capability(
+            "plugin_bundles",
+            paths.hermes_home / "plugins",
+            (
+                "Hermes plugin directory exists; managed OMH bundle install, import/register smoke, "
+                "and host-observed runtime load are reported by the dedicated plugin capabilities"
+            ),
+            "No Hermes plugin directory detected by file probe",
+        )
+    )
+    capabilities.append(
+        _dir_capability(
+            "apps",
+            paths.hermes_home / "apps",
+            "Apps directory exists, but omh has no stable Hermes app contract",
+            "No Hermes app directory detected by file probe",
+        )
+    )
+    mcp_markers = [paths.hermes_home / ".mcp.json", paths.hermes_home / "mcp.json"]
+    team_worker_readiness_capability, team_worker_readiness = _team_worker_readiness_capability(paths)
+    capabilities.append(_mcp_preference_capability(paths))
+    capabilities.append(_mcp_bridge_server_capability())
+    capabilities.append(team_worker_readiness_capability)
+    capabilities.append(_worktree_creator_capability())
+    capabilities.append(_mcp_bridge_runtime_capability(paths))
+    mcp_host_session = _mcp_host_session_capability(paths)
+    capabilities.append(mcp_host_session)
+    capabilities.append(_mcp_host_config_capability(paths, mcp_markers))
+    capabilities.append(
+        Capability(
+            "native_skill_metadata",
+            "unknown",
+            str(paths.hermes_config_path),
+            "No stable Hermes-native skill metadata contract is known to omh yet",
+        )
+    )
+    wrappers = _wrapper_artifacts(paths)
+    plugin = inspect_plugin_bundle(paths)
+    plugin_runtime_capability, plugin_runtime_observed, plugin_runtime_active = _plugin_runtime_observed_capability(paths)
+    plugins_dir_exists = _has_dir(paths.hermes_plugins_dir)
+    capabilities.extend(
+        [
+            Capability(
+                "plugin_dir_exists",
+                "available" if plugins_dir_exists else "unknown",
+                str(paths.hermes_plugins_dir),
+                "Hermes plugin directory exists" if plugins_dir_exists else "No Hermes plugin directory detected by file probe",
+            ),
+            Capability(
+                "omh_plugin_bundle",
+                "available" if plugin["plugin_dir_installed"] else "missing",
+                str(paths.hermes_plugin_dir),
+                "Managed OMH plugin bundle is installed" if plugin["plugin_dir_installed"] else "Managed OMH plugin bundle is not installed",
+            ),
+            Capability(
+                "plugin_import_smoke",
+                "available" if plugin["plugin_import_smoke"] else ("missing" if plugin["plugin_dir_installed"] else "unknown"),
+                str(paths.hermes_plugin_dir / "__init__.py"),
+                "Installed OMH plugin imports locally" if plugin["plugin_import_smoke"] else "Installed OMH plugin has not passed local import smoke",
+            ),
+            Capability(
+                "plugin_register_smoke",
+                "available" if plugin["plugin_register_smoke"] else ("missing" if plugin["plugin_dir_installed"] else "unknown"),
+                str(paths.hermes_plugin_dir),
+                (
+                    "Installed OMH plugin register() is callable with OMH's fake context: "
+                    f"tools={plugin['registered_tools']} hooks={plugin['registered_hooks']}; "
+                    "the real Hermes loader is not exercised by this capability"
+                    if plugin["plugin_register_smoke"]
+                    else _plugin_smoke_message(plugin)
+                ),
+            ),
+            plugin_runtime_capability,
+        ]
+    )
+    capabilities.append(
+        Capability(
+            "wrapper_metadata",
+            "available" if wrappers else "missing",
+            ", ".join(str(path) for path in wrappers[:5]) if wrappers else str(paths.runtime_runs_dir),
+            "Wrapper observation artifacts are present" if wrappers else "No wrapper observation artifacts recorded yet",
+        )
+    )
+    target_topology = summarize_target_registry(paths)
+    capabilities.extend(
+        [
+            Capability(
+                "target_registry",
+                "available" if target_topology["status"] == "available" else ("missing" if target_topology["status"] == "missing" else "unknown"),
+                str(paths.target_registry_path),
+                (
+                    f"{target_topology['known_target_count']} Hermes target(s) known"
+                    if target_topology["status"] == "available"
+                    else "No OMH target registry has been recorded yet"
+                ),
+            ),
+            Capability(
+                "target_topology",
+                "available" if target_topology["mode"] in {"single_agent_target", "multi_agent_targets"} else "unknown",
+                str(paths.target_registry_path),
+                f"mode={target_topology['mode']}; active_agent_count={target_topology['active_agent_count']}; transition={target_topology['transition']}",
+            ),
+        ]
+    )
+    capabilities.append(_domain_intelligence_store_capability())
+
+    payload = {
+        "schema_version": 1,
+        "omh_home": str(paths.omh_home),
+        "hermes_home": str(paths.hermes_home),
+        "capabilities": [capability.to_dict() for capability in capabilities],
+        "buzz": buzz,
+        # Historical bounded profile snapshot, not a live host/terminal guarantee.
+        "group_chat_activity": read_group_activity_status(paths.omh_home, paths.hermes_home),
+        "target_topology": target_topology,
+        "plugin_distribution_ready": bool(plugin["plugin_distribution_ready"]),
+        "plugin_runtime_observed": plugin_runtime_observed,
+        "plugin_runtime_active": plugin_runtime_active,
+        "mcp_host_session_observed": mcp_host_session.status == "available",
+        "team_worker_readiness_ready": team_worker_readiness_capability.status == "available",
+        "team_worker_presentation_status": str(team_worker_readiness.get("presentation_status", "unknown")),
+        "team_worker_readiness": team_worker_readiness,
+        "native_integration_claim_ready": bool(plugin["plugin_distribution_ready"]) and plugin_runtime_active,
+        "claim_boundary": (
+            "Prompt-level routing is the default unless a stable Hermes extension surface and host-supplied "
+            "runtime evidence prove deeper integration. Plugin host observations prove plugin load/use only, "
+            "not coding execution, review, CI, or merge."
+        ),
+    }
+    if include_parity:
+        payload["parity_matrix"] = build_parity_matrix(payload)
+    if include_roadmap or include_parity:
+        payload["capability_gap_roadmap"] = build_capability_gap_roadmap(payload)
+    return payload

@@ -13,7 +13,13 @@ from typing import Any, Dict, List, Optional
 
 from . import TAGLINE, __version__
 from .agent import Agent
-from .config import Config, load_config, omh_home
+from .config import (
+    Config,
+    builtin_config_path,
+    default_config_text,
+    load_config,
+    omh_home,
+)
 from .errors import ConfigError, OmhError
 from .providers import build_providers
 from .router import ModelRouter
@@ -130,7 +136,7 @@ def _apply_args(config: Config, args: argparse.Namespace) -> Optional[str]:
     return None
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.version:
@@ -157,11 +163,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     theme = Theme(config.theme, enabled=False if args.no_color else None)
 
     if args.init:
-        target = omh_home() / "config.json"
+        target = omh_home() / "config.toml"
         if target.exists():
             print(theme.warn(f"{target} already exists"))
             return 1
-        config.save(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(default_config_text(), encoding="utf-8")
         print(theme.ok(f"wrote {target}"))
         return 0
     if args.list_models:
@@ -201,6 +208,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         return app.run_once(data)
     return app.repl()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Entry point that tolerates ``omh | head`` closing the pipe."""
+    try:
+        return _main(argv)
+    except BrokenPipeError:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:  # pragma: no cover - already gone
+            pass
+        return 0
 
 
 class App:
@@ -780,11 +800,12 @@ class App:
         )
 
     def _init(self) -> None:
-        target = omh_home() / "config.json"
+        target = omh_home() / "config.toml"
         if target.exists():
             self.console.line(self.theme.warn(f"  {target} already exists"))
             return
-        self.config.save(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(default_config_text(), encoding="utf-8")
         self.console.line(self.theme.ok(f"  wrote {target}"))
 
     def _save_command(self) -> None:
@@ -794,11 +815,16 @@ class App:
     def doctor(self) -> int:
         t = self.theme
         providers = build_providers(self.config)
-        config_paths = [
-            path
-            for path in (omh_home() / "config.json", Path.cwd() / ".omh.json")
-            if path.is_file()
-        ]
+        config_paths = [builtin_config_path()]
+        for path in (
+            omh_home() / "config.toml",
+            Path(os.environ.get("OMH_CONFIG", "")).expanduser()
+            if os.environ.get("OMH_CONFIG")
+            else None,
+            Path.cwd() / ".omh.toml",
+        ):
+            if path is not None and path.is_file() and path not in config_paths:
+                config_paths.append(path)
         self.console.line()
         self.console.line(
             t.title("  omh " + __version__)

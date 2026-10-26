@@ -1,0 +1,98 @@
+{
+  "schema_version": "awesome_hermes_plugin_outcome_matrix/v1",
+  "source_commit": "27389ad544f923ee67b455457c214c679f26ad8a",
+  "outcomes": [
+    {
+      "plugin_id": "clawrouter-hermes",
+      "upstream_outcome_summary": "Routes many model providers through a paid local proxy and manages a real wallet.",
+      "implementation_state": "omh_native",
+      "owner_boundary": "omh",
+      "claim_status": "prepared_not_observed",
+      "evidence_refs": [
+        {"kind": "code", "ref": "src/workflows/provider_profile_posture.py"},
+        {"kind": "test", "ref": "tests/test_provider_profile_posture.py"}
+      ],
+      "rationale": "OMH prepares a provider/profile posture without launching proxies, routing models, creating wallets, or executing payments.",
+      "native_capability_ids": ["provider-profile-posture"]
+    },
+    {
+      "plugin_id": "cronalytics",
+      "upstream_outcome_summary": "Collects cron cost and usage analytics through session hooks, SQLite storage, and a dashboard.",
+      "implementation_state": "omh_native",
+      "owner_boundary": "omh",
+      "claim_status": "prepared_not_observed",
+      "evidence_refs": [
+        {"kind": "code", "ref": "src/runtime/run_efficiency.py"},
+        {"kind": "test", "ref": "tests/test_run_efficiency.py"}
+      ],
+      "rationale": "OMH reports supplied local run metadata without collecting host hooks, SQLite telemetry, or dashboard data.",
+      "native_capability_ids": ["run-efficiency"]
+    },
+    {
+      "plugin_id": "hermes-doppler",
+      "upstream_outcome_summary": "Prepares per-profile secret isolation through a Doppler connector and environment injection.",
+      "implementation_state": "omh_native",
+      "owner_boundary": "omh",
+      "claim_status": "prepared_not_observed",
+      "evidence_refs": [
+        {"kind": "code", "ref": "src/workflows/provider_profile_posture.py"},
+        {"kind": "test", "ref": "tests/test_provider_profile_posture.py"}
+      ],
+      "rationale": "OMH prepares secret-presence and profile metadata without reading secret values, validating credentials, or injecting provider configuration.",
+      "native_capability_ids": ["provider-profile-posture"]
+    },
+    {
+      "plugin_id": "hermes-plugin-guard",
+      "upstream_outcome_summary": "Statically scans local Hermes plugin manifests, capabilities, dependencies, likely secrets, and repository hygiene before enablement.",
+      "implementation_state": "omh_native",
+      "owner_boundary": "omh",
+      "claim_status": "prepared_not_observed",
+      "evidence_refs": [
+        {"kind": "code", "ref": "src/workflows/plugin_risk_audit.py"},
+        {"kind": "test", "ref": "tests/test_plugin_risk_audit.py"}
+      ],
+      "rationale": "OMH statically audits one explicitly supplied local plugin directory for bounded aggregate risk categories without source disclosure, plugin import, registration, execution, dependency installation, network access, or safety approval claims.",
+      "native_capability_ids": ["plugin-risk-audit"]
+    },
+    {
+      "plugin_id": "hermes-plugin-slash-prompts",
+      "upstream_outcome_summary": "Loads external CLI-agent prompt files as Hermes slash commands across multiple source formats and argument syntaxes.",
+      "implementation_state": "omh_native",
+      "owner_boundary": "omh",
+      "claim_status": "prepared_not_observed",
+      "evidence_refs": [
+        {"kind": "code", "ref": "src/workflows/prompt_compatibility.py"},
+        {"kind": "test", "ref": "tests/test_prompt_compatibility.py"}
+      ],
+      "rationale": "OMH audits explicitly supplied local prompt files for format, argument syntax, and command collisions without discovery, import, registration, mutation, or host activation.",
+      "native_capability_ids": ["prompt-import-readiness"]
+    },
+    {
+      "plugin_id": "robrain",
+      "upstream_outcome_summary": "Records rejected alternatives and resurfaces their reasons when a decision is revisited.",
+      "implementation_state": "omh_native",
+      "owner_boundary": "omh",
+      "claim_status": "prepared_not_observed",
+      "evidence_refs": [
+        {"kind": "code", "ref": "src/workflows/rejected_decision_recall.py"},
+        {"kind": "test", "ref": "tests/test_rejected_decision_recall.py"}
+      ],
+      "rationale": "OMH recalls reviewed rejected-decision metadata without claiming external database-backed memory behavior.",
+      "native_capability_ids": ["decision-recall"]
+    },
+    {
+      "plugin_id": "rtk-hermes",
+      "upstream_outcome_summary": "Intercepts shell output and compresses it before it reaches the model context window.",
+      "implementation_state": "contract_only",
+      "owner_boundary": "omh",
+      "claim_status": "prepared_not_observed",
+      "evidence_refs": [
+        {"kind": "code", "ref": "src/runtime/run_efficiency.py"},
+        {"kind": "test", "ref": "tests/test_run_efficiency.py"}
+      ],
+      "rationale": "OMH can prepare bounded efficiency-report metadata, but does not intercept shell calls or rewrite tool output.",
+      "native_capability_ids": ["run-efficiency"]
+    }
+  ],
+  "claim_boundary": "This matrix distinguishes OMH-local prepared capabilities from upstream plugin outcomes. It is not plugin installation, provider connectivity, host integration, runtime execution, or feature-parity evidence."
+}

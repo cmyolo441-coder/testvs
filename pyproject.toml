@@ -31,3 +31,6 @@ Source = "https://github.com/rlaope/oh-my-hermes"
 
 [tool.setuptools]
 packages = ["omh", "omh.providers", "omh.tools"]
+
+[tool.setuptools.package-data]
+omh = ["default_config.toml"]

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -109,9 +109,9 @@ class SubprocessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             first = run_cli("--init", home=tmp)
             self.assertEqual(first.returncode, 0, first.stderr)
-            config_path = Path(tmp) / "config.json"
+            config_path = Path(tmp) / "config.toml"
             self.assertTrue(config_path.exists())
-            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
             self.assertIn("router", raw)
             second = run_cli("--init", home=tmp)
             self.assertEqual(second.returncode, 1)
@@ -219,7 +219,7 @@ class SlashCommandTest(unittest.TestCase):
     def test_init_from_repl(self) -> None:
         with mock.patch.dict(os.environ, {"OMH_HOME": self.tmp}, clear=True):
             self.app._slash("/init")
-        self.assertTrue((Path(self.tmp) / "config.json").exists())
+        self.assertTrue((Path(self.tmp) / "config.toml").exists())
 
 
 class RunOnceTest(unittest.TestCase):

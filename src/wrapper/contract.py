@@ -1,0 +1,12073 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime, timezone
+from functools import lru_cache
+import hashlib
+import re
+from pathlib import Path
+from typing import Any, Final, Mapping
+
+from ..context_safety import MAX_SUMMARY_CHARS, bounded_prompt_preview, compact_progress_events
+from ..coding.action_gate import LADDER_ACTION_IDS
+from ..coding.agentic_playbook import maybe_build_agentic_playbook
+from ..coding.agentic_playbook_contract import chat_response_with_agentic_playbook
+from ..coding.executor_local_workflow import validate_executor_local_workflow
+from ..coding.media_handoff_capabilities import input_representations_from_attachments, merged_input_representation
+from ..coding.hermes_model_recommendation import resolved_hermes_model_recommendation
+from ..coding.routing_observation import (
+    render_routing_code_block_text,
+    validate_routing_observation,
+)
+from ..coding.status_board import model_label_for
+from ..coding.pi_family_interop import RUNTIME_USER_NAMES
+from ..system.display_width import display_width, pad_to_width
+from ..evidence import status_label
+from .message_gate import build_message_gate, fence_marker_for, message_gate_body
+from .continuity import build_continuity_briefing
+from ..ingress import (
+    CHAT_SOURCES,
+    MESSAGING_CHAT_SOURCES,
+    compact_source_metadata,
+    extract_event_attachments,
+    extract_message_text,
+    extract_source_metadata,
+)
+from ..system.platform_envelope import build_platform_envelope, platform_thread_key_scope
+from ..system.tracker_content import normalize_tracker_content
+from ..routing.catalog_questions import is_skill_catalog_question as _is_skill_catalog_question
+from ..routing.chat import (
+    DIRECT_ANSWER_REASON_CODES,
+    LOOP_TIMER_ANSWER_REASON_CODES,
+    REASON_CODE_FILE_LOOKUP,
+    invoked_skill_asks_status,
+    invoked_skill_instruction,
+    invoked_skill_stops_or_asks,
+    public_chat_route_payload,
+    route_explanation_payload,
+    route_question_observation,
+)
+from ..routing.coding_route_actions import coding_route_decision_payload, resolve_coding_route_decision
+from ..routing.localization import normalized_phrase
+from ..routing.route_plan import public_workflow_identifier, with_public_skill_names
+from ..routing.route_question import apply_route_question_mode
+from ..plugin_bundle.omh.route_question_mode import read_route_question_mode
+from ..routing.policy import POINT_IN_TIME_WEB_GUARD
+from ..workflows.realtime_voice_trial_receipts import build_prepared_realtime_voice_chat_state
+from ..workflows.temporal_source_receipts import (
+    TEMPORAL_EVIDENCE_SURFACES_SCHEMA_VERSION,
+    TEMPORAL_RETRIEVAL_GAP_SCHEMA_VERSION,
+    TEMPORAL_SOURCE_RECEIPT_SCHEMA_VERSION,
+)
+from ..routing.owner_preference import (
+    read_owner_preference,
+    record_accepted_explicit_choice,
+    record_in_message_explicit_naming,
+    write_owner_preference,
+)
+from ..coding.executors import EXTERNAL_CLI_PROFILES
+from ..routing.missed_route import is_missed_route_feedback
+from ..routing.visual_qa_cues import contains_cue_phrase as _contains_cue_phrase
+from ..routing.omh_help import (
+    is_omh_docs_question as _is_omh_docs_question,
+    is_omh_intro_question as _is_omh_intro_question,
+    is_omh_quickstart_question as _is_omh_quickstart_question,
+    is_omh_status_question as _is_omh_status_question,
+)
+from ..coding_delegation import CODING_EXECUTOR_TARGETS, build_coding_delegation_payload
+from ..capabilities.families import capability_family_cards
+from ..context import build_context_brief
+from ..executors import executor_label
+from ..goal_loop import build_loop_start_card
+from ..hermes_planning import build_hermes_plan_payload, is_coding_shaped_task
+from ..learning_candidate import build_learning_candidate_card
+from ..memory import memory_recall_pack_for_handoff, memory_surface_for_source, record_attached_recall_usage
+from ..operator_productivity import build_agent_operator_productivity_card
+from ..system.paths import OmhPaths, resolve_paths
+from ..plugin_bundle.omh.awareness import workflow_context_card_for_workflow, workflow_context_cards
+from ..plugin_bundle.omh.degradation import degradation_chat_note
+from ..plugin_bundle.omh.hermes_session_commands import handed_on_text, host_command_turn, person_request_text
+from ..plugin_bundle.omh.memory_dreaming import read_latest_consolidation
+from ..probe import probe_capabilities
+from ..quickstart import build_quickstart_card
+from ..skills.catalog import (
+    DEEP_INTERVIEW_MAX_ROUNDS,
+    decision_frontier_policy,
+    installable_skill_definitions,
+    omh_skill_display_name,
+    omh_skill_install_path,
+    primary_harness_for_skill,
+    retained_delegation_skill_names,
+)
+from ..setup_profiles import read_setup_profile
+from ..surfaces.evidence_copy import not_evidence_action_suffix, not_evidence_reply_suffix
+from ..visual_summary import image_generation_setup_fallback
+from ..workflows.goal_ledger import goal_message_states_acceptance_criteria
+from ..workflows.goal_quality_coaching import is_goal_classified_message
+from ..workflows.domain_routing_context import resolve_domain_routing_context_result
+from ..workflows.web_visual_qa_projection import build_prepared_web_visual_qa_chat_state
+from .hermes_runtime import (
+    hermes_coding_team_body,
+    hermes_coding_team_claim_boundary,
+    hermes_coding_team_extra_action_specs,
+)
+from .domain_context_attachment import (
+    HostProjectBindingFactory,
+    rendered_domain_context_fragment,
+    resolve_attached_domain_context,
+)
+from ..skills.expert_question_rendering import domain_expert_question_body
+from .localized_copy import (
+    SUPPORTED_COPY_LOCALES,
+    chat_copy,
+    consolidation_notice_line,
+    detect_copy_locale,
+    is_localized_locale,
+    recovery_action_copy,
+    skill_picker_body as localized_skill_picker_body,
+    skill_picker_headline,
+)
+from .orchestration_guidance import build_omh_orchestration_guidance
+from ..workflows.blocked_work_records import recovery_action_for
+from ..workflows.agent_board import AgentBoardRequest
+from ..workflows.workflow_artifact_operations import WORKFLOW_ARTIFACT_OPERATIONS
+
+
+CHAT_INTERACTION_SCHEMA_VERSION = "chat_interaction/v1"
+CHAT_RESPONSE_SCHEMA_VERSION = "chat_response/v1"
+STATUS_CARD_SCHEMA_VERSION = "status_card/v1"
+SKILL_PICKER_SCHEMA_VERSION = "omh_skill_picker/v1"
+COMMAND_PREVIEW_SCHEMA_VERSION = "omh_command_preview/v1"
+CONTEXT_PRIMER_SCHEMA_VERSION = "omh_context_primer/v1"
+USAGE_TRACE_SCHEMA_VERSION = "omh_usage_trace/v1"
+WORKFLOW_EXPLANATION_SCHEMA_VERSION = "omh_workflow_explanation/v1"
+MESSENGER_RENDERING_SCHEMA_VERSION = "omh_messenger_rendering/v1"
+MESSENGER_ADAPTER_PAYLOAD_SCHEMA_VERSION = "omh_messenger_adapter_payload/v1"
+MESSENGER_ADAPTER_CLAIM_BOUNDARY = (
+    "Rendering and capabilities are not execution or delivery evidence."
+)
+DELIVERY_OBLIGATION_SCHEMA_VERSION = "wrapper_delivery_obligation/v1"
+DELIVERY_OBLIGATION_TRIGGERS = ("handoff_ci_pass", "loop_iteration_complete")
+DELIVERY_OBLIGATION_STATE = "prepared_not_delivered"
+GOAL_QUALITY_COACHING_CARD_SCHEMA_VERSION = "goal_quality_coaching_card/v1"
+RENDER_PROFILE_LIMITED_MARKDOWN = "limited_markdown"
+RENDER_PROFILE_RICH_MARKDOWN = "rich_markdown"
+RENDER_PROFILES = (RENDER_PROFILE_LIMITED_MARKDOWN, RENDER_PROFILE_RICH_MARKDOWN)
+_LIMITED_MARKDOWN_SOURCES = frozenset({"discord", "slack", "telegram"})
+INTERACTION_MODES = ("auto", "route", "plan", "delegate")
+VISIBLE_ACTIONS = (
+    "answer:clarify",
+    "show_command_preview",
+    "show_skill_picker",
+    "choose_skill",
+    "search_skills",
+    "accept_plan",
+    "revise_plan",
+    "present_plan",
+    "prepare_handoff",
+    "prepare_project_terms_context",
+    "choose_executor",
+    "reset_coding_owner_preference",
+    "show_prompt_handoff",
+    "copy_prompt_handoff",
+    "copy_fanout_resume",
+    "show_runtime_handoff",
+    "show_coding_team_path",
+    "start_runtime",
+    "start_hermes_coding",
+    "start_team",
+    "start_swarm",
+    "prepare_worktree",
+    "record_runtime_observation",
+    "send_to_executor",
+    "send_to_codex",
+    "open_executor_session",
+    "attach_executor_session",
+    "refresh_executor_status",
+    "show_coding_handoff_status",
+    "record_executor_completed",
+    "record_executor_blocked",
+    "record_executor_cancelled",
+    "record_executor_failed",
+    "ask_hermes_verify",
+    "show_quickstart",
+    "show_context_brief",
+    "show_status",
+    "show_target_status",
+    "apply_target_change",
+    "choose_permission_profile",
+    "confirm_risky_action",
+    "assess_loopability",
+    "convert_to_loop_goal",
+    "route_direct_task",
+    "state_goal_success_criteria",
+    "start_delivery_cycle",
+    "start_loop",
+    "run_loop_tick",
+    "show_loop_status",
+    "show_loop_queue",
+    "prepare_loop_handoff",
+    "observe_loop_queue",
+    "block_loop_queue",
+    "keep_memory",
+    "forget_memory",
+    "update_memory",
+    "change_memory_scope",
+    "apply_memory_updates",
+    "show_memory_status",
+    "show_rejected_decision_recall",
+    "show_research_department_plan",
+    "revise_research_sources",
+    "confirm_cadence_delivery_tooling",
+    "record_source_observation",
+    "prepare_source_finder_plan",
+    "show_source_candidates",
+    "record_source_candidate",
+    "record_source_link_observed",
+    "record_download_observed",
+    "record_file_hash",
+    "record_text_extraction_observed",
+    "record_license_check",
+    "choose_source",
+    "route_to_downstream_workflow",
+    "show_acquisition_status",
+    "prepare_learning_brief",
+    "prepare_paper_learning",
+    "choose_explanation_level",
+    "show_paper_source_requirements",
+    "record_paper_metadata",
+    "record_paper_excerpt_observed",
+    "record_file_text_extraction_observed",
+    "show_paper_learning",
+    "continue_next_section",
+    "revise_explanation_level",
+    "show_coverage_ledger",
+    "record_user_review",
+    "prepare_visual_prompt_card",
+    "show_visual_prompt_card",
+    "copy_visual_prompt",
+    "revise_visual_card",
+    "change_visual_language",
+    "choose_image_generator",
+    "setup_image_generator",
+    "generate_visual_image",
+    "record_visual_image",
+    "record_visual_qa",
+    "record_visual_delivery",
+    "show_visual_status",
+    "prepare_design_quality_gate",
+    "prepare_design_orchestration",
+    "prepare_design_direction_iteration",
+    "show_design_direction_iteration",
+    "revise_design_direction_iteration",
+    "select_design_direction_option",
+    "request_design_direction_memory_review",
+    "show_design_quality_gate",
+    "record_design_reference",
+    "record_content_qa",
+    "record_layout_qa",
+    "record_surface_quality_matrix",
+    "prepare_finance_analysis",
+    "start_dag_run",
+    "prepare_people_ops_brief",
+    "prepare_legal_compliance_review",
+    "prepare_support_operations",
+    "prepare_curriculum_design",
+    "prepare_localization_review",
+    "prepare_sales_development",
+    "prepare_decision_prototype",
+    "prepare_typed_ask",
+    "prepare_route_question_answer",
+    "prepare_failure_next_move",
+    "prepare_review_flags",
+    "prepare_action_hold_check",
+    "prepare_completion_objection_check",
+    "prepare_lifecycle_growth",
+    "prepare_market_research",
+    "prepare_product_discovery_validation",
+    "prepare_sales_pipeline_review",
+    "prepare_product_brief",
+    "prepare_frontend_handoff",
+    "prepare_backend_handoff",
+    "prepare_rust_handoff",
+    "prepare_native_debug_plan",
+    "prepare_root_cause_investigation",
+    "show_reproduction_record",
+    "prepare_commit_pr_text",
+    "show_evidence_ledger",
+    "prepare_git_repair_plan",
+    "show_pushed_state",
+    "prepare_db_change_plan",
+    "show_migration_readiness",
+    "prepare_security_event_response",
+    "show_event_closure",
+    "prepare_instruction_file_update",
+    "show_command_verification",
+    "prepare_iac_change_plan",
+    "show_apply_gate",
+    "prepare_pipeline_plan",
+    "show_replay_plan",
+    "prepare_finetune_decision",
+    "show_promotion_gate",
+    "prepare_mobile_release_plan",
+    "show_rollout_halt",
+    "prepare_control_test_plan",
+    "show_severity_grade",
+    "prepare_data_share_review",
+    "show_residual_scan",
+    "prepare_pre_spend_card",
+    "show_spend_ledger",
+    "prepare_release_plan",
+    "show_release_readiness",
+    "show_frontend_handoff",
+    "record_browser_capture",
+    "record_accessibility_check",
+    "record_performance_check",
+    "prepare_accessibility_audit",
+    "show_accessibility_audit",
+    "record_focus_flow",
+    "record_screen_reader_check",
+    "record_wcag_mapping",
+    "record_target_size_review",
+    "route_to_frontend_or_visual_qa",
+    "prepare_visual_qa",
+    "prepare_show_reel",
+    "prepare_geospatial_analysis",
+    "prepare_biomedical_evidence",
+    "prepare_molecular_docking",
+    "prepare_ai_job_search",
+    "show_visual_qa",
+    "show_capture_package",
+    "prepare_message_attachment_projection",
+    "record_render_capture",
+    "record_visual_diff",
+    "record_visual_oracle_review",
+    "record_multimodal_review",
+    "record_cjk_layout_findings",
+    "record_visual_qa_verdict",
+    "prepare_browser_operator_card",
+    "show_browser_operator_card",
+    "confirm_browser_action",
+    "record_browser_observation",
+    "prepare_workspace_file_operator_card",
+    "show_workspace_file_operator_card",
+    "confirm_file_operation",
+    "record_file_observation",
+    "record_file_operation_result",
+    "prepare_command_operator_card",
+    "show_command_operator_card",
+    "prepare_external_connector_readiness",
+    "show_external_connector_readiness_card",
+    "prepare_provider_profile_posture",
+    "audit_plugin_risk",
+    "record_connector_capability_matrix",
+    "record_auth_cost_boundary",
+    "record_multimodal_routing_policy",
+    "record_connector_trial_observation",
+    "prepare_prompt_import_readiness",
+    "show_prompt_import_readiness_card",
+    "record_prompt_source_inventory",
+    "record_argument_interpolation_policy",
+    "record_slash_command_collision_report",
+    "record_prompt_import_observation",
+    "prepare_physical_device_readiness",
+    "show_physical_device_readiness_card",
+    "record_device_safety_envelope",
+    "record_sensor_camera_gate_policy",
+    "record_operator_approval_policy",
+    "record_device_trial_observation",
+    "prepare_connector_operator_card",
+    "show_connector_operator_card",
+    "prepare_live_info_operator_card",
+    "show_live_info_operator_card",
+    "prepare_content_operator_card",
+    "show_content_operator_card",
+    "prepare_media_input_card",
+    "show_media_input_card",
+    "confirm_command_execution",
+    "confirm_connector_action",
+    "record_command_observation",
+    "record_command_result",
+    "record_connector_observation",
+    "record_connector_result",
+    "record_live_info_observation",
+    "record_live_info_result",
+    "record_content_draft",
+    "record_content_review",
+    "record_content_output",
+    "record_media_source_scope",
+    "record_transcript_boundary",
+    "record_media_result",
+    "prepare_data_analysis_card",
+    "show_data_analysis_card",
+    "record_dataset_scope",
+    "record_analysis_result",
+    "prepare_workspace_audit",
+    "show_workspace_audit",
+    "record_workspace_inventory",
+    "record_config_security_findings",
+    "record_surface_gap",
+    "prepare_production_audit",
+    "show_production_audit",
+    "record_release_gate",
+    "record_production_signal",
+    "record_rollback_path",
+    "prepare_verification_gate",
+    "show_verification_gate",
+    "record_build_check",
+    "record_lint_check",
+    "record_test_check",
+    "record_security_check",
+    "record_ci_check",
+    "record_verification_verdict",
+    "prepare_build_failure_triage",
+    "show_build_failure_triage",
+    "record_failure_log",
+    "record_failure_cluster",
+    "record_root_cause_hypothesis",
+    "prepare_minimal_fix_handoff",
+    "record_rerun_plan",
+    "route_to_verification_gate",
+    "prepare_agent_evaluation",
+    "show_agent_evaluation",
+    "record_eval_task",
+    "record_eval_run",
+    "record_eval_metric",
+    "record_eval_verdict",
+    "prepare_rules_distillation",
+    "show_rules_distillation",
+    "record_rule_candidate",
+    "approve_rule_candidate",
+    "reject_rule_candidate",
+    "prepare_rule_patch",
+    "prepare_codebase_onboarding",
+    "show_codebase_onboarding",
+    "record_repo_map",
+    "record_reading_path",
+    "record_domain_glossary",
+    "record_first_task_runway",
+    "prepare_codegraph_refresh",
+    "show_codegraph_refresh",
+    "prepare_inference_serving",
+    "show_inference_serving",
+    "prepare_award_bar_score",
+    "show_award_bar_score",
+    "prepare_tech_debt_audit",
+    "show_tech_debt_audit",
+    "prepare_refactor_plan",
+    "show_refactor_plan",
+    "prepare_codebase_uml",
+    "show_codebase_uml",
+    "record_codegraph_build",
+    "record_codegraph_summary",
+    "record_codegraph_handoff",
+    "prepare_skill_scout",
+    "show_skill_scout",
+    "record_skill_candidate",
+    "record_skill_candidate_risk_review",
+    "route_to_skill_creator_or_skill_health",
+    "prepare_skill_health",
+    "show_skill_health",
+    "record_skill_health_signal",
+    "record_skill_amendment_review",
+    "route_to_doctor_skill_or_workflow_learning",
+    "prepare_context_budget_review",
+    "show_context_budget_review",
+    "show_run_efficiency_report",
+    "record_must_keep_context",
+    "record_checkpoint_plan",
+    "record_budget_risk",
+    "record_provider_usage",
+    "prepare_security_safety_review",
+    "prepare_application_threat_model",
+    "show_attack_scenarios",
+    "show_control_tests",
+    "prepare_live_incident_record",
+    "show_incident_timeline",
+    "show_recovery_verification",
+    "show_security_safety_review",
+    "record_threat_surface",
+    "record_permission_secret_risk",
+    "record_prompt_injection_risk",
+    "record_safe_action_policy",
+    "prepare_remediation_handoff",
+    "dispatch_to_workflow",
+    "run_hermes_research",
+    "prepare_strategy_brief",
+    "prepare_meeting_brief",
+    "triage_feedback",
+    "prepare_ops_review",
+    "present_app_delivery_loop",
+    "present_meta_route",
+    "run_cto_loop",
+    "prepare_deploy_monitor_plan",
+    "prepare_review_or_followup_handoff",
+    "run_local_operator_check",
+    "apply_capability_toggle",
+    "show_running_work_board",
+    "declare_plan_checklist",
+    "show_achievements_summary",
+    "prepare_wiki_blueprint",
+    "run_setup_guide",
+    "prepare_operating_workflow",
+    "prepare_memory_review",
+    "prepare_coding_handoff",
+    "prepare_coding_runtime_handoff",
+    "prepare_operating_record",
+    "prepare_report_package",
+    "prepare_reliability_review",
+    "prepare_scheduled_ops_blueprint",
+    "prepare_research_department_plan",
+    "prepare_material_package",
+    "prepare_deliverable_package",
+    "prepare_github_event_ops_card",
+    "prepare_github_issue_intake",
+    "show_direction_check",
+    "confirm_issue_creation",
+    "record_read_back",
+    "prepare_long_document_reading",
+    "show_chunk_ledger",
+    "continue_next_range",
+    "prepare_agent_board_card",
+    "prepare_executor_runtime_readiness",
+    "prepare_memory_new",
+    "prepare_memory_sync",
+    "prepare_gateway_intent_card",
+    "prepare_voice_operator_card",
+    "prepare_toolbelt_readiness",
+    "prepare_harness_session_inventory",
+    "prepare_ops_observability_card",
+    "prepare_ultraperf_loop",
+    "refresh_status",
+    "prepare_agent_ops_review",
+    "show_agent_ops_review",
+    "choose_ops_lane",
+    "prepare_research_lane",
+    "prepare_coding_lane",
+    "prepare_review_lane",
+    "refresh_agent_ops_status",
+    "record_agent_ops_observation",
+    "prepare_agent_debug",
+    "show_agent_debug_report",
+    "record_agent_failure_capture",
+    "record_agent_recovery_action",
+    "escalate_agent_debug",
+    "prepare_llm_app_build",
+    "prepare_failure_signal_audit",
+    "show_failure_signal_audit",
+    "record_failure_signal",
+    "record_fallback_risk",
+    "route_to_remediation_or_visual_qa",
+    "prepare_instinct_ledger",
+    "show_instinct_ledger",
+    "record_instinct_candidate",
+    "record_instinct_scope_decision",
+    "record_instinct_promotion_review",
+    "record_instinct_export_review",
+    "route_to_rules_distill_or_workflow_learning",
+    "record_workflow_learning_trace",
+    "record_missed_route",
+    "show_learning_review_queue",
+    "show_learning_eval",
+    "propose_skill_improvement",
+    "review_improvement",
+    "approve_improvement",
+    "revise_improvement",
+    "reject_improvement",
+    "prepare_patch_proposal",
+    "show_patch_proposal",
+    "copy_patch_handoff",
+    "show_learning_candidate",
+    "copy_learn_prompt",
+    "add_regression_case",
+    "audit_learning_readiness",
+    "export_learning_bundle",
+    "replay_regression_cases",
+    "check_learning_index",
+    "rebuild_learning_index",
+    "run_omh_update",
+    "run_omh_setup",
+    "run_omh_doctor",
+    "run_omh_uninstall",
+    "run_omh_install",
+    "run_omh_list",
+    "cancel",
+)
+_ROUTE_TO_MODE = {"dispatch": "plan", "clarify": "clarify", "fallback": "clarify"}
+_CLARIFICATION_SKILLS = {"deep-interview"}
+_ROUTER_SKILL = "oh-my-hermes"
+_SKILL_PICKER_TOKENS = frozenset({"omh", "ohmy", "skills"})
+_SKILL_PICKER_HELP_TOKENS = frozenset({"", "help", "menu", "list", "commands", "workflows", "skills"})
+_COMMAND_PREVIEW_PREFIXES = ("./", "/")
+_COMMAND_PREVIEW_ALIAS = "omh"
+_MESSAGE_EXECUTOR_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("claude-code", ("claude code", "claude-code", "claudecode", "클로드 코드", "클로드코드")),
+    ("codex", ("codex", "코덱스")),
+    ("omc-runtime", ("omc", "oh my claude", "oh-my-claude", "oh my claude code", "oh-my-claude-code")),
+    ("pi-family-runtime", RUNTIME_USER_NAMES),
+    ("omx-runtime", ("omx", "oh my codex", "oh-my-" + "codex", "omx runtime")),
+    (
+        "hermes",
+        (
+            "hermes coding",
+            "hermes runtime",
+            "hermes itself",
+            "with hermes",
+            "hermes만으로",
+            "hermes 만으로",
+            "헤르메스가 코딩",
+            "헤르메스로 구현",
+            "헤르메스 자체",
+            "헤르메스 런타임",
+            "헤르메스만으로",
+            "헤르메스 만으로",
+        ),
+    ),
+)
+_SKILL_PICKER_ENTRIES = (
+    ("oh-my-hermes", "Route for me", "Let Hermes choose the safest workflow.", "./omh <request>"),
+    ("deep-interview", "Deep Interview", "Clarify fuzzy goals before planning.", "./deep-interview <request>"),
+    ("ralplan", "Ralplan", "Research and plan before execution.", "./ralplan <request>"),
+    ("loop", "Loop", "Iterate on a loopable long-horizon goal.", "./loop <goal>"),
+    ("ultrawork", "Ultra Work", "Run an accepted plan or one bounded delivery cycle in explicit lanes.", "./ultrawork <request>"),
+    ("feedback-triage", "Feedback Triage", "Turn customer or product signals into investigation.", "./feedback-triage <signal>"),
+    ("research", "Research", "Gather source-backed evidence, from live citations to studied reference implementations.", "./research <question>"),
+    ("source-finder", "Source Finder", "Prepare typed source candidates before downstream work.", "./source-finder <target>"),
+    ("research-department", "Research Department", "Prepare Scout, Analyst, and Briefer research ops.", "./research-department <topic>"),
+    ("paper-learning", "Paper Learning", "Explain a paper by level without dropping coverage.", "./paper-learning <paper>"),
+    ("agent-ops-review", "Agent Ops Review", "See quality, blockers, next action, and throughput levers.", "./agent-ops-review <request>"),
+    ("code-review", "Code Review", "Review completed work without overclaiming evidence.", "./code-review <scope>"),
+    ("materials-package", "Materials Package", "Shape PPT, PDF, spreadsheet, document, or Markdown deliverables.", "./materials-package <brief>"),
+    ("img-summary", "Img Summary", "Prepare image-generation-ready summary cards.", "./img-summary <source>"),
+    ("design-quality-gate", "Design Quality Gate", "Raise visual, content, layout, and publishing quality.", "./design-quality-gate <brief>"),
+    ("automation-blueprint", "Automation Blueprint", "Prepare recurring Hermes scheduled-ops workflows.", "./automation-blueprint <intent>"),
+    ("doctor", "Doctor", "Check OMH install and Hermes registration health.", "./doctor"),
+)
+_CONTEXT_PRIMER_GROUPS = (
+    {
+        "id": "intent_to_plan",
+        "label": "Intent to plan",
+        "workflows": ("deep-interview", "ralplan", "loop", "ultrawork"),
+        "use_when": "The user has a fuzzy goal, a large goal, or one delivery cycle that needs research, planning, execution, review, and sync.",
+    },
+    {
+        "id": "company_product_ops",
+        "label": "Company and product ops",
+        "workflows": ("feedback-triage", "research-department", "source-finder", "paper-learning", "research", "strategy-brief", "automation-blueprint"),
+        "use_when": "The user needs customer-signal triage, source-backed research, recurring ops, meeting/report work, or strategy synthesis.",
+    },
+    {
+        "id": "deliverables_and_visuals",
+        "label": "Deliverables and visuals",
+        "workflows": ("design-quality-gate", "frontend", "visual-qa", "materials-package", "deliverable-package", "img-summary", "report-package"),
+        "use_when": "The user wants files, decks, PDFs, frontend surfaces, screenshots, posters, reports, image-summary cards, premium design QA, or attachment-ready delivery states.",
+    },
+    {
+        "id": "coding_and_runtime",
+        "label": "Coding and runtime tracking",
+        "workflows": (
+            "idea-to-deploy",
+            "workspace-audit",
+            "production-audit",
+            "verification-gate",
+            "agent-evaluation",
+            "rules-distill",
+            "agent-ops-review",
+            "code-review",
+            "ops-observability-card",
+        ),
+        "use_when": "The user wants Hermes to prepare coding handoffs, explain executor status, review evidence, CI, or merge readiness.",
+    },
+)
+_RETAINED_DELEGATION_SKILLS = set(retained_delegation_skill_names())
+_DIRECT_WORKFLOW_SKILLS = {
+    "geospatial-analysis",
+    "biomedical-evidence",
+    "molecular-docking",
+    "ai-job-search",
+    "market-research",
+    "show-reel",
+    "research",
+    "ultraqa",
+    # A big job the person asked for runs at once (owner decision D1); only scope, spend or an irreversible step
+    # stops it, so it gets its own card rather than a plan-first one.
+    "dag-ulw",
+    "code-review",
+    "web-research",
+    "source-finder",
+    "doctor",
+    "skill",
+    "wiki",
+    # Neither needs a plan first, and wrapping them in one was actively wrong:
+    # a capability toggle is a reversible local policy write that names the
+    # command undoing it, and the running-work board only reads local files.
+    # Without an entry here a dispatch is wrapped into "I routed this to
+    # `omh-plan` because it needs a safe plan first", so asking to turn memory
+    # off got a planning card instead of the toggle.
+    "capability-toggle",
+    "running-work-board",
+    "todo-checklist",
+    *_RETAINED_DELEGATION_SKILLS,
+} - (_CLARIFICATION_SKILLS | {"cancel"})
+_CODING_OWNER_NEXT_ACTIONS = frozenset(
+    {
+        "prepare_coding_handoff",
+        "prepare_coding_runtime_handoff",
+        "start_delivery_cycle",
+    }
+)
+_CODING_OWNER_WORKFLOWS = frozenset(
+    {
+        "ultrawork",
+        "ai-slop-cleaner",
+        "maestro",
+    }
+)
+_CODING_OWNER_WHEN_CODE_SHAPED = frozenset({"code-review"})
+_STATUS_COPY = {
+    "prepare_coding_delegation": (
+        "handoff",
+        "I am preparing the handoff details.",
+        "No executor work is observed yet.",
+        "No execution has started.",
+    ),
+    "clarify_coding_request": (
+        "clarification",
+        "I need one clarification before delegation.",
+        "I will keep this in the chat until the task is specific enough.",
+        "No execution has started.",
+    ),
+    "route_coding_request": (
+        "clarification",
+        "I need to route this before delegation.",
+        "I will ask for the missing outcome before sending anything to an executor.",
+        "No execution has started.",
+    ),
+    "choose_executor": (
+        "handoff",
+        "Choose who should own the coding work.",
+        "A coding handoff path is not selected yet; no executor/runtime dispatch is observed.",
+        "Executor choice is not dispatch or implementation evidence.",
+    ),
+    "dispatch_to_executor": (
+        "handoff",
+        "An executor handoff is ready.",
+        "I have prepared the handoff, but executor/runtime dispatch is not observed yet.",
+        "Preparation is not execution evidence.",
+    ),
+    "show_prompt_handoff": (
+        "handoff",
+        "A prompt handoff is ready.",
+        "The selected prompt handoff is prepared, but OMH has not dispatched it to an executor.",
+        "Prompt handoff is prepared only; OMH has not dispatched it to an executor.",
+    ),
+    "show_runtime_handoff": (
+        "handoff",
+        "A runtime handoff is ready.",
+        "The selected runtime handoff is prepared, but runtime start is not observed yet.",
+        "Runtime handoff is prepared only; runtime start requires observed runtime evidence.",
+    ),
+    "wait_for_executor_evidence": (
+        "status",
+        "The handoff was dispatched.",
+        "I am waiting for executor evidence before reporting completion.",
+        "Dispatch is not completion evidence.",
+    ),
+    "surface_executor_blocker": (
+        "blocker",
+        "The executor reported a blocker.",
+        "I will surface the blocker instead of claiming completion.",
+        "Blocked executor work is not complete.",
+    ),
+    "surface_executor_cancellation": (
+        "blocker",
+        "The executor run was cancelled.",
+        "I will report the cancellation and what re-dispatching it would need, instead of claiming any outcome.",
+        "Cancelled executor work is not complete, not failed, and not blocked on anything clearable.",
+    ),
+    "record_review_evidence": (
+        "status",
+        "Executor completion needs review evidence.",
+        "I will not report completion until review evidence is observed.",
+        "Execution is observed; review is not.",
+    ),
+    "surface_review_blocker": (
+        "blocker",
+        "Review is blocking completion.",
+        "I will surface the review blocker instead of claiming completion.",
+        "Review did not pass.",
+    ),
+    "record_verification_evidence": (
+        "status",
+        "Executor completion needs verification evidence.",
+        "I will not report completion until verification evidence is observed.",
+        "Execution is observed; verification is not.",
+    ),
+    "record_ci_evidence": (
+        "status",
+        "Review passed; CI evidence is still missing.",
+        "I will not report merge readiness until CI evidence is observed.",
+        "Review is not CI evidence.",
+    ),
+    "surface_ci_blocker": (
+        "blocker",
+        "CI is blocking completion.",
+        "I will surface the failing or blocked CI checks instead of claiming merge readiness.",
+        "Failed CI is not merge-ready.",
+    ),
+    "record_merge_readiness": (
+        "status",
+        "Review and CI passed; merge readiness is still missing.",
+        "I will not report merge-ready until merge readiness evidence is observed.",
+        "CI passing is not merge evidence.",
+    ),
+    "surface_merge_blocker": (
+        "blocker",
+        "Merge is blocked.",
+        "I will surface the merge blocker instead of claiming the run is ready.",
+        "Blocked merge is not complete.",
+    ),
+    "report_completion_with_evidence": (
+        "status",
+        "Executor completion is reportable.",
+        "Execution and verification evidence are observed.",
+        "Completion is backed by observed wrapper evidence.",
+    ),
+    # These two rungs assert external effects, so their body is not a constant:
+    # `_merge_status_copy` rebuilds it from the run's external effect receipts
+    # and only names a gate it can cite. The strings below are the kind,
+    # headline, and boundary that survive that rebuild.
+    "report_merge_ready": (
+        "status",
+        "This is ready to merge.",
+        "Execution, verification, review, and merge-readiness evidence are observed.",
+        "Ready to merge is not the same as merged.",
+    ),
+    "report_merged": (
+        "status",
+        "This has been merged.",
+        "Execution, verification, review, and merge evidence are observed.",
+        "Merged status is backed by runtime ledger evidence and an external effect receipt.",
+    ),
+}
+_HUMAN_ACK_BODY_BY_SKILL = {
+    "automation-blueprint": (
+        "I will prepare this as a recurring Hermes ops workflow: schedule, source inputs, delivery target, "
+        "silence policy, and the confirmation card. If you want it kept, I can save it as a paused recurring "
+        "intent. Activating it, creating the actual schedule, or sending messages still needs observed runtime "
+        "evidence."
+    ),
+    "research-department": (
+        "I will shape this into a research workflow: what to watch, how raw findings move into analysis, "
+        "how the briefing should be delivered, and what still needs source or delivery evidence."
+    ),
+    "paper-learning": (
+        "I will explain this paper at the selected level without shrinking it into a short summary. I will first "
+        "mark what paper text or PDF extraction is actually observed, then walk section by section with a coverage ledger."
+    ),
+    "source-finder": (
+        "I will prepare typed source candidates and acquisition status first: papers, links, datasets, repos, presentations, "
+        "or docs/specs. Search, download, extraction, license checks, verification, and downstream processing stay unobserved "
+        "until a wrapper or user records evidence."
+    ),
+    "workspace-audit": (
+        "I will prepare a read-only workspace audit: repo, skill, prompt, plugin, MCP/tool, hook, config, docs, "
+        "and runtime surfaces, with secrets redacted and mutations routed to a separate follow-up workflow."
+    ),
+    "production-audit": (
+        "I will prepare a production-readiness audit: release scope, build/test/CI/security evidence, observability, "
+        "rollback, support, and a GO/HOLD/BLOCK verdict. Deploy and live-health claims still need observed evidence."
+    ),
+    "verification-gate": (
+        "I will prepare the verification gate: required checks, observed result freshness, generated-output checks, "
+        "CI/DCO boundaries, and a PASS/HOLD/BLOCK claim verdict before completion or merge claims."
+    ),
+    "agent-evaluation": (
+        "I will prepare a fair executor evaluation: tasks, fixtures, rubric, budgets, isolation, observed run matrix, "
+        "and scenario-specific recommendation instead of anecdotal agent ranking."
+    ),
+    "rules-distill": (
+        "I will distill repeated workflow lessons into reviewed rule candidates with source references, duplicates, "
+        "conflicts, and approval state. Nothing mutates skills, prompts, docs, or memory until approved and implemented."
+    ),
+    "codebase-onboarding": (
+        "I will prepare a codebase onboarding pack: observed repo map, reading path, glossary, risks, unknowns, "
+        "and first-task runway. Setup, code edits, executor dispatch, and verification stay separate."
+    ),
+    "refactor-plan": (
+        "I will shape the decided refactor into phases: reconnaissance from observed repo evidence, the "
+        "contracts-first phase order with per-phase verification and rollback, the files table, and a stop at "
+        "the approval gate. No phase is implemented until you approve the plan."
+    ),
+    "inference-serving": (
+        "I will prepare the serving process: engine and quantization from the decision tables, the gated "
+        "deployment runbook with its verification commands, and the benchmark protocol with metrics, load "
+        "shape, and SLO. Every step stays prepared until its command result is observed."
+    ),
+    "tech-debt-audit": (
+        "I will prepare the tech-debt ledger: orientation from repo evidence, dimension-by-dimension findings "
+        "with file:line citations, severity-by-effort ranking with quick wins, the looks-bad-but-fine list, and "
+        "RESOLVED/NEW/CARRIED reconciliation against the previous ledger. Detection commands stay prepared until "
+        "their results are observed."
+    ),
+    "award-bar-score": (
+        "I will prepare the award-bar score: a score for each of UI, UX, and innovation with the rendered "
+        "evidence it was read from, the weighted total against the published threshold, and the binding "
+        "constraint - the one axis whose gain moves the total most. Any innovation move that costs an "
+        "accessibility or performance budget is recorded as a tradeoff for you to choose. No jury outcome "
+        "is claimed, and axes stay not_observed until the page is rendered."
+    ),
+    "codegraph-refresh": (
+        "I will prepare a codegraph refresh: repo root, build/summary/handoff command choices, staleness scope, "
+        "file-write policy, and observed-only codegraph summary or handoff evidence. Command execution and "
+        "generated files stay separate until observed."
+    ),
+    "codebase-uml": (
+        "I will draw the codebase as one interface-level diagram: scope the view, generate the PlantUML source "
+        "from the actual tree, render it with the local renderer, and attach the picture with its omissions "
+        "legend. The image counts only once the render is observed."
+    ),
+    "skill-scout": (
+        "I will prepare a skill scout report: intended skill workflow, search keywords, local and external candidate "
+        "sources, risk review gaps, and use/fork/create options. Installation, copying, external trust, and "
+        "implementation stay separate until observed and reviewed."
+    ),
+    "skill-health": (
+        "I will prepare a skill health dashboard: catalog and generated-skill surfaces, stale or duplicate guidance, "
+        "observed failure-pattern signals, pending amendment reviews, and top safe actions. Install repair, skill "
+        "mutation, and future routing fixes stay separate until observed and reviewed."
+    ),
+    "agent-debug": (
+        "I will prepare an agent debug report: failure state, recent tool sequence, goal or prompt drift, context "
+        "pressure, environment assumptions, likely failure pattern, and the smallest safe recovery action. Executor "
+        "reset, hidden mutation, tool repair, and proof of future fixes stay separate until observed."
+    ),
+    "instinct-ledger": (
+        "I will prepare an instinct ledger: atomic trigger/action candidates, project or global scope, confidence, "
+        "source evidence, promotion review, and export/import boundaries. Hooks, memory writes, skill mutation, "
+        "global promotion, and behavior-change claims stay separate until observed."
+    ),
+    "context-budget-review": (
+        "I will prepare a context budget review: must-keep context, checkpoint cadence, budget risks, overflow "
+        "recovery, and provider-truth gaps. Exact billing or token usage still needs observed runtime/provider evidence."
+    ),
+    "security-safety-review": (
+        "I will prepare a redacted security safety review: threat surface, prompt-injection risks, tool permissions, "
+        "secret/dependency/destructive-action gates, and safe remediation handoff without exposing secrets."
+    ),
+    "application-threat-model": (
+        "I will model this application, not the agent: assets with their data class and loss, trust boundaries with what "
+        "authenticates each crossing, attack scenarios per boundary, one control decision each, and the security test that "
+        "fails when a control is removed. No control counts as deployed until configuration or a passing test is observed."
+    ),
+    "live-incident-response": (
+        "I will command this incident while it is open: severity declared with the observation that set it, a named commander and "
+        "the remaining roles, an append-only timeline, every mitigation marked temporary or permanent, and recovery verified "
+        "against a named signal. Paging, status-page updates, and customer sends stay prepared until a connector returns a result."
+    ),
+    "materials-package": (
+        "I will shape this into a material package: target files, source inputs, missing data, outline, "
+        "generation owner, and QA checks. I will not claim the files exist until export evidence is observed."
+    ),
+    "deliverable-package": (
+        "I will prepare the deliverable path: which files are needed, who generates them, what QA must pass, "
+        "and how attachment or delivery status should be recorded."
+    ),
+    "github-event-ops": (
+        "I will classify the GitHub PR, issue, review, or CI event into triage, review, label, or fix-handoff "
+        "actions. Webhook delivery and GitHub mutations stay unobserved until a wrapper records them."
+    ),
+    "github-issue-intake": (
+        "I will classify the report, ask at most three decision-changing questions, search duplicates, and present "
+        "a direction check. Issue creation stays disabled until you confirm, and only an authorized connector's "
+        "read-back counts as observed evidence."
+    ),
+    "long-document-reading": (
+        "I will read this document in page ranges sized to the read budget, keeping a covered / next / missing "
+        "ledger with page anchors instead of one truncated read. Page count, extraction, and scanned-page OCR stay "
+        "unobserved until the tool results record them."
+    ),
+    "memory-sync": (
+        "I will review existing claims in English, with concise Korean help labels when useful, and prepare a native "
+        "write diff. No OMH surface invokes, applies, or observes a MEMORY.md or USER.md write — an approved diff is "
+        "applied by Hermes's own native memory tool; native, provider, and vector context is not_omh_reviewed and "
+        "never inherits OMH approval."
+    ),
+    "memory-new": (
+        "I will remember the durable fact as one bounded line through omh_memory capture, asking one question only "
+        "when scope or durability is ambiguous; refuse secrets/logs/transcripts/prompt injection/temporary progress; "
+        "or defer uncertain or external provider/vector content to review."
+    ),
+    "voice-operator": (
+        "I will turn the short voice or mobile request into a concise clarify, plan, status, handoff, or "
+        "confirmation card, and require confirmation before risky actions."
+    ),
+    "workspace-file-operator": (
+        "I will prepare the file-operation path: path scope, allowed operations, excluded paths, destructive "
+        "confirmation, and observation slots. File reads, writes, moves, renames, deletes, uploads, and downloads "
+        "stay unobserved until a wrapper records them."
+    ),
+    "command-operator": (
+        "I will prepare the command path: command text, working directory, environment assumptions, timeout, "
+        "safety gate, result-evidence slots, and stop condition. Terminal launch, shell execution, stdout/stderr, "
+        "exit code, package-manager effects, and filesystem mutations stay unobserved until command evidence is recorded."
+    ),
+    "data-analysis": (
+        "I will prepare the data-analysis path: dataset scope, columns or schema, analysis question, method, "
+        "result-evidence slots, and stop condition. File extraction, query execution, chart generation, and numeric "
+        "findings stay unobserved until data and method evidence are recorded."
+    ),
+    "toolbelt-readiness": (
+        "I will map the MCP, CLI, API, credential, and connector pieces this workflow needs, show what is "
+        "observed versus missing, and suggest the safest setup or handoff next step."
+    ),
+    "research": (
+        "I will keep this in Hermes as a source-backed research lane: define source boundaries, freshness, "
+        "version or jurisdiction scope, and declared depth, gather cited evidence, study reference implementations "
+        "with pinned refs when the decision needs them, and gate contested claims before any later plan or handoff."
+    ),
+    "strategy-brief": (
+        "I will prepare strategy options, tradeoffs, decision notes, and open questions in Hermes. Implementation "
+        "handoff stays disabled until an accepted decision creates explicit work."
+    ),
+    "meeting-brief": (
+        "I will prepare the agenda, context prompts, decision slots, and follow-up template. Prepared meeting "
+        "material is not evidence that the meeting happened."
+    ),
+    "feedback-triage": (
+        "I will cluster the signal, separate bug reports, requests, and questions, and recommend the next investigation, "
+        "plan, or handoff path without treating triage as implementation."
+    ),
+    "code-review": (
+        "I will prepare the review path: what needs checking, which claims need evidence, and what follow-up handoff "
+        "is needed if fixes are found. Review preparation is not a completed review."
+    ),
+    "report-package": (
+        "I will prepare the report package: source inputs, outline, missing numbers, approval points, and export or "
+        "delivery checks. The package is not delivered until observed evidence exists."
+    ),
+    "reliability-review": (
+        "I will prepare a reliability review with service boundaries, SLO or incident context, risk areas, and "
+        "remediation handoff options. Healthy status or incident closure still needs observed evidence."
+    ),
+    "gateway-intent-card": (
+        "I will normalize the gateway intent: origin, thread, delivery policy, silent updates, attachments, and "
+        "status-update behavior before any platform action is claimed."
+    ),
+    "ops-observability-card": (
+        "I will prepare a wrapper-safe observability card for token, cost, latency, run history, and failure-mode "
+        "signals while keeping local estimates separate from provider-observed truth."
+    ),
+    "operating-rhythm": (
+        "I will prepare the operating rhythm: cadence, meeting topics, decision records, owners, and follow-up "
+        "slots. Prepared operations notes are not evidence that the work happened."
+    ),
+}
+
+_ACK_PRIMARY_ACTIONS_BY_NEXT_ACTION = {
+    "present_meta_route": ("present_meta_route", "Show workflow route"),
+    "present_plan": ("present_plan", "Show plan"),
+    "assess_loopability": ("assess_loopability", "Assess loopability"),
+    "prepare_visual_prompt_card": ("prepare_visual_prompt_card", "Prepare image card"),
+    "prepare_agent_ops_review": ("prepare_agent_ops_review", "Open ops review"),
+    "start_delivery_cycle": ("start_delivery_cycle", "Start delivery cycle"),
+    "audit_learning_readiness": ("audit_learning_readiness", "Audit learning"),
+    "run_omh_update": ("run_omh_update", "Run omh update"),
+    "run_omh_setup": ("run_omh_setup", "Run omh setup"),
+    "run_omh_doctor": ("run_omh_doctor", "Run omh doctor"),
+    "run_omh_uninstall": ("run_omh_uninstall", "Run omh uninstall"),
+    "run_omh_install": ("run_omh_install", "Run omh install"),
+    "run_omh_list": ("run_omh_list", "Run omh list"),
+    "run_hermes_research": ("run_hermes_research", "Start research"),
+    "prepare_strategy_brief": ("prepare_strategy_brief", "Prepare strategy"),
+    "prepare_meeting_brief": ("prepare_meeting_brief", "Prepare brief"),
+    "triage_feedback": ("triage_feedback", "Triage feedback"),
+    "prepare_ops_review": ("prepare_ops_review", "Prepare ops review"),
+    "present_app_delivery_loop": ("present_app_delivery_loop", "Show delivery loop"),
+    "run_cto_loop": ("run_cto_loop", "Open team loop"),
+    "prepare_deploy_monitor_plan": ("prepare_deploy_monitor_plan", "Prepare deploy plan"),
+    "prepare_review_or_followup_handoff": ("prepare_review_or_followup_handoff", "Prepare review"),
+    "run_local_operator_check": ("run_local_operator_check", "Show local check"),
+    "apply_capability_toggle": ("apply_capability_toggle", "Show capability policy"),
+    "show_running_work_board": ("show_running_work_board", "Show running work"),
+    "declare_plan_checklist": ("declare_plan_checklist", "Declare checklist"),
+    "show_achievements_summary": ("show_achievements_summary", "Show achievements"),
+    "prepare_wiki_blueprint": ("prepare_wiki_blueprint", "Prepare wiki blueprint"),
+    "run_setup_guide": ("run_setup_guide", "Start setup guide"),
+    "prepare_operating_workflow": ("prepare_operating_workflow", "Prepare workflow"),
+    "prepare_memory_review": ("prepare_memory_review", "Review memory"),
+    "prepare_project_terms_context": ("prepare_project_terms_context", "Align project terms"),
+    "prepare_coding_handoff": ("prepare_coding_handoff", "Prepare coding handoff"),
+    "prepare_coding_runtime_handoff": ("prepare_coding_runtime_handoff", "Prepare runtime handoff"),
+    "prepare_operating_record": ("prepare_operating_record", "Prepare rhythm"),
+    "prepare_report_package": ("prepare_report_package", "Prepare report"),
+    "prepare_reliability_review": ("prepare_reliability_review", "Review reliability"),
+    "prepare_scheduled_ops_blueprint": ("prepare_scheduled_ops_blueprint", "Prepare automation"),
+    "prepare_research_department_plan": ("prepare_research_department_plan", "Prepare research flow"),
+    "prepare_market_research": ("prepare_market_research", "Scope market analysis"),
+    "prepare_source_finder_plan": ("prepare_source_finder_plan", "Prepare sources"),
+    "prepare_learning_brief": ("prepare_learning_brief", "Confirm learning target"),
+    "prepare_paper_learning": ("prepare_paper_learning", "Prepare paper learning"),
+    "prepare_workspace_audit": ("prepare_workspace_audit", "Prepare audit"),
+    "prepare_production_audit": ("prepare_production_audit", "Audit production"),
+    "prepare_verification_gate": ("prepare_verification_gate", "Prepare gate"),
+    "prepare_build_failure_triage": ("prepare_build_failure_triage", "Triage build failure"),
+    "prepare_agent_evaluation": ("prepare_agent_evaluation", "Prepare eval"),
+    "prepare_rules_distillation": ("prepare_rules_distillation", "Distill rules"),
+    "prepare_codebase_onboarding": ("prepare_codebase_onboarding", "Prepare onboarding"),
+    "prepare_codegraph_refresh": ("prepare_codegraph_refresh", "Refresh codegraph"),
+    "prepare_inference_serving": ("prepare_inference_serving", "Prepare serving"),
+    "prepare_award_bar_score": ("prepare_award_bar_score", "Score award bar"),
+    "prepare_tech_debt_audit": ("prepare_tech_debt_audit", "Audit tech debt"),
+    "prepare_refactor_plan": ("prepare_refactor_plan", "Plan refactor"),
+    "prepare_codebase_uml": ("prepare_codebase_uml", "Draw codebase"),
+    "prepare_agent_debug": ("prepare_agent_debug", "Prepare agent debug"),
+    "prepare_failure_signal_audit": ("prepare_failure_signal_audit", "Audit failure signals"),
+    "prepare_llm_app_build": ("prepare_llm_app_build", "Prepare LLM build"),
+    "prepare_instinct_ledger": ("prepare_instinct_ledger", "Prepare instincts"),
+    "prepare_skill_scout": ("prepare_skill_scout", "Prepare skill scout"),
+    "prepare_skill_health": ("prepare_skill_health", "Prepare skill health"),
+    "prepare_context_budget_review": ("prepare_context_budget_review", "Review context"),
+    "show_run_efficiency_report": ("show_run_efficiency_report", "Show run efficiency"),
+    "prepare_security_safety_review": ("prepare_security_safety_review", "Review safety"),
+    "prepare_application_threat_model": ("prepare_application_threat_model", "Model the threats"),
+    "prepare_live_incident_record": ("prepare_live_incident_record", "Command the incident"),
+    "show_incident_timeline": ("show_incident_timeline", "Show incident timeline"),
+    "show_recovery_verification": ("show_recovery_verification", "Show recovery check"),
+    "show_attack_scenarios": ("show_attack_scenarios", "Show attack scenarios"),
+    "show_control_tests": ("show_control_tests", "Show control tests"),
+    "prepare_material_package": ("prepare_material_package", "Prepare package"),
+    "prepare_design_quality_gate": ("prepare_design_quality_gate", "Prepare design gate"),
+    "prepare_design_orchestration": ("prepare_design_orchestration", "Prepare design direction"),
+    "prepare_finance_analysis": ("prepare_finance_analysis", "Prepare finance analysis"),
+    "start_dag_run": ("start_dag_run", "Start graph run"),
+    "prepare_people_ops_brief": ("prepare_people_ops_brief", "Prepare people ops"),
+    "prepare_legal_compliance_review": ("prepare_legal_compliance_review", "Prepare legal review"),
+    "prepare_support_operations": ("prepare_support_operations", "Prepare support guidance"),
+    "prepare_curriculum_design": ("prepare_curriculum_design", "Prepare curriculum"),
+    "prepare_localization_review": ("prepare_localization_review", "Prepare localization review"),
+    "prepare_sales_development": ("prepare_sales_development", "Prepare sales brief"),
+    "prepare_decision_prototype": ("prepare_decision_prototype", "Prepare decision prototype"),
+    "prepare_typed_ask": ("prepare_typed_ask", "Prepare typed ask"),
+    "prepare_route_question_answer": ("prepare_route_question_answer", "Prepare route answer"),
+    "prepare_failure_next_move": ("prepare_failure_next_move", "Prepare failure next move"),
+    "prepare_review_flags": ("prepare_review_flags", "Prepare review flags"),
+    "prepare_action_hold_check": ("prepare_action_hold_check", "Prepare action check"),
+    "prepare_completion_objection_check": ("prepare_completion_objection_check", "Prepare completion check"),
+    "prepare_lifecycle_growth": ("prepare_lifecycle_growth", "Prepare lifecycle plan"),
+    "prepare_product_discovery_validation": ("prepare_product_discovery_validation", "Prepare discovery validation"),
+    "prepare_sales_pipeline_review": ("prepare_sales_pipeline_review", "Prepare pipeline review"),
+    "prepare_product_brief": ("prepare_product_brief", "Prepare product brief"),
+    "prepare_frontend_handoff": ("prepare_frontend_handoff", "Prepare frontend"),
+    "prepare_backend_handoff": ("prepare_backend_handoff", "Prepare backend contract"),
+    "prepare_rust_handoff": ("prepare_rust_handoff", "Prepare Rust contract"),
+    "prepare_native_debug_plan": ("prepare_native_debug_plan", "Prepare debug plan"),
+    "prepare_root_cause_investigation": ("prepare_root_cause_investigation", "Find the root cause"),
+    "show_reproduction_record": ("show_reproduction_record", "Show reproduction"),
+    "prepare_commit_pr_text": ("prepare_commit_pr_text", "Draft the text"),
+    "show_evidence_ledger": ("show_evidence_ledger", "Show evidence ledger"),
+    "prepare_git_repair_plan": ("prepare_git_repair_plan", "Plan the git repair"),
+    "show_pushed_state": ("show_pushed_state", "Show what is pushed"),
+    "prepare_db_change_plan": ("prepare_db_change_plan", "Plan the database change"),
+    "show_migration_readiness": ("show_migration_readiness", "Show migration readiness"),
+    "prepare_security_event_response": ("prepare_security_event_response", "Respond to the security event"),
+    "show_event_closure": ("show_event_closure", "Show event closure"),
+    "prepare_instruction_file_update": ("prepare_instruction_file_update", "Update the instruction file"),
+    "show_command_verification": ("show_command_verification", "Show command verification"),
+    "prepare_iac_change_plan": ("prepare_iac_change_plan", "Plan the infrastructure change"),
+    "show_apply_gate": ("show_apply_gate", "Show the apply gates"),
+    "prepare_pipeline_plan": ("prepare_pipeline_plan", "Plan the pipeline work"),
+    "show_replay_plan": ("show_replay_plan", "Show the replay plan"),
+    "prepare_finetune_decision": ("prepare_finetune_decision", "Decide on fine-tuning"),
+    "show_promotion_gate": ("show_promotion_gate", "Show the promotion gate"),
+    "prepare_mobile_release_plan": ("prepare_mobile_release_plan", "Plan the store release"),
+    "show_rollout_halt": ("show_rollout_halt", "Show the halt thresholds"),
+    "prepare_control_test_plan": ("prepare_control_test_plan", "Plan the control test"),
+    "show_severity_grade": ("show_severity_grade", "Show the severity criteria"),
+    "prepare_data_share_review": ("prepare_data_share_review", "Review the data share"),
+    "show_residual_scan": ("show_residual_scan", "Show the residual scan"),
+    "prepare_pre_spend_card": ("prepare_pre_spend_card", "Show the pre-spend card"),
+    "show_spend_ledger": ("show_spend_ledger", "Show the spend ledger"),
+    "prepare_release_plan": ("prepare_release_plan", "Plan the release"),
+    "show_release_readiness": ("show_release_readiness", "Show release readiness"),
+    "prepare_accessibility_audit": ("prepare_accessibility_audit", "Audit accessibility"),
+    "prepare_visual_qa": ("prepare_visual_qa", "Prepare visual QA"),
+    "prepare_show_reel": ("prepare_show_reel", "Prepare show reel"),
+    "prepare_geospatial_analysis": ("prepare_geospatial_analysis", "Prepare spatial computation"),
+    "prepare_biomedical_evidence": ("prepare_biomedical_evidence", "Prepare evidence reconciliation"),
+    "prepare_molecular_docking": ("prepare_molecular_docking", "Prepare standalone docking"),
+    "prepare_ai_job_search": ("prepare_ai_job_search", "Prepare career work"),
+    "prepare_deliverable_package": ("prepare_deliverable_package", "Prepare deliverable"),
+    "prepare_github_event_ops_card": ("prepare_github_event_ops_card", "Open event card"),
+    "prepare_github_issue_intake": ("prepare_github_issue_intake", "Open intake card"),
+    "prepare_long_document_reading": ("prepare_long_document_reading", "Plan page ranges"),
+    "show_chunk_ledger": ("show_chunk_ledger", "Show chunk ledger"),
+    "continue_next_range": ("continue_next_range", "Read next range"),
+    "show_direction_check": ("show_direction_check", "Show direction check"),
+    "confirm_issue_creation": ("confirm_issue_creation", "Confirm issue creation"),
+    "record_read_back": ("record_read_back", "Record read-back"),
+    "prepare_agent_board_card": ("prepare_agent_board_card", "Open agent board"),
+    "prepare_executor_runtime_readiness": ("prepare_executor_runtime_readiness", "Check runtime"),
+    "prepare_memory_new": ("prepare_memory_new", "Add memory"),
+    "prepare_memory_sync": ("prepare_memory_sync", "Review memory"),
+    "show_rejected_decision_recall": ("show_rejected_decision_recall", "Show rejected decisions"),
+    "prepare_gateway_intent_card": ("prepare_gateway_intent_card", "Open gateway card"),
+    "prepare_voice_operator_card": ("prepare_voice_operator_card", "Open voice card"),
+    "prepare_browser_operator_card": ("prepare_browser_operator_card", "Open browser card"),
+    "prepare_workspace_file_operator_card": ("prepare_workspace_file_operator_card", "Open file card"),
+    "prepare_command_operator_card": ("prepare_command_operator_card", "Open command card"),
+    "prepare_external_connector_readiness": (
+        "prepare_external_connector_readiness",
+        "Check connector readiness",
+    ),
+    "prepare_provider_profile_posture": ("prepare_provider_profile_posture", "Prepare provider profile"),
+    "audit_plugin_risk": ("audit_plugin_risk", "Audit plugin risk"),
+    "prepare_prompt_import_readiness": ("prepare_prompt_import_readiness", "Check prompt import"),
+    "audit_prompt_compatibility": ("audit_prompt_compatibility", "Audit prompt compatibility"),
+    "prepare_physical_device_readiness": (
+        "prepare_physical_device_readiness",
+        "Check device readiness",
+    ),
+    "prepare_connector_operator_card": ("prepare_connector_operator_card", "Open connector card"),
+    "prepare_live_info_operator_card": ("prepare_live_info_operator_card", "Open live info card"),
+    "prepare_content_operator_card": ("prepare_content_operator_card", "Open content card"),
+    "prepare_media_input_card": ("prepare_media_input_card", "Open media card"),
+    "prepare_data_analysis_card": ("prepare_data_analysis_card", "Open analysis card"),
+    "prepare_toolbelt_readiness": ("prepare_toolbelt_readiness", "Check toolbelt"),
+    "prepare_harness_session_inventory": ("prepare_harness_session_inventory", "Open inventory"),
+    "prepare_ops_observability_card": ("prepare_ops_observability_card", "Open observability"),
+    "prepare_ultraperf_loop": ("prepare_ultraperf_loop", "Prepare performance loop"),
+    "refresh_status": ("refresh_status", "Refresh status"),
+}
+
+_OPERATING_BRIEF_CHAT_CARDS: dict[str, dict[str, object]] = {
+    "context": {
+        "kind": "project_terms_context",
+        "headline": "I can align this repository's terminology before planning.",
+        "body": (
+            "I will inspect repository evidence, the optional project-terms source, and active reviewed terminology; "
+            "answer settled lookups directly; and ask only dependency-ready unresolved decisions after you confirm "
+            "interview entry. Staging, profile approval, planning, and coding handoff each require their own confirmation."
+        ),
+        "phase": "project_terms_context_prepared",
+        "next_action": "prepare_project_terms_context",
+        "artifact_schema": "project_terms_context_card/v1",
+        "actions": [
+            {"id": "prepare_project_terms_context", "label": "Align project terms", "style": "primary"},
+            {"id": "answer:clarify", "label": "Review frontier", "style": "secondary"},
+            {"id": "show_status", "label": "Show source status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "inspect_repository_and_reviewed_terms",
+            "answer_safe_lookup_directly",
+            "confirm_candidate_staging_or_frontier_entry",
+            "run_bounded_dependency_ready_frontier",
+            "confirm_shared_understanding_before_plan_or_handoff",
+        ],
+        "evidence_not_observed": [
+            "candidate staging",
+            "profile approval",
+            "model use",
+            "planning handoff",
+            "executor dispatch",
+        ],
+    },
+    "ops-review": {
+        "kind": "ops_review",
+        "headline": "I can turn this into an operating review.",
+        "body": (
+            "I will prepare a compact operating review: observed status, customer signals, release risks, blockers, "
+            "owners, and follow-up questions. Unknowns stay visible until source, owner, delivery, or runtime evidence "
+            "is recorded."
+        ),
+        "phase": "ops_review_prepared",
+        "next_action": "prepare_ops_review",
+        "artifact_schema": "ops_review_card/v1",
+        "actions": [
+            {"id": "prepare_ops_review", "label": "Prepare ops review", "style": "primary"},
+            {"id": "prepare_report_package", "label": "Prepare report", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "summarize_observed_status",
+            "name_customer_and_release_risks",
+            "separate_blockers_from_unknowns",
+            "assign_follow_up_owners",
+        ],
+        "evidence_not_observed": [
+            "source status review",
+            "customer signal review",
+            "owner confirmation",
+            "release decision",
+            "follow-up completion",
+            "implementation",
+            "CI",
+            "merge",
+        ],
+    },
+    "strategy-brief": {
+        "kind": "strategy_brief",
+        "headline": "I can shape this into strategy options.",
+        "body": (
+            "I will prepare the strategy brief: decision frame, options, tradeoffs, assumptions, evidence gaps, "
+            "decision owner, and open questions. Coding or delivery work stays disabled until a decision is accepted."
+        ),
+        "phase": "strategy_brief_prepared",
+        "next_action": "prepare_strategy_brief",
+        "artifact_schema": "strategy_brief_card/v1",
+        "actions": [
+            {"id": "prepare_strategy_brief", "label": "Prepare strategy", "style": "primary"},
+            {"id": "prepare_meeting_brief", "label": "Prepare meeting brief", "style": "secondary"},
+            {
+                "id": "prepare_coding_handoff",
+                "label": "Prepare coding handoff",
+                "style": "secondary",
+                "enabled": False,
+                "payload": {"requires": "accepted decision and scoped implementation work"},
+            },
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "frame_decision",
+            "list_options_and_tradeoffs",
+            "name_evidence_gaps",
+            "capture_decision_and_next_work",
+        ],
+        "evidence_not_observed": [
+            "source-backed market evidence",
+            "accepted decision",
+            "stakeholder approval",
+            "coding handoff",
+            "implementation",
+            "verification",
+        ],
+    },
+    "meeting-brief": {
+        "kind": "meeting_brief",
+        "headline": "I can prepare the meeting brief and follow-up slots.",
+        "body": (
+            "I will prepare the agenda, context prompts, decision slots, owner follow-ups, and meeting record template. "
+            "Prepared material is not evidence that the meeting happened or that owners accepted follow-ups."
+        ),
+        "phase": "meeting_brief_prepared",
+        "next_action": "prepare_meeting_brief",
+        "artifact_schema": "meeting_brief_card/v1",
+        "actions": [
+            {"id": "prepare_meeting_brief", "label": "Prepare brief", "style": "primary"},
+            {"id": "prepare_report_package", "label": "Prepare report", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "prepare_agenda",
+            "name_decision_slots",
+            "assign_follow_up_slots",
+            "separate_prepared_material_from_meeting_evidence",
+        ],
+        "evidence_not_observed": [
+            "meeting completion",
+            "attendee approval",
+            "decision acceptance",
+            "owner acceptance",
+            "follow-up completion",
+            "delivery",
+        ],
+    },
+    "report-package": {
+        "kind": "report_package",
+        "headline": "I can package this into a report people can review.",
+        "body": (
+            "I will prepare the report package: source inputs, narrative outline, missing numbers, reviewer checkpoints, "
+            "export checklist, and delivery status. Binary export, visual QA, approval, and attachment remain observed-only."
+        ),
+        "phase": "report_package_prepared",
+        "next_action": "prepare_report_package",
+        "artifact_schema": "report_package_card/v1",
+        "actions": [
+            {"id": "prepare_report_package", "label": "Prepare report", "style": "primary"},
+            {"id": "prepare_material_package", "label": "Prepare file package", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "collect_source_inputs",
+            "draft_report_outline",
+            "mark_missing_numbers",
+            "prepare_export_and_delivery_checks",
+        ],
+        "evidence_not_observed": [
+            "source review completion",
+            "stakeholder approval",
+            "binary export",
+            "render QA",
+            "attachment or delivery",
+            "publication",
+        ],
+    },
+}
+
+_OPERATING_BRIEF_CHAT_CARDS.update(
+    {
+        "product-brief": {
+            "kind": "product_brief",
+            "headline": "I can turn this product evidence into a decision-ready PRD and roadmap brief.",
+            "body": (
+                "I will prepare the problem, user, evidence, metric, goal, non-goal, requirements, prioritization options, "
+                "dependencies, risks, acceptance shape, and decision owner. A draft PRD is not stakeholder acceptance, "
+                "roadmap-system mutation, implementation, test evidence, delivery, or a market commitment."
+            ),
+            "phase": "product_brief_prepared",
+            "next_action": "prepare_product_brief",
+            "artifact_schema": "product_brief_card/v1",
+            "actions": [
+                {"id": "prepare_product_brief", "label": "Prepare product brief", "style": "primary"},
+                {"id": "prepare_strategy_brief", "label": "Prepare strategy", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": [
+                "frame_problem_user_and_evidence",
+                "write_requirements_risks_dependencies_and_acceptance_shape",
+                "compare_prioritization_options_and_tradeoffs",
+                "name_decision_owner_and_gated_downstream_route",
+            ],
+            "evidence_not_observed": [
+                "stakeholder acceptance",
+                "Jira, Linear, or roadmap-system mutation",
+                "implementation",
+                "test evidence",
+                "delivery",
+                "market commitment",
+            ],
+        },
+    }
+)
+
+_OPERATING_BRIEF_WORKFLOW_BY_NEXT_ACTION = {
+    str(config["next_action"]): workflow for workflow, config in _OPERATING_BRIEF_CHAT_CARDS.items()
+}
+
+_META_ROUTER_CHAT_CARDS: dict[str, dict[str, object]] = {
+    "meta-router": {
+        "kind": "meta_route",
+        "headline": "I can read the task and pick the right workflow(s) from the live catalog.",
+        "body": (
+            "I will reason over the /omh task, consult the live OMH catalog with `omh recommend --json` "
+            "(re-querying with rephrased stage descriptions when the shortlist is unclear), and select or chain the "
+            "workflow(s) that fit — excluding meta-router itself. The routing decision names the workflow(s) to run "
+            "and reports its evidence boundary; it is not execution, review, CI, or merge evidence."
+        ),
+        "phase": "meta_route_prepared",
+        "next_action": "present_meta_route",
+        "artifact_schema": "meta_route_card/v1",
+        "actions": [
+            {"id": "present_meta_route", "label": "Route to workflow", "style": "primary"},
+            {"id": "choose_skill", "label": "Show workflow options", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "read_the_omh_task",
+            "consult_live_catalog_with_omh_recommend_json",
+            "escalate_to_docs_workflows_json_if_unclear",
+            "select_or_chain_workflows_excluding_meta_router",
+            "present_decision_with_evidence_boundary",
+        ],
+        "evidence_not_observed": [
+            "execution",
+            "review",
+            "CI",
+            "merge",
+        ],
+    },
+}
+
+_REVIEW_QUALITY_CHAT_CARDS: dict[str, dict[str, object]] = {
+    "ultraqa": {
+        "kind": "qa_review",
+        "headline": "I can turn this into QA scenarios and observed checks.",
+        "body": (
+            "I will prepare the QA lane: scenario list, expected behavior, cheap checks, expensive checks, known gaps, "
+            "and follow-up handoff options. No product diagnosis, verification, fix, CI, or release-readiness claim is made "
+            "until matching observations exist."
+        ),
+        "phase": "qa_review_prepared",
+        "next_action": "dispatch_to_workflow",
+        "artifact_schema": "qa_review_card/v1",
+        "actions": [
+            {
+                "id": "dispatch_to_workflow",
+                "label": "Prepare QA workflow",
+                "style": "primary",
+                "payload": {"claim_boundary": "route_only_not_scenario_execution"},
+            },
+            {"id": "prepare_review_or_followup_handoff", "label": "Prepare follow-up review", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "define_scenarios",
+            "name_expected_behavior",
+            "separate_observed_checks_from_gaps",
+            "prepare_follow_up_handoff_if_needed",
+        ],
+        "evidence_not_observed": [
+            "scenario execution",
+            "product diagnosis",
+            "observed checks",
+            "fix implementation",
+            "verification",
+            "CI",
+            "release readiness",
+        ],
+    },
+    "code-review": {
+        "kind": "review_check",
+        "headline": "I can review the claims before we call this done.",
+        "body": (
+            "I will prepare a review lane: claims to inspect, evidence to verify, missing tests, risk areas, and any "
+            "follow-up fix handoff. Review preparation is not a completed review, fix, CI result, or merge decision."
+        ),
+        "phase": "review_check_prepared",
+        "next_action": "prepare_review_or_followup_handoff",
+        "artifact_schema": "review_check_card/v1",
+        "claim_boundary_suffix": "It is not verification, CI, merge-readiness, or merge evidence.",
+        "actions": [
+            {"id": "prepare_review_or_followup_handoff", "label": "Prepare review", "style": "primary"},
+            {
+                "id": "prepare_coding_handoff",
+                "label": "Prepare fix handoff",
+                "style": "secondary",
+                "enabled": False,
+                "payload": {"requires": "observed findings that require code changes"},
+            },
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "list_review_claims",
+            "check_evidence",
+            "separate_findings_from_fix_handoffs",
+            "record_verification_gaps",
+        ],
+        "evidence_not_observed": [
+            "completed review",
+            "accepted findings",
+            "fix implementation",
+            "test execution",
+            "CI",
+            "merge readiness",
+            "merge",
+        ],
+    },
+    "reliability-review": {
+        "kind": "reliability_review",
+        "headline": "I can review reliability without declaring the system healthy.",
+        "body": (
+            "I will prepare the reliability review: service boundary, incident or SLO context, error-budget questions, "
+            "risk hypotheses, remediation options, and verification gates. Healthy status, closure, or remediation success "
+            "stays unobserved until evidence is recorded."
+        ),
+        "phase": "reliability_review_prepared",
+        "next_action": "prepare_reliability_review",
+        "artifact_schema": "reliability_review_card/v1",
+        "actions": [
+            {"id": "prepare_reliability_review", "label": "Review reliability", "style": "primary"},
+            {"id": "prepare_review_or_followup_handoff", "label": "Prepare follow-up review", "style": "secondary"},
+            {
+                "id": "prepare_coding_handoff",
+                "label": "Prepare remediation handoff",
+                "style": "secondary",
+                "enabled": False,
+                "payload": {"requires": "accepted remediation scope and observed reliability evidence"},
+            },
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "define_service_boundary",
+            "capture_slo_or_incident_context",
+            "separate_risks_from_observed_health",
+            "prepare_remediation_handoff_if_needed",
+        ],
+        "evidence_not_observed": [
+            "SLO pass",
+            "healthy error budget",
+            "incident closure",
+            "remediation completion",
+            "verification",
+            "review",
+            "CI",
+            "merge",
+        ],
+    },
+    "live-incident-response": {
+        "kind": "live_incident_record",
+        "headline": "I can command this incident while it is still open.",
+        "body": (
+            "I will prepare the live incident record: severity declared with the observation that set it and the time it changed, a "
+            "named commander plus operations, communications, and scribe, an append-only timeline of observations, actions, "
+            "and decisions, every mitigation marked temporary or permanent with what removes it, and recovery verified "
+            "against a named signal at its healthy value. A correction appends an entry; it never rewrites one."
+        ),
+        "phase": "live_incident_record_prepared",
+        "next_action": "prepare_live_incident_record",
+        "artifact_schema": "live_incident_record/v1",
+        "claim_boundary_suffix": "Paging, status-page updates, and customer sends stay prepared until `connector-operator` returns a result.",
+        "actions": [
+            {"id": "prepare_live_incident_record", "label": "Command the incident", "style": "primary"},
+            {"id": "show_incident_timeline", "label": "Show incident timeline", "style": "secondary"},
+            {"id": "show_recovery_verification", "label": "Show recovery check", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "declare_severity_from_observed_blast_radius",
+            "name_the_commander_then_the_remaining_roles",
+            "open_the_append_only_timeline",
+            "record_each_mitigation_as_temporary_or_permanent",
+            "verify_recovery_against_the_named_signal",
+            "draft_the_customer_notice_and_keep_the_send_prepared",
+        ],
+        "evidence_not_observed": [
+            "page delivery",
+            "status page update",
+            "customer notification",
+            "rollback execution",
+            "recovery",
+            "incident closure",
+        ],
+    },
+    "production-audit": {
+        "kind": "production_audit",
+        "headline": "I can prepare a production-readiness audit.",
+        "body": (
+            "I will prepare the production-readiness audit: release scope, build, test, CI, security, observability, "
+            "rollback, support handoff, and a GO/HOLD/BLOCK verdict. Deploy and live-health claims still need observed evidence."
+        ),
+        "phase": "production_audit_prepared",
+        "next_action": "prepare_production_audit",
+        "artifact_schema": "production_readiness_audit/v1",
+        "claim_boundary_suffix": "It is not deployment, live health, rollback readiness, support readiness, or release approval evidence.",
+        "actions": [
+            {"id": "prepare_production_audit", "label": "Audit production", "style": "primary"},
+            {"id": "prepare_reliability_review", "label": "Review reliability", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "scope_release_surface",
+            "check_build_test_ci_security_evidence",
+            "review_observability_and_rollback",
+            "record_go_hold_block_verdict",
+        ],
+        "evidence_not_observed": [
+            "deployment",
+            "live health check",
+            "rollback readiness",
+            "support readiness",
+            "release approval",
+            "CI rerun",
+        ],
+    },
+    "verification-gate": {
+        "kind": "verification_gate",
+        "headline": "I can prepare the verification gate before completion claims.",
+        "body": (
+            "I will prepare required checks, observed result freshness, generated-output checks, CI/DCO boundaries, "
+            "and a PASS/HOLD/BLOCK claim verdict before completion, release, or merge claims."
+        ),
+        "phase": "verification_gate_prepared",
+        "next_action": "prepare_verification_gate",
+        "artifact_schema": "verification_gate/v1",
+        "claim_boundary_suffix": "It is not test execution, CI pass, review completion, merge-readiness, or merge evidence.",
+        "actions": [
+            {"id": "prepare_verification_gate", "label": "Prepare gate", "style": "primary"},
+            {"id": "prepare_review_or_followup_handoff", "label": "Prepare review", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "name_claims_to_verify",
+            "list_required_checks",
+            "record_observed_freshness",
+            "issue_pass_hold_block_verdict",
+        ],
+        "evidence_not_observed": [
+            "test execution",
+            "CI pass",
+            "review completion",
+            "merge readiness",
+            "merge",
+        ],
+    },
+    "build-failure-triage": {
+        "kind": "build_failure_triage",
+        "headline": "I can triage the build failure before proposing a fix.",
+        "body": (
+            "I will prepare a failure-log digest, cluster likely failure modes, rank root-cause hypotheses, "
+            "and outline a minimal fix handoff only when the evidence supports it. The build is not fixed until observed."
+        ),
+        "phase": "build_failure_triage_prepared",
+        "next_action": "prepare_build_failure_triage",
+        "artifact_schema": "build_failure_triage_plan/v1",
+        "claim_boundary_suffix": "It is not log retrieval, root-cause proof, fix implementation, rerun success, CI pass, or merge evidence.",
+        "actions": [
+            {"id": "prepare_build_failure_triage", "label": "Triage build failure", "style": "primary"},
+            {
+                "id": "prepare_coding_handoff",
+                "label": "Prepare fix handoff",
+                "style": "secondary",
+                "enabled": False,
+                "payload": {"requires": "ranked root-cause evidence and accepted remediation scope"},
+            },
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "digest_failure_logs",
+            "cluster_failure_modes",
+            "rank_root_cause_hypotheses",
+            "prepare_minimal_fix_handoff_when_supported",
+        ],
+        "evidence_not_observed": [
+            "log retrieval",
+            "root-cause proof",
+            "fix implementation",
+            "rerun success",
+            "CI pass",
+            "merge",
+        ],
+    },
+    "context-budget-review": {
+        "kind": "context_budget_review",
+        "headline": "I can prepare a context budget review.",
+        "body": (
+            "I will prepare the must-keep context, checkpoint cadence, budget risks, overflow recovery path, "
+            "and provider-truth gaps. Exact billing or token usage still needs observed runtime or provider evidence."
+        ),
+        "phase": "context_budget_review_prepared",
+        "next_action": "prepare_context_budget_review",
+        "artifact_schema": "context_budget_review/v1",
+        "claim_boundary_suffix": "It is not provider billing truth, exact token usage, compaction success, or future context-safety evidence.",
+        "actions": [
+            {"id": "prepare_context_budget_review", "label": "Review context", "style": "primary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "identify_must_keep_context",
+            "set_checkpoint_cadence",
+            "name_overflow_recovery_path",
+            "separate_estimates_from_provider_truth",
+        ],
+        "evidence_not_observed": [
+            "provider billing truth",
+            "exact token usage",
+            "compaction success",
+            "future context safety",
+        ],
+    },
+    "security-safety-review": {
+        "kind": "security_safety_review",
+        "headline": "I can prepare a redacted security and safety review.",
+        "body": (
+            "I will prepare threat surfaces, prompt-injection risks, tool permissions, secret/dependency/destructive-action gates, "
+            "and safe remediation handoff options without exposing secrets."
+        ),
+        "phase": "security_safety_review_prepared",
+        "next_action": "prepare_security_safety_review",
+        "artifact_schema": "security_safety_review/v1",
+        "claim_boundary_suffix": "It is not secret access, dependency audit completion, vulnerability proof, remediation, CI, or security sign-off evidence.",
+        "actions": [
+            {"id": "prepare_security_safety_review", "label": "Review safety", "style": "primary"},
+            {"id": "prepare_review_or_followup_handoff", "label": "Prepare review", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "redact_sensitive_context",
+            "map_prompt_injection_and_tool_risks",
+            "check_secret_dependency_destructive_gates",
+            "prepare_safe_remediation_handoff_options",
+        ],
+        "evidence_not_observed": [
+            "secret access",
+            "dependency audit completion",
+            "vulnerability proof",
+            "remediation",
+            "CI",
+            "security sign-off",
+        ],
+    },
+    "application-threat-model": {
+        "kind": "application_threat_model",
+        "headline": "I can model this application's threats — its assets, not the agent's tool surface.",
+        "body": (
+            "I will prepare the application threat model: an asset register with a data class and one named loss each, trust "
+            "boundaries stating what crosses and what authenticates the crossing, attack scenarios derived per boundary, one "
+            "decision per scenario (mitigate, transfer, accept, eliminate) with an owner, and a security test per mitigating "
+            "control naming the observable that fails without it. A control I cannot observe stays unverified."
+        ),
+        "phase": "application_threat_model_prepared",
+        "next_action": "prepare_application_threat_model",
+        "artifact_schema": "application_threat_model/v1",
+        "claim_boundary_suffix": "It is not a scan, a penetration test, a compliance attestation, or proof that any control is deployed.",
+        "actions": [
+            {"id": "prepare_application_threat_model", "label": "Model the threats", "style": "primary"},
+            {"id": "show_attack_scenarios", "label": "Show attack scenarios", "style": "secondary"},
+            {"id": "show_control_tests", "label": "Show control tests", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "map_components_data_flows_and_assets",
+            "mark_trust_boundaries_and_what_authenticates_each",
+            "derive_attack_scenarios_per_boundary",
+            "decide_one_control_per_scenario_with_an_owner",
+            "name_the_security_test_that_fails_without_each_control",
+        ],
+        "evidence_not_observed": [
+            "control deployment",
+            "scanner execution",
+            "penetration test",
+            "security test result",
+            "compliance attestation",
+        ],
+    },
+}
+
+_REVIEW_QUALITY_CHAT_CARDS.update(
+    {
+        "legal-compliance-review": {
+            "kind": "legal_compliance_review",
+            "headline": "I can prepare a scoped legal and compliance issue review before a decision or action.",
+            "body": (
+                "I will prepare jurisdiction, document/version, authority, and evidence boundaries; a clause, control, or requirement "
+                "matrix; ranked risks; and counsel-escalation questions. This is not legal advice, counsel sign-off, compliance certification, "
+                "contract execution, filing, or regulator communication."
+            ),
+            "phase": "legal_compliance_review_prepared",
+            "next_action": "prepare_legal_compliance_review",
+            "artifact_schema": "legal_compliance_review_card/v1",
+            "actions": [
+                {"id": "prepare_legal_compliance_review", "label": "Prepare legal review", "style": "primary"},
+                {"id": "prepare_review_or_followup_handoff", "label": "Prepare follow-up review", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": [
+                "state_jurisdiction_authority_document_and_evidence_boundary",
+                "build_clause_control_or_requirement_matrix",
+                "rank_risks_and_counsel_questions",
+                "separate_prepared_review_from_legal_decision_or_action",
+            ],
+            "evidence_not_observed": [
+                "legal advice",
+                "counsel sign-off",
+                "compliance certification",
+                "contract execution",
+                "filing",
+                "regulator communication",
+            ],
+        },
+        "localization-review": {
+            "kind": "localization_review",
+            "headline": "I can prepare locale-ready terminology, cultural-fit, and quality-review guidance.",
+            "body": (
+                "I will prepare locale and source-version context, terminology choices, a string issue matrix, review ownership, and locale QA "
+                "criteria. This is not a locale-file change, translation upload, publication, rendered-build validation, or market approval."
+            ),
+            "phase": "localization_review_prepared",
+            "next_action": "prepare_localization_review",
+            "artifact_schema": "localization_review_card/v1",
+            "actions": [
+                {"id": "prepare_localization_review", "label": "Prepare localization review", "style": "primary"},
+                {"id": "prepare_visual_qa", "label": "Prepare visual QA", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": [
+                "scope_locale_audience_context_and_source_version",
+                "prepare_glossary_and_localization_choices",
+                "rank_string_issues_and_review_owner",
+                "name_locale_qa_and_rendered_evidence_gaps",
+            ],
+            "evidence_not_observed": [
+                "locale-file change",
+                "translation upload",
+                "publication",
+                "rendered-build validation",
+                "market approval",
+            ],
+        },
+    }
+)
+
+_DELIVERY_RUNTIME_CHAT_CARDS: dict[str, dict[str, object]] = {
+    "idea-to-deploy": {
+        "kind": "app_delivery_loop",
+        "headline": "I can shape this into a product delivery loop.",
+        "body": (
+            "I will prepare the idea-to-deploy loop: product intent, plan lane, implementation boundary, release gate, "
+            "monitoring checks, rollback questions, and owner handoffs. This is not implementation, deploy, monitoring, "
+            "or customer-impact evidence."
+        ),
+        "phase": "app_delivery_loop_prepared",
+        "next_action": "present_app_delivery_loop",
+        "artifact_schema": "app_delivery_loop_card/v1",
+        "actions": [
+            {"id": "present_app_delivery_loop", "label": "Show delivery loop", "style": "primary"},
+            {
+                "id": "prepare_coding_handoff",
+                "label": "Prepare implementation handoff",
+                "style": "secondary",
+                "enabled": False,
+                "payload": {"requires": "accepted product scope and implementation owner"},
+            },
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "shape_product_intent",
+            "prepare_plan_lane",
+            "separate_implementation_from_release",
+            "define_monitoring_and_rollback_checks",
+        ],
+        "evidence_not_observed": [
+            "accepted product scope",
+            "implementation",
+            "deployment",
+            "monitoring",
+            "rollback readiness",
+            "customer impact",
+            "CI",
+        ],
+    },
+    "llm-app-dev": {
+        "kind": "llm_app_build",
+        "headline": "I can prepare the build handoff for this LLM feature.",
+        "body": (
+            "I will prepare the rails: one provider boundary with an exact model ID, the output schema and its "
+            "validate-and-repair path, prompts as versioned files with system, task, and untrusted context kept apart, "
+            "retrieval grounding when retrieval is in the path, and the eval suite -- golden set, task-level validators, "
+            "and the paired baseline-vs-candidate comparison -- as a shipped deliverable. Model responses, eval results, "
+            "token counts, and cost stay unobserved until a run reports them."
+        ),
+        "phase": "llm_app_build_prepared",
+        "next_action": "prepare_llm_app_build",
+        "artifact_schema": "llm_app_build_card/v1",
+        "actions": [
+            {"id": "prepare_llm_app_build", "label": "Prepare LLM build", "style": "primary"},
+            {
+                "id": "prepare_coding_handoff",
+                "label": "Prepare implementation handoff",
+                "style": "secondary",
+                "enabled": False,
+                "payload": {"requires": "decided rails and an implementation owner"},
+            },
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "pin_provider_and_model_boundary",
+            "declare_output_schema_and_repair_path",
+            "lay_out_versioned_prompt_artifacts",
+            "ground_retrieval_and_evaluate_it_first",
+            "ship_the_eval_suite_as_a_deliverable",
+        ],
+        "evidence_not_observed": [
+            "provider call",
+            "eval run",
+            "token and cost telemetry",
+            "implementation",
+            "review",
+            "CI",
+            "merge",
+        ],
+    },
+    "cto-loop": {
+        "kind": "cto_loop",
+        "headline": "I can run this as a leadership decision loop.",
+        "body": (
+            "I will prepare the CTO loop: roadmap question, architecture tradeoffs, delivery risk, security or reliability "
+            "questions, release readiness gates, and decision owners. It is not stakeholder approval, architecture sign-off, "
+            "implementation, or release evidence."
+        ),
+        "phase": "cto_loop_prepared",
+        "next_action": "run_cto_loop",
+        "artifact_schema": "cto_loop_card/v1",
+        "actions": [
+            {"id": "run_cto_loop", "label": "Open CTO loop", "style": "primary"},
+            {"id": "prepare_strategy_brief", "label": "Prepare strategy", "style": "secondary"},
+            {
+                "id": "prepare_coding_handoff",
+                "label": "Prepare implementation handoff",
+                "style": "secondary",
+                "enabled": False,
+                "payload": {"requires": "accepted decision and scoped implementation work"},
+            },
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "frame_leadership_question",
+            "compare_architecture_tradeoffs",
+            "name_delivery_and_release_risks",
+            "capture_decision_before_execution",
+        ],
+        "evidence_not_observed": [
+            "stakeholder approval",
+            "architecture sign-off",
+            "implementation",
+            "release readiness",
+            "security review",
+            "CI",
+            "merge",
+        ],
+    },
+    "deploy-and-monitor": {
+        "kind": "deploy_monitor_plan",
+        "headline": "I can prepare the deploy and monitor plan.",
+        "body": (
+            "I will prepare release operations: deploy intent, preflight gates, rollback plan, health checks, monitoring "
+            "signals, incident fallback, and post-deploy review. This does not mean deploy, rollback, health, monitoring, "
+            "or incident response has been observed."
+        ),
+        "phase": "deploy_monitor_plan_prepared",
+        "next_action": "prepare_deploy_monitor_plan",
+        "artifact_schema": "deploy_monitor_plan_card/v1",
+        "actions": [
+            {"id": "prepare_deploy_monitor_plan", "label": "Prepare deploy plan", "style": "primary"},
+            {"id": "run_local_operator_check", "label": "Show local checks", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "capture_release_intent",
+            "list_preflight_gates",
+            "define_health_signals",
+            "separate_observed_deploy_from_plan",
+        ],
+        "evidence_not_observed": [
+            "preflight pass",
+            "deploy execution",
+            "rollback readiness",
+            "health check pass",
+            "monitoring signal",
+            "incident response",
+            "post-deploy approval",
+        ],
+    },
+    "executor-runtime-readiness": {
+        "kind": "executor_runtime_readiness",
+        "headline": "I can check which coding path is ready.",
+        "body": (
+            "I will prepare a runtime readiness card: Codex, Claude Code, Hermes, and generic runtime options; required "
+            "tools; missing setup; fallback path; and what a wrapper can ask next. This is not executor dispatch, session "
+            "attachment, implementation, verification, or CI evidence."
+        ),
+        "phase": "executor_runtime_readiness_prepared",
+        "next_action": "prepare_executor_runtime_readiness",
+        "artifact_schema": "executor_runtime_readiness_card/v1",
+        "actions": [
+            {"id": "prepare_executor_runtime_readiness", "label": "Check coding path", "style": "primary"},
+            {"id": "choose_executor", "label": "Choose coding agent", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "list_available_coding_paths",
+            "check_missing_tools_without_dispatch",
+            "choose_or_confirm_executor",
+            "prepare_handoff_after_choice",
+        ],
+        "evidence_not_observed": [
+            "executor dispatch",
+            "session attachment",
+            "implementation",
+            "verification",
+            "review",
+            "CI",
+            "merge",
+        ],
+    },
+}
+
+_WORKFLOW_OPERATIONS_CHAT_CARDS: dict[str, dict[str, object]] = {
+    "automation-blueprint": {
+        "kind": "automation_blueprint",
+        "headline": "I can turn this into a scheduled ops blueprint.",
+        "body": (
+            "I will prepare the recurring workflow: schedule, source inputs, delivery target, silence policy, "
+            "confirmation card, and status update rules. I can save it as a paused recurring intent, which only "
+            "an approved runtime surface can activate later, with an approval reference and a recorded observer. "
+            "Before it can be activated you also choose what happens when a prior run is still active, when a "
+            "window is missed, whether a failure is retried or backfilled, and after how many consecutive "
+            "failures it pauses itself. "
+            "Host cron creation, source retrieval, gateway delivery, and no-agent execution stay observed-only."
+        ),
+        "phase": "automation_blueprint_prepared",
+        "next_action": "prepare_scheduled_ops_blueprint",
+        "artifact_schema": "automation_blueprint_card/v1",
+        "claim_boundary_suffix": "It is not host cron creation, automation enablement, source retrieval, delivery, or no-agent execution evidence.",
+        "actions": [
+            {"id": "prepare_scheduled_ops_blueprint", "label": "Prepare automation", "style": "primary"},
+            {"id": "prepare_toolbelt_readiness", "label": "Check toolbelt", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "capture_schedule",
+            "define_source_inputs",
+            "set_delivery_and_silence_policy",
+            "save_paused_recurring_intent",
+            "prepare_confirmation_card",
+        ],
+        "evidence_not_observed": [
+            "host cron creation",
+            "Hermes automation enablement",
+            "source retrieval",
+            "gateway delivery",
+            "no-agent execution",
+            "recipient receipt",
+        ],
+    },
+    "agent-board": {
+        "kind": "agent_board",
+        "headline": "I can prepare a board for multiple Hermes agents.",
+        "body": (
+            "I will prepare the agent board: targets, roles, tasks, handoff lanes, heartbeat expectations, blocker "
+            "states, and completion rules. For parallel coding splits, `omh coding fanout` freezes the unit split "
+            "into a merge contract and `omh coding fanout show` is the live evidence view. Other agents accepting, "
+            "working, heartbeat-ing, or completing work remains unobserved until target-specific evidence exists."
+        ),
+        "phase": "agent_board_prepared",
+        "next_action": "prepare_agent_board_card",
+        "artifact_schema": "agent_board_card/v1",
+        "claim_boundary_suffix": "It is not target acceptance, agent heartbeat, task execution, blocker resolution, handoff receipt, or completion evidence.",
+        "actions": [
+            {"id": "prepare_agent_board_card", "label": "Open agent board", "style": "primary"},
+            {"id": "refresh_status", "label": "Refresh status", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "detect_targets",
+            "assign_role_lanes",
+            "record_task_and_handoff_states",
+            "require_target_specific_heartbeat_evidence",
+        ],
+        "evidence_not_observed": [
+            "target acceptance",
+            "agent heartbeat",
+            "task execution",
+            "blocker resolution",
+            "handoff receipt",
+            "completion",
+        ],
+    },
+    "design-quality-gate": {
+        "kind": "design_quality_gate",
+        "headline": "I can prepare the design quality gate before calling it polished.",
+        "body": (
+            "I will prepare the design quality gate: reference packet, layout and content checks, CJK/text-fit review, "
+            "surface quality matrix, comparative rubric, and visual QA evidence slots. Better-looking output still needs rendered evidence."
+        ),
+        "phase": "design_quality_gate_prepared",
+        "next_action": "prepare_design_quality_gate",
+        "artifact_schema": "design_quality_gate/v1",
+        "claim_boundary_suffix": "It is not rendered visual QA, comparative PASS, generated asset quality, publication, approval, or delivery evidence.",
+        "actions": [
+            {"id": "prepare_design_quality_gate", "label": "Prepare design gate", "style": "primary"},
+            {"id": "prepare_visual_qa", "label": "Prepare visual QA", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "select_reference_packet",
+            "prepare_surface_quality_matrix",
+            "check_text_fit_cjk_and_layout",
+            "record_visual_qa_when_observed",
+        ],
+        "evidence_not_observed": [
+            "rendered visual QA",
+            "comparative PASS",
+            "generated asset quality",
+            "publication",
+            "approval",
+            "delivery",
+        ],
+    },
+    "frontend": {
+        "kind": "frontend_handoff",
+        "headline": "I can prepare the frontend handoff with visual QA gates.",
+        "body": (
+            "I will prepare the frontend brief: routes, states, responsive breakpoints, component inventory, design-system contract, "
+            "implementation owner, and visual QA follow-up. Implementation and screenshots remain observed-only."
+        ),
+        "phase": "frontend_handoff_prepared",
+        "next_action": "prepare_frontend_handoff",
+        "artifact_schema": "frontend_design_brief/v1",
+        "claim_boundary_suffix": "It is not frontend implementation, browser rendering, screenshot evidence, accessibility pass, or deployment evidence.",
+        "actions": [
+            {"id": "prepare_frontend_handoff", "label": "Prepare frontend", "style": "primary"},
+            {"id": "prepare_visual_qa", "label": "Prepare visual QA", "style": "secondary"},
+            {"id": "prepare_accessibility_audit", "label": "Audit accessibility", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "define_routes_and_states",
+            "prepare_component_inventory",
+            "name_responsive_breakpoints",
+            "attach_visual_qa_requirement",
+        ],
+        "evidence_not_observed": [
+            "frontend implementation",
+            "browser rendering",
+            "screenshot capture",
+            "accessibility pass",
+            "deployment",
+        ],
+    },
+    "backend": {
+        "kind": "backend_contract",
+        "headline": "I can prepare the backend service contract before any endpoint is written.",
+        "body": (
+            "I will prepare the service contract: callers and their trust level, the auth boundary, the error-path table, "
+            "one response envelope for the surface, and the expand/backfill/switch/contract migration order when storage moves. "
+            "Implementation, applied migrations, and integration runs remain observed-only."
+        ),
+        "phase": "backend_contract_prepared",
+        "next_action": "prepare_backend_handoff",
+        "artifact_schema": "backend_service_contract/v1",
+        "claim_boundary_suffix": "It is not implementation, a running service, an applied migration, integration evidence, load evidence, or deployment evidence.",
+        "actions": [
+            {"id": "prepare_backend_handoff", "label": "Prepare backend contract", "style": "primary"},
+            {"id": "prepare_security_safety_review", "label": "Review safety", "style": "secondary"},
+            {"id": "prepare_verification_gate", "label": "Prepare gate", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "name_callers_and_trust_level",
+            "map_the_auth_boundary",
+            "fill_the_error_path_table",
+            "order_the_migration_steps",
+        ],
+        "evidence_not_observed": [
+            "implementation",
+            "running service",
+            "applied migration",
+            "integration run",
+            "load evidence",
+            "deployment",
+        ],
+    },
+    "rust": {
+        "kind": "rust_contract",
+        "headline": "I can prepare the Rust change contract, starting with the UB escalation check.",
+        "body": (
+            "I will run the escalation check first — unsafe, raw pointers, FFI, MaybeUninit, or lock-free primitives escalate — "
+            "then prepare the ownership shape, the error and API contract, and the exact gate commands. "
+            "Compilation, clippy, tests, Miri, and sanitizers remain observed-only."
+        ),
+        "phase": "rust_contract_prepared",
+        "next_action": "prepare_rust_handoff",
+        "artifact_schema": "rust_change_contract/v1",
+        "claim_boundary_suffix": "It is not compilation, clippy cleanliness, a passing test, a Miri run, a sanitizer run, or a loom-style concurrency run.",
+        "actions": [
+            {"id": "prepare_rust_handoff", "label": "Prepare Rust contract", "style": "primary"},
+            {"id": "prepare_native_debug_plan", "label": "Prepare debug plan", "style": "secondary"},
+            {"id": "prepare_verification_gate", "label": "Prepare gate", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "run_the_ub_escalation_check",
+            "name_the_ownership_shape",
+            "name_the_error_and_api_contract",
+            "list_the_gate_commands",
+        ],
+        "evidence_not_observed": [
+            "compilation",
+            "clippy run",
+            "test run",
+            "miri run",
+            "sanitizer run",
+            "concurrency model check",
+        ],
+    },
+    "relational-db": {
+        "kind": "db_change_plan",
+        "headline": "I can plan this database work with the checks that prove it safe to run.",
+        "body": (
+            "I will state the engine, the version, and the table sizes, cite the observed query plan before proposing an index, "
+            "and give every migration step the lock it takes, its `lock_timeout`, and its rollback. A migration plan reads ready "
+            "only when no step lacks lock behaviour or a rollback. OMH never connects to the database."
+        ),
+        "phase": "db_change_plan_prepared",
+        "next_action": "prepare_db_change_plan",
+        "artifact_schema": "online_migration_plan/v1",
+        "claim_boundary_suffix": "It is not a query plan, a built index, an applied migration, or a measured lock wait until the output is observed.",
+        "actions": [
+            {"id": "prepare_db_change_plan", "label": "Plan the database change", "style": "primary"},
+            {"id": "show_migration_readiness", "label": "Show migration readiness", "style": "secondary"},
+            {"id": "prepare_backend_handoff", "label": "Prepare backend contract", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "state_engine_version_and_table_sizes",
+            "cite_the_observed_query_plan",
+            "size_the_index_and_its_write_cost",
+            "give_every_migration_step_its_lock_and_rollback",
+            "issue_the_readiness_verdict",
+        ],
+        "evidence_not_observed": [
+            "query plan",
+            "index build",
+            "migration applied",
+            "lock wait",
+            "row count",
+        ],
+    },
+    "release-cut": {
+        "kind": "release_plan",
+        "headline": "I can plan this release with its rollback decided before it is needed.",
+        "body": (
+            "I will list what goes in and what is held, derive the version, and order the cut: freeze, bump every version "
+            "surface, tag, run the release workflow, pass its approval, publish, and curate the notes. Each rollout stage gets "
+            "a promotion criterion, and the plan reads ready only with a named rollback trigger and the exact command that "
+            "performs it. OMH prepares; the host or CI executes."
+        ),
+        "phase": "release_plan_prepared",
+        "next_action": "prepare_release_plan",
+        "artifact_schema": "release_plan/v1",
+        "claim_boundary_suffix": "It is not a pushed tag, a published release, a promoted canary, or a performed rollback until the output is observed.",
+        "actions": [
+            {"id": "prepare_release_plan", "label": "Plan the release", "style": "primary"},
+            {"id": "show_release_readiness", "label": "Show release readiness", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "list_contents_and_derive_the_version",
+            "order_the_cut_with_the_branch_frozen",
+            "stage_the_rollout_with_promotion_criteria",
+            "name_the_rollback_trigger_and_command",
+            "issue_the_readiness_verdict",
+        ],
+        "evidence_not_observed": [
+            "tag pushed",
+            "release published",
+            "approval passed",
+            "canary promoted",
+            "rollback performed",
+        ],
+    },
+    "agent-instructions": {
+        "kind": "instruction_file_update",
+        "headline": "I can write or update the agent instruction file inside its marked region.",
+        "body": (
+            "I will list the instruction files and who reads them, mark every build and test command verified with its observed "
+            "run or unverified, map each generated file to its source, regenerate command, and gate, and record the pitfalls "
+            "with what they cost. Only the text between the omh:agent-instructions markers changes, and I refuse counts and "
+            "line numbers because they drift."
+        ),
+        "phase": "instruction_file_update_prepared",
+        "next_action": "prepare_instruction_file_update",
+        "artifact_schema": "instruction_region_update/v1",
+        "claim_boundary_suffix": "It is not a run command, a written file, or a replaced region until the output is observed.",
+        "actions": [
+            {"id": "prepare_instruction_file_update", "label": "Update the instruction file", "style": "primary"},
+            {"id": "show_command_verification", "label": "Show command verification", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "inventory_the_instruction_files",
+            "verify_each_command_or_mark_it_unverified",
+            "map_generated_files_to_source_and_gate",
+            "record_pitfalls_with_their_cost",
+            "replace_only_the_marked_region",
+        ],
+        "evidence_not_observed": [
+            "command run",
+            "file written",
+            "region replaced",
+        ],
+    },
+    "data-pipelines": {
+        "kind": "pipeline_plan",
+        "headline": "I can plan this pipeline work so a rerun changes nothing twice.",
+        "body": (
+            "I will find what makes a row unique at the sink, write the idempotency contract, map the lineage and the schema "
+            "change's downstream impact, bound any replay or backfill by window and target, and name the data-quality gate each "
+            "load must pass. I run no job and query no warehouse."
+        ),
+        "phase": "pipeline_plan_prepared",
+        "next_action": "prepare_pipeline_plan",
+        "artifact_schema": "replay_backfill_plan/v1",
+        "claim_boundary_suffix": "It is not a job run, a backfill, or a passed quality check until the output is observed.",
+        "actions": [
+            {"id": "prepare_pipeline_plan", "label": "Plan the pipeline work", "style": "primary"},
+            {"id": "show_replay_plan", "label": "Show the replay plan", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "find_the_sink_key",
+            "write_the_idempotency_contract",
+            "map_lineage_and_schema_impact",
+            "bound_the_replay_or_backfill",
+            "gate_each_load_on_quality_checks",
+        ],
+        "evidence_not_observed": [
+            "job run",
+            "backfill performed",
+            "quality check passed",
+        ],
+    },
+    "model-finetuning": {
+        "kind": "finetune_plan",
+        "headline": "I can decide whether this needs fine-tuning, and plan it if it does.",
+        "body": (
+            "I will measure the untuned model and the cheaper fixes against a held-out eval first, and stop at "
+            "`do_not_finetune` if one closes the gap; otherwise I choose SFT, DPO, or RLVR from the data you have, plan the "
+            "data with a held-out split, and gate promotion on beating the untuned baseline. I train nothing and run no eval."
+        ),
+        "phase": "finetune_plan_prepared",
+        "next_action": "prepare_finetune_decision",
+        "artifact_schema": "finetune_decision/v1",
+        "claim_boundary_suffix": "It is not a training run, an eval score, or a promoted checkpoint until the output is observed.",
+        "actions": [
+            {"id": "prepare_finetune_decision", "label": "Decide on fine-tuning", "style": "primary"},
+            {"id": "show_promotion_gate", "label": "Show the promotion gate", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "measure_the_untuned_baseline_on_held_out_examples",
+            "try_prompting_and_retrieval_first",
+            "choose_the_method_from_the_data",
+            "plan_the_data_with_a_held_out_split",
+            "promote_only_a_checkpoint_that_beats_the_baseline",
+        ],
+        "evidence_not_observed": [
+            "training run",
+            "eval score",
+            "checkpoint promoted",
+        ],
+    },
+    "mobile-release": {
+        "kind": "mobile_release_plan",
+        "headline": "I can plan this store release, with its halt planned before the rollout.",
+        "body": (
+            "I will check the signing assets and their expiry, compare the privacy manifest and the data safety form "
+            "against the SDKs the build ships, plan the TestFlight or Play beta, stage the rollout behind crash-free and ANR "
+            "halt thresholds, and reserve the hotfix build number. I build, sign, and submit nothing."
+        ),
+        "phase": "mobile_release_plan_prepared",
+        "next_action": "prepare_mobile_release_plan",
+        "artifact_schema": "staged_rollout_plan/v1",
+        "claim_boundary_suffix": "It is not an uploaded build, an approved review, or an advanced rollout until the store console shows it.",
+        "actions": [
+            {"id": "prepare_mobile_release_plan", "label": "Plan the store release", "style": "primary"},
+            {"id": "show_rollout_halt", "label": "Show the halt thresholds", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "check_signing_assets_and_expiry",
+            "compare_privacy_declarations_with_shipped_sdks",
+            "run_the_beta_channel",
+            "stage_the_rollout_behind_halt_thresholds",
+            "reserve_the_hotfix_build",
+        ],
+        "evidence_not_observed": [
+            "build uploaded",
+            "review approved",
+            "rollout advanced",
+        ],
+    },
+    "internal-audit": {
+        "kind": "control_test_plan",
+        "headline": "I can plan this control test and grade what it finds from stated criteria.",
+        "body": (
+            "I will define the control and its population, check the population is complete, size the sample from the "
+            "control's frequency, name the evidence each item must produce, plan the re-performance, and derive any "
+            "severity grade from stated likelihood, magnitude and compensating controls. I read no ledger and sign off nothing."
+        ),
+        "phase": "control_test_plan_prepared",
+        "next_action": "prepare_control_test_plan",
+        "artifact_schema": "deficiency_severity_grade/v1",
+        "claim_boundary_suffix": "It is not a pulled population, obtained evidence, or a re-performed control until the output is observed.",
+        "actions": [
+            {"id": "prepare_control_test_plan", "label": "Plan the control test", "style": "primary"},
+            {"id": "show_severity_grade", "label": "Show the severity criteria", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "define_the_control_and_its_population",
+            "check_population_completeness",
+            "size_and_draw_the_sample",
+            "request_evidence_and_reperform",
+            "grade_from_stated_criteria",
+        ],
+        "evidence_not_observed": [
+            "population pulled",
+            "evidence obtained",
+            "control re-performed",
+        ],
+    },
+    "data-share-review": {
+        "kind": "data_share_review",
+        "headline": "I can get this file ready to leave the team and show what still remains in it.",
+        "body": (
+            "I will ask where it goes and what that destination needs, classify every field, drop what is not needed, "
+            "pseudonymize what must stay joinable with the mapping kept on your side, and count each class left in the "
+            "exact file that leaves. I upload nothing and keep no raw value."
+        ),
+        "phase": "data_share_review_prepared",
+        "next_action": "prepare_data_share_review",
+        "artifact_schema": "residual_scan/v1",
+        "claim_boundary_suffix": "It is not a redacted file until a residual scan of the file that leaves is observed.",
+        "actions": [
+            {"id": "prepare_data_share_review", "label": "Review the data share", "style": "primary"},
+            {"id": "show_residual_scan", "label": "Show the residual scan", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "name_the_destination_and_its_need",
+            "inventory_and_classify_fields",
+            "minimize_then_pseudonymize",
+            "scan_the_shipped_file_per_class",
+            "record_what_left",
+        ],
+        "evidence_not_observed": [
+            "fields removed",
+            "residual scan run",
+            "file shared",
+        ],
+    },
+    "spend-gate": {
+        "kind": "pre_spend_card",
+        "headline": "I can show what this spend will cost before any money moves.",
+        "body": (
+            "I will read the payee, the total with fees, and the currency from the quote itself, check it against your cap, "
+            "name the refund terms and whether it can be undone, and wait for your typed yes. Money moves only after your "
+            "typed yes, through your own card fill, payment client, or page; I never keep your card details, and the spend "
+            "counts as done only once its receipt is observed."
+        ),
+        "phase": "pre_spend_card_prepared",
+        "next_action": "prepare_pre_spend_card",
+        "artifact_schema": "pre_spend_card/v1",
+        "claim_boundary_suffix": "It is not a confirmation, a payment, or a charge until the receipt is observed.",
+        "actions": [
+            {"id": "prepare_pre_spend_card", "label": "Show the pre-spend card", "style": "primary"},
+            {"id": "show_spend_ledger", "label": "Show the spend ledger", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "read_the_quote_from_its_source",
+            "check_the_cap",
+            "show_the_pre_spend_card",
+            "wait_for_typed_confirmation",
+            "observe_the_receipt",
+        ],
+        "evidence_not_observed": [
+            "spend confirmed",
+            "payment submitted",
+            "receipt observed",
+        ],
+    },
+    "iac-change": {
+        "kind": "iac_change_plan",
+        "headline": "I can plan this infrastructure change before it is applied.",
+        "body": (
+            "I will separate existing drift from the change, read the creates, replacements and destroys from the saved plan, "
+            "give the cost delta or mark it unestimated, and stage the apply from the least exposed environment with a health "
+            "gate and a rollback per stage. A stateful replacement waits for your approval, and I apply nothing."
+        ),
+        "phase": "iac_change_plan_prepared",
+        "next_action": "prepare_iac_change_plan",
+        "artifact_schema": "staged_apply_plan/v1",
+        "claim_boundary_suffix": "It is not a plan run, an apply, a passed health gate, or a rollback until the output is observed.",
+        "actions": [
+            {"id": "prepare_iac_change_plan", "label": "Plan the infrastructure change", "style": "primary"},
+            {"id": "show_apply_gate", "label": "Show the apply gates", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "read_the_saved_plan",
+            "separate_drift_from_the_change",
+            "list_replacements_and_destroys",
+            "estimate_the_cost_delta",
+            "stage_the_apply_with_gates_and_rollbacks",
+        ],
+        "evidence_not_observed": [
+            "plan run",
+            "apply performed",
+            "health gate passed",
+            "rollback performed",
+        ],
+    },
+    "security-event-response": {
+        "kind": "security_event_response",
+        "headline": "I can take this security event from triage to an observed close.",
+        "body": (
+            "I will classify the event and its exposure window, call severity from the reachable path rather than the version "
+            "number, and order containment. For a leaked secret the rotation and the old credential's observed rejection come "
+            "before any history rewrite, and the event stays open until the rotation is observed. OMH never scans, contacts a "
+            "registry, or rotates anything."
+        ),
+        "phase": "security_event_response_prepared",
+        "next_action": "prepare_security_event_response",
+        "artifact_schema": "containment_plan/v1",
+        "claim_boundary_suffix": "It is not a scan, an advisory read, a rotation, a revocation, or a shipped fix until the output is observed.",
+        "actions": [
+            {"id": "prepare_security_event_response", "label": "Respond to the security event", "style": "primary"},
+            {"id": "show_event_closure", "label": "Show event closure", "style": "secondary"},
+            {"id": "prepare_security_safety_review", "label": "Review safety", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "classify_the_event_and_exposure_window",
+            "call_severity_from_reachability",
+            "order_containment_rotation_before_rewrite",
+            "record_each_step_observed",
+            "issue_the_closure_verdict",
+        ],
+        "evidence_not_observed": [
+            "advisory read",
+            "reachability",
+            "credential rotated",
+            "old credential rejected",
+            "fixed version shipped",
+        ],
+    },
+    "git-workflow": {
+        "kind": "git_repair_plan",
+        "headline": "I can plan this git repair, starting with what is already pushed.",
+        "body": (
+            "I will list each branch with its local head, its remote head, and who may have fetched it, then order the steps "
+            "for the conflict, the bisect, or the rewrite with a recovery point in front of every step that rewrites history. "
+            "Every force-push uses `--force-with-lease`, and counted or generated files are re-derived rather than picked."
+        ),
+        "phase": "git_repair_plan_prepared",
+        "next_action": "prepare_git_repair_plan",
+        "artifact_schema": "pushed_state_inventory/v1",
+        "claim_boundary_suffix": "It is not a resolved conflict, a bisect verdict, a rewritten history, or a push until the output is observed.",
+        "actions": [
+            {"id": "prepare_git_repair_plan", "label": "Plan the git repair", "style": "primary"},
+            {"id": "show_pushed_state", "label": "Show what is pushed", "style": "secondary"},
+            {"id": "prepare_commit_pr_text", "label": "Draft the text", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "inventory_what_is_already_pushed",
+            "mark_every_rewriting_step",
+            "name_the_recovery_point_before_each_rewrite",
+            "force_push_only_with_force_with_lease",
+            "report_each_step_from_observed_output",
+        ],
+        "evidence_not_observed": [
+            "conflict resolution",
+            "bisect verdict",
+            "history rewrite",
+            "force-push",
+            "collaborator re-fetch",
+        ],
+    },
+    "commit-pr-authoring": {
+        "kind": "commit_pr_draft",
+        "headline": "I can draft the commit message and PR body in this repository's own convention.",
+        "body": (
+            "I will read the PR template and the recent log first, build an evidence ledger of every command with observed or "
+            "not_observed, and draft the text from it: `Tested:` lists only commands observed to run, and everything prepared, "
+            "planned, or skipped goes under `Not-tested:` with its reason. I will not commit, push, or open the PR."
+        ),
+        "phase": "commit_pr_draft_prepared",
+        "next_action": "prepare_commit_pr_text",
+        "artifact_schema": "evidence_ledger/v1",
+        "claim_boundary_suffix": "It is not a commit, a push, an opened PR, a test pass, or CI evidence.",
+        "actions": [
+            {"id": "prepare_commit_pr_text", "label": "Draft the text", "style": "primary"},
+            {"id": "show_evidence_ledger", "label": "Show evidence ledger", "style": "secondary"},
+            {"id": "prepare_review_or_followup_handoff", "label": "Review first", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "read_the_template_and_recent_log",
+            "build_the_evidence_ledger",
+            "draft_subject_and_body_in_the_repo_convention",
+            "project_tested_and_not_tested_from_the_ledger",
+        ],
+        "evidence_not_observed": [
+            "commit",
+            "push",
+            "pull request opened",
+            "test run",
+            "CI run",
+        ],
+    },
+    "app-debugging": {
+        "kind": "root_cause_investigation",
+        "headline": "I can take this to a demonstrated root cause before anyone changes the code.",
+        "body": (
+            "I will record the reproduction first -- the command, the observed and expected output, and the hit rate -- then write "
+            "at least three competing hypotheses on distinct axes and order the observations cheapest first by which hypotheses "
+            "each one eliminates. No fix is prepared while the reproduction reads not_observed."
+        ),
+        "phase": "root_cause_investigation_prepared",
+        "next_action": "prepare_root_cause_investigation",
+        "artifact_schema": "reproduction_record/v1",
+        "claim_boundary_suffix": "It is not a reproduction, a probe result, a root cause, or a fix until the executor's run is observed.",
+        "actions": [
+            {"id": "prepare_root_cause_investigation", "label": "Find the root cause", "style": "primary"},
+            {"id": "show_reproduction_record", "label": "Show reproduction", "style": "secondary"},
+            {"id": "prepare_verification_gate", "label": "Prepare gate", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_the_reproduction_with_its_hit_rate",
+            "write_three_hypotheses_on_distinct_axes",
+            "order_observations_cheapest_first",
+            "record_which_hypotheses_each_observation_eliminates",
+            "hand_off_the_fix_with_the_reproduction_as_its_regression_test",
+        ],
+        "evidence_not_observed": [
+            "reproduction",
+            "probe result",
+            "root cause",
+            "fix",
+            "regression test pass",
+        ],
+    },
+    "native-debugging": {
+        "kind": "native_debug_plan",
+        "headline": "I can prepare the native debugging plan before anyone guesses at the cause.",
+        "body": (
+            "I will state the fault as an observed symptom, write at least three hypotheses on distinct axes with the observation "
+            "that refutes each, and plan the debugger session — adapter, breakpoints, watchpoints, threads, frames, and the values "
+            "read at each stop. The executor drives the debugger; OMH executes nothing."
+        ),
+        "phase": "native_debug_plan_prepared",
+        "next_action": "prepare_native_debug_plan",
+        "artifact_schema": "native_fault_statement/v1",
+        "claim_boundary_suffix": "It is not a reproduction, a breakpoint hit, a read value, a backtrace, a root cause, or a fix.",
+        "actions": [
+            {"id": "prepare_native_debug_plan", "label": "Prepare debug plan", "style": "primary"},
+            {"id": "prepare_rust_handoff", "label": "Prepare Rust contract", "style": "secondary"},
+            {"id": "prepare_verification_gate", "label": "Prepare gate", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "state_the_symptom_and_reproduction",
+            "write_three_hypotheses_on_distinct_axes",
+            "pair_each_with_its_refuting_observation",
+            "plan_the_dap_debugger_session",
+        ],
+        "evidence_not_observed": [
+            "reproduction",
+            "breakpoint hit",
+            "memory or register read",
+            "backtrace",
+            "root cause",
+            "fix",
+        ],
+    },
+    "show-reel": {
+        "kind": "show_reel",
+        "headline": "I can shape an audience-specific motion showcase from verified sources to delivery.",
+        "body": "Prepare the audience, content/subtitle/voice/font/direction tracks, source and brand permissions, three concepts, segment art direction, timing, renderer capability and revision budget. Missing renderer or QA evidence keeps the requested video on hold.",
+        "phase": "show_reel_prepared",
+        "next_action": "prepare_show_reel",
+        "artifact_schema": "show_reel_brief/v1",
+        "recommended_flow": ["verify_audience_locales_and_sources", "compare_concepts_and_direct_segments", "select_available_renderer_and_measure_timing", "review_revise_export_and_record_qa", "package_sources_and_observe_delivery"],
+        "evidence_not_observed": ["source and brand verification", "rendered video", "font shaping and locale review", "codec/color/filesize and motion QA", "source-package transfer", "attachment receipt or publication"],
+        "claim_boundary_suffix": "This is preparation, not a render, measured codec/color/filesize or locale QA, source-package transfer, attachment, receipt or publication.",
+        "actions": [
+            {"id": "prepare_show_reel", "label": "Prepare show reel", "style": "primary"},
+            {"id": "prepare_visual_qa", "label": "Prepare visual QA", "style": "secondary"},
+        ],
+    },
+    "geospatial-analysis": {
+        "kind": "geospatial_analysis",
+        "headline": "I can prepare CRS-safe polygon intersection with measured output checks.",
+        "body": "Confirm supplied layers, authoritative source CRS, a projected metre target, optional Shapely/PyProj and a new output directory. Explicit execution must produce inspectable geometry, summary and replay hashes.",
+        "phase": "geospatial_analysis_prepared",
+        "next_action": "prepare_geospatial_analysis",
+        "artifact_schema": "geospatial_summary/v1",
+        "recommended_flow": ["validate_layers_crs_and_units", "invoke_optional_helper_with_host_deadline", "read_geometry_summary_and_hashes"],
+        "evidence_not_observed": ["input validation", "spatial computation", "geometry and metric readback", "replay verification"],
+        "claim_boundary_suffix": "This is preparation, not observed intersection, a public-world finding or map generation.",
+        "actions": [{"id": "prepare_geospatial_analysis", "label": "Prepare spatial computation", "style": "primary"}],
+    },
+    "biomedical-evidence": {
+        "kind": "biomedical_evidence",
+        "headline": "I can prepare public source reconciliation without a clinical conclusion.",
+        "body": "Confirm exact public query, allele/build/transcript, disease and intended identifiers. Capture ClinVar and registry responses through the bounded host terminal, then reconcile original local bytes offline, preserving disagreements and absent dates.",
+        "phase": "biomedical_evidence_prepared",
+        "next_action": "prepare_biomedical_evidence",
+        "artifact_schema": "biomedical_evidence_matrix/v1",
+        "recommended_flow": ["confirm_public_scope_and_ids", "capture_sources_with_receipts", "reconcile_offline_and_report_gaps"],
+        "evidence_not_observed": ["source retrieval", "identity matching", "reconciliation", "output hash verification"],
+        "claim_boundary_suffix": "This is preparation, not retrieved evidence, complete reconciliation, eligibility or treatment advice.",
+        "actions": [{"id": "prepare_biomedical_evidence", "label": "Prepare evidence reconciliation", "style": "primary"}],
+    },
+    "ai-job-search": {
+        "kind": "ai_job_search",
+        "headline": "I can help find opportunities and prepare truthful applications.",
+        "body": "Confirm the action and private destination. Load the installed method and toolkit instructions, capture bounded sources, invoke validate/merge/summary, then write and review requested versioned documents. Record transitions only from explicit event evidence.",
+        "phase": "ai_job_search_prepared",
+        "next_action": "prepare_ai_job_search",
+        "artifact_schema": "ai_job_search_captures/v1",
+        "recommended_flow": ["confirm_action_and_private_workspace", "capture_sources_and_run_offline_helper", "write_review_and_read_back_actual_artifacts"],
+        "evidence_not_observed": ["verified opportunities", "candidate-grounded drafts", "independent review", "confirmed application events"],
+        "claim_boundary_suffix": "Preparation is not retrieval, document creation, review or submission. The host must actually follow the installed method; no application is sent automatically.",
+        "actions": [{"id": "prepare_ai_job_search", "label": "Prepare career work", "style": "primary"}],
+    },
+    "molecular-docking": {
+        "kind": "molecular_docking",
+        "headline": "I can prepare a bounded standalone Vina search with real pose verification.",
+        "body": "Confirm prepared receptor/ligand PDBQT, preparation provenance, angstrom binding box, CPU, seed, optional Vina and host deadline. Run explicitly in a new directory and reconcile actual poses, finite energies, logs and replay hashes.",
+        "phase": "molecular_docking_prepared",
+        "next_action": "prepare_molecular_docking",
+        "artifact_schema": "molecular_docking_run/v1",
+        "recommended_flow": ["validate_prepared_inputs_and_budget", "invoke_standalone_vina_with_host_deadline", "read_actual_poses_scores_and_hashes"],
+        "evidence_not_observed": ["chemical preparation review", "backend execution", "pose and energy readback", "seeded replay"],
+        "claim_boundary_suffix": "This is preparation, not docking execution, ToolUniverse integration, affinity certainty, efficacy or safety evidence.",
+        "actions": [{"id": "prepare_molecular_docking", "label": "Prepare standalone docking", "style": "primary"}],
+    },
+    "visual-qa": {
+        "kind": "visual_qa",
+        "headline": "I can prepare rendered visual QA without pretending screenshots exist.",
+        "body": (
+            "I will prepare viewport captures, screenshot/diff slots, console and network health checks, click-path traces, "
+            "accessibility keyboard trace, and a PASS/HOLD verdict. No visual pass exists until rendered evidence is recorded."
+        ),
+        "phase": "visual_qa_prepared",
+        "next_action": "prepare_visual_qa",
+        "artifact_schema": "visual_qa_plan/v1",
+        "claim_boundary_suffix": (
+            "It is not screenshot capture, pixel-diff evidence, browser interaction proof, accessibility pass, visual PASS evidence, "
+            "message attachment upload, platform delivery, or a multimodal model call by OMH."
+        ),
+        "actions": [
+            {"id": "prepare_visual_qa", "label": "Prepare visual QA", "style": "primary"},
+            {"id": "show_capture_package", "label": "Show capture package", "style": "secondary"},
+            {"id": "prepare_message_attachment_projection", "label": "Prepare attachments", "style": "secondary"},
+            {"id": "record_browser_capture", "label": "Record capture", "style": "secondary"},
+            {"id": "record_multimodal_review", "label": "Record multimodal review", "style": "secondary"},
+            {"id": "record_visual_qa_verdict", "label": "Record verdict", "style": "secondary"},
+            {"id": "prepare_accessibility_audit", "label": "Audit accessibility", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "prepare_web_visual_qa_package",
+            "define_viewport_matrix",
+            "project_captures_to_message_attachments",
+            "prepare_render_capture_manifest",
+            "separate_screenshot_diff_and_interaction_evidence",
+            "auto_route_by_cost_risk_and_observed_evidence",
+            "record_pass_hold_verdict_only_after_rendered_evidence",
+        ],
+        "evidence_not_observed": [
+            "screenshot capture",
+            "pixel diff",
+            "browser interaction",
+            "console/network health",
+            "accessibility keyboard trace",
+            "visual PASS",
+            "message attachment upload",
+            "platform delivery",
+            "model called by OMH",
+        ],
+    },
+    "accessibility-audit": {
+        "kind": "accessibility_audit",
+        "headline": "I can prepare an accessibility audit without overclaiming WCAG PASS.",
+        "body": (
+            "I will prepare WCAG criteria, semantic structure review, focus and keyboard trace slots, screen-reader map, "
+            "target-size review, contrast/reflow checks, and the observed evidence needed before any PASS claim."
+        ),
+        "phase": "accessibility_audit_prepared",
+        "next_action": "prepare_accessibility_audit",
+        "artifact_schema": "accessibility_audit_plan/v1",
+        "claim_boundary_suffix": "It is not automated scan completion, screen-reader evidence, keyboard trace evidence, WCAG PASS, remediation, or deployment evidence.",
+        "actions": [
+            {"id": "prepare_accessibility_audit", "label": "Audit accessibility", "style": "primary"},
+            {"id": "prepare_visual_qa", "label": "Prepare visual QA", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "map_wcag_success_criteria",
+            "review_semantic_structure",
+            "prepare_focus_keyboard_and_screen_reader_slots",
+            "separate_scan_output_from_pass_verdict",
+        ],
+        "evidence_not_observed": [
+            "automated scan completion",
+            "screen-reader evidence",
+            "keyboard trace evidence",
+            "WCAG PASS",
+            "remediation",
+            "deployment",
+        ],
+    },
+    "memory-new": {
+        "kind": "memory_candidate",
+        "headline": "I can assess one bounded memory candidate.",
+        "body": (
+            "I will remember the durable fact as one bounded line through omh_memory capture, asking one question only "
+            "when scope or durability is ambiguous; refuse secrets, raw logs, transcripts, prompt injection, or temporary "
+            "progress; or defer uncertain fields and external provider/vector content to review."
+        ),
+        "phase": "memory_candidate_prepared",
+        "next_action": "prepare_memory_new",
+        "artifact_schema": "memory_new_candidate/v1",
+        "claim_boundary_suffix": (
+            "A memory candidate is not an approved record or Hermes-native mutation. Hermes-native and external provider/vector "
+            "context is not_omh_reviewed, can nominate a candidate only, and never inherits OMH approval."
+        ),
+        "actions": [
+            {"id": "prepare_memory_new", "label": "Assess memory", "style": "primary"},
+            {"id": "show_memory_status", "label": "Show memory status", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "ask_source_target_scope_and_retention_class",
+            "remember_one_bounded_durable_candidate_or_refuse_or_defer",
+            "review_candidate_without_inheriting_external_approval",
+            "record_omh_local_target_write_only_when_observed",
+        ],
+        "evidence_not_observed": [
+            "approved OMH project-memory record",
+            "Hermes native-memory write",
+            "provider or vector approval",
+            "target write",
+            "model-request delivery",
+        ],
+    },
+    "memory-sync": {
+        "kind": "memory_curation",
+        "headline": "I can review Hermes memory candidates and prepare a write diff for your approval.",
+        "body": (
+            "I will review existing claims in English, with concise Korean help labels and preserved Korean routing. I can prepare "
+            "a native write diff; no OMH surface invokes, applies, or observes a MEMORY.md or USER.md write — after your explicit "
+            "approval the diff is applied by Hermes's own native memory tool and reported as an observed native write."
+        ),
+        "phase": "memory_curation_prepared",
+        "next_action": "prepare_memory_sync",
+        "artifact_schema": "memory_curation_card/v1",
+        "claim_boundary_suffix": (
+            "It is prepared guidance only: no OMH surface invokes, applies, or observes a MEMORY.md/USER.md write, and an approved diff applied through Hermes's native memory tool is Hermes's own act, never OMH mutation evidence. It is not Hermes internal memory, MEMORY.md, USER.md, skill-file modification, or external source freshness evidence. Hermes-native and external provider/vector context is not_omh_reviewed and never inherits OMH approval."
+        ),
+        "actions": [
+            {"id": "prepare_memory_sync", "label": "Review memory", "style": "primary"},
+            {"id": "show_memory_status", "label": "Show memory status", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "extract_and_classify_existing_claims",
+            "distinguish_omh_reviewed_vs_not_omh_reviewed_context",
+            "prepare_native_write_diff_only",
+            "present_keep_revise_archive_choices",
+            "apply_approved_diff_via_native_memory_tool",
+            "report_observed_native_write",
+        ],
+        "evidence_not_observed": [
+            "prepared guidance only: no OMH surface invokes, applies, or observes a MEMORY.md/USER.md write",
+            "native MEMORY.md write",
+            "native USER.md write",
+            "native write invocation or application",
+            "skill-file modification",
+            "external source freshness",
+        ],
+    },
+    "skill-health": {
+        "kind": "skill_health",
+        "headline": "I can prepare a skill portfolio health dashboard.",
+        "body": (
+            "I will prepare the skill health dashboard: catalog and generated-skill surfaces, stale or duplicate guidance, "
+            "observed failure-pattern signals, pending amendment review slots, and the top safe improvement actions. "
+            "Install repair, skill mutation, model training, verification, CI, and future routing fixes stay observed-only."
+        ),
+        "phase": "skill_health_prepared",
+        "next_action": "prepare_skill_health",
+        "artifact_schema": "skill_health_card/v1",
+        "claim_boundary_suffix": "It is not install/setup health, live skill execution success, automatic skill mutation, model training, verification, review, CI, or proof that future routing is fixed.",
+        "actions": [
+            {"id": "prepare_skill_health", "label": "Prepare skill health", "style": "primary"},
+            {"id": "record_skill_health_signal", "label": "Record signal", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "scope_skill_portfolio",
+            "inventory_catalog_and_generated_surfaces",
+            "separate_observed_failures_from_inferred_patterns",
+            "queue_pending_amendments_for_review",
+            "prepare_top_safe_actions",
+        ],
+        "evidence_not_observed": [
+            "install/setup health",
+            "live skill execution success",
+            "automatic skill mutation",
+            "model training",
+            "verification",
+            "review",
+            "CI",
+            "future routing fix",
+        ],
+    },
+    "skill-scout": {
+        "kind": "skill_scout",
+        "headline": "I can scout existing skill candidates before creating a new one.",
+        "body": (
+            "I will prepare the skill scout report: intended workflow, trigger keywords, local and external candidate "
+            "sources, risk review gaps, and use/fork/create options. Installation, copying, external trust, file writes, "
+            "and implementation stay observed-only."
+        ),
+        "phase": "skill_scout_prepared",
+        "next_action": "prepare_skill_scout",
+        "artifact_schema": "skill_scout_recommendation/v1",
+        "claim_boundary_suffix": "It is not skill installation, external source trust, marketplace mutation, file copy, network retrieval, credential use, implementation, review, CI, or proof that a candidate is safe to adopt.",
+        "actions": [
+            {"id": "prepare_skill_scout", "label": "Prepare skill scout", "style": "primary"},
+            {"id": "record_skill_candidate", "label": "Record candidate", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "capture_skill_intent",
+            "prepare_search_keywords",
+            "inventory_local_candidates_when_observed",
+            "review_external_candidate_risks_when_observed",
+            "rank_use_fork_create_options",
+        ],
+        "evidence_not_observed": [
+            "skill installation",
+            "external source trust",
+            "marketplace mutation",
+            "file copy",
+            "network retrieval",
+            "credential use",
+            "implementation",
+            "review",
+            "CI",
+            "merge",
+        ],
+    },
+    "agent-debug": {
+        "kind": "agent_debug",
+        "headline": "I can debug a stuck agent run without pretending to reset it.",
+        "body": (
+            "I will prepare the agent debug report: failure pattern, recent tool or command loop, goal drift, "
+            "context pressure, environment assumptions, diagnosis hypothesis, smallest safe recovery action, "
+            "and remaining blockers. Executor reset, hidden state mutation, tool repair, implementation, "
+            "verification, CI, and future-loop fixes stay observed-only."
+        ),
+        "phase": "agent_debug_prepared",
+        "next_action": "prepare_agent_debug",
+        "artifact_schema": "agent_debug_report/v1",
+        "claim_boundary_suffix": "It is not executor reset, hidden state mutation, tool repair, implementation, verification, review, CI, merge, or proof that future loops are fixed.",
+        "actions": [
+            {"id": "prepare_agent_debug", "label": "Prepare agent debug", "style": "primary"},
+            {"id": "record_agent_failure_capture", "label": "Record failure", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "capture_failure_state",
+            "classify_failure_pattern",
+            "verify_environment_assumptions",
+            "choose_smallest_safe_recovery",
+            "record_result_or_escalation",
+        ],
+        "evidence_not_observed": [
+            "executor reset",
+            "hidden state mutation",
+            "tool repair",
+            "implementation",
+            "verification",
+            "review",
+            "CI",
+            "merge",
+            "future loop fix",
+        ],
+    },
+    "workspace-audit": {
+        "kind": "workspace_audit",
+        "headline": "I can prepare a read-only workspace audit.",
+        "body": (
+            "I will prepare the workspace audit: repo, skill, prompt, plugin, MCP/tool, hook, config, docs, and runtime surfaces, "
+            "with secrets redacted and any mutation routed to a separate follow-up workflow."
+        ),
+        "phase": "workspace_audit_prepared",
+        "next_action": "prepare_workspace_audit",
+        "artifact_schema": "workspace_audit_report/v1",
+        "claim_boundary_suffix": "It is not config mutation, secret inspection, plugin installation, MCP load proof, runtime dispatch, or repair evidence.",
+        "actions": [
+            {"id": "prepare_workspace_audit", "label": "Prepare audit", "style": "primary"},
+            {"id": "prepare_toolbelt_readiness", "label": "Check toolbelt", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "inventory_workspace_surfaces",
+            "redact_secrets_and_credentials",
+            "classify_stale_or_missing_configs",
+            "route_repairs_to_follow_up_workflows",
+        ],
+        "evidence_not_observed": [
+            "config mutation",
+            "secret inspection",
+            "plugin installation",
+            "MCP load proof",
+            "runtime dispatch",
+            "repair completion",
+        ],
+    },
+    "agent-evaluation": {
+        "kind": "agent_evaluation",
+        "headline": "I can prepare a fair agent evaluation instead of anecdotal ranking.",
+        "body": (
+            "I will prepare tasks, fixtures, rubric, budgets, isolation, observed run matrix, and a scenario-specific recommendation. "
+            "No agent is declared better until comparable run evidence exists."
+        ),
+        "phase": "agent_evaluation_prepared",
+        "next_action": "prepare_agent_evaluation",
+        "artifact_schema": "agent_evaluation_plan/v1",
+        "claim_boundary_suffix": "It is not executor dispatch, benchmark execution, quality proof, cost truth, or final agent ranking evidence.",
+        "actions": [
+            {"id": "prepare_agent_evaluation", "label": "Prepare eval", "style": "primary"},
+            {"id": "prepare_report_package", "label": "Prepare report", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "define_representative_tasks",
+            "freeze_rubric_and_budgets",
+            "isolate_executor_runs",
+            "compare_observed_outputs_before_recommendation",
+        ],
+        "evidence_not_observed": [
+            "executor dispatch",
+            "benchmark execution",
+            "quality proof",
+            "provider cost truth",
+            "final ranking",
+        ],
+    },
+    "rules-distill": {
+        "kind": "rules_distill",
+        "headline": "I can distill repeated lessons into reviewed rule candidates.",
+        "body": (
+            "I will prepare source-linked rule candidates, duplicates, conflicts, scope, approval state, and implementation path. "
+            "Nothing mutates AGENTS.md, skills, prompts, docs, or memory until approved and implemented."
+        ),
+        "phase": "rules_distillation_prepared",
+        "next_action": "prepare_rules_distillation",
+        "artifact_schema": "rules_distillation_candidate_set/v1",
+        "claim_boundary_suffix": "It is not AGENTS.md mutation, skill mutation, prompt mutation, memory write, approval, or future-behavior evidence.",
+        "actions": [
+            {"id": "prepare_rules_distillation", "label": "Distill rules", "style": "primary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "collect_source_failures",
+            "dedupe_rule_candidates",
+            "check_conflicts_and_scope",
+            "wait_for_review_before_mutation",
+        ],
+        "evidence_not_observed": [
+            "AGENTS.md mutation",
+            "skill mutation",
+            "prompt mutation",
+            "memory write",
+            "approval",
+            "future behavior change",
+        ],
+    },
+    "codebase-onboarding": {
+        "kind": "codebase_onboarding",
+        "headline": "I can prepare a codebase onboarding pack.",
+        "body": (
+            "I will prepare the observed repo map, reading path, glossary, risks, unknowns, and first-task runway. "
+            "Setup, code edits, executor dispatch, and verification stay separate."
+        ),
+        "phase": "codebase_onboarding_prepared",
+        "next_action": "prepare_codebase_onboarding",
+        "artifact_schema": "codebase_onboarding_pack/v1",
+        "claim_boundary_suffix": "It is not code inspection completion, setup, implementation, executor dispatch, verification, or CI evidence.",
+        "actions": [
+            {"id": "prepare_codebase_onboarding", "label": "Prepare onboarding", "style": "primary"},
+            {"id": "prepare_workspace_audit", "label": "Prepare audit", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "map_repo_surfaces",
+            "prepare_reading_path",
+            "record_glossary_risks_and_unknowns",
+            "separate_onboarding_from_first_task_execution",
+        ],
+        "evidence_not_observed": [
+            "code inspection completion",
+            "setup",
+            "implementation",
+            "executor dispatch",
+            "verification",
+            "CI",
+        ],
+    },
+    "codebase-uml": {
+        "kind": "codebase_uml",
+        "headline": "I can draw the codebase as one diagram.",
+        "body": (
+            "I will scope the view (whole repo, one area, or module level), generate the PlantUML source from the "
+            "actual tree, render it locally, and attach the picture with its omissions legend. "
+            "The image counts only once the render is observed."
+        ),
+        "phase": "codebase_uml_prepared",
+        "next_action": "prepare_codebase_uml",
+        "artifact_schema": "codebase_uml/v1",
+        "claim_boundary_suffix": "It is not a rendered image, an attachment, complete architecture, review, CI, or merge evidence.",
+        "actions": [
+            {"id": "prepare_codebase_uml", "label": "Draw codebase", "style": "primary"},
+            {"id": "prepare_codegraph_refresh", "label": "Refresh codegraph", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "scope_view_package_focus_or_module",
+            "generate_plantuml_source_from_tree",
+            "render_with_plan_command_and_attach",
+            "read_omissions_legend_back",
+        ],
+        "evidence_not_observed": [
+            "render command result",
+            "image attachment",
+            "complete architecture",
+            "review",
+            "CI",
+        ],
+    },
+    "refactor-plan": {
+        "kind": "refactor_plan",
+        "headline": "I can shape this refactor into phases.",
+        "body": (
+            "I will map affected files, boundaries, coupling, and blast radius from observed evidence, order the "
+            "contracts-first phases with per-phase verification and rollback, ship the files table, and stop at "
+            "the approval gate. No phase is implemented until the plan is approved."
+        ),
+        "phase": "refactor_plan_prepared",
+        "next_action": "prepare_refactor_plan",
+        "artifact_schema": "refactor_phase_plan/v1",
+        "claim_boundary_suffix": "It is not implementation, migration, verification, review, CI, or merge evidence, and plan approval proves no phase ran.",
+        "actions": [
+            {"id": "prepare_refactor_plan", "label": "Plan refactor", "style": "primary"},
+            {"id": "prepare_codegraph_refresh", "label": "Refresh codegraph", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "map_recon_from_observed_evidence",
+            "order_contracts_first_phases_with_rollback",
+            "ship_files_table",
+            "stop_at_approval_gate",
+        ],
+        "evidence_not_observed": [
+            "implementation",
+            "migration",
+            "verification",
+            "review",
+            "CI",
+        ],
+    },
+    "inference-serving": {
+        "kind": "inference_serving",
+        "headline": "I can prepare the serving process for this model.",
+        "body": (
+            "I will decide engine and quantization from the tables, prepare the gated docker or Kubernetes "
+            "runbook with its verification commands, and design the benchmark with metrics, load shape, and "
+            "SLO. Every step stays prepared until its command result is observed."
+        ),
+        "phase": "inference_serving_prepared",
+        "next_action": "prepare_inference_serving",
+        "artifact_schema": "inference_serving_plan/v1",
+        "claim_boundary_suffix": "It is not a running server, rollout evidence, a measured capacity claim, review, CI, or merge evidence.",
+        "actions": [
+            {"id": "prepare_inference_serving", "label": "Prepare serving", "style": "primary"},
+            {"id": "prepare_command_operator_card", "label": "Prepare command card", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "decide_engine_and_quantization_from_tables",
+            "prepare_gated_runbook_with_verification",
+            "design_benchmark_with_slo_and_load_shape",
+            "report_each_step_prepared_or_observed",
+        ],
+        "evidence_not_observed": [
+            "server rollout",
+            "readiness or smoke result",
+            "benchmark measurement",
+            "review",
+            "CI",
+        ],
+    },
+    "tech-debt-audit": {
+        "kind": "tech_debt_audit",
+        "headline": "I can prepare the tech-debt ledger for this codebase.",
+        "body": (
+            "I will orient from repo evidence (manifests, churn, largest files), audit the named debt "
+            "dimensions with file:line citations, and rank findings by severity and effort into the ledger - "
+            "quick wins, top fixes, and the looks-bad-but-fine list. On rerun I reconcile RESOLVED/NEW/CARRIED "
+            "against the previous ledger."
+        ),
+        "phase": "tech_debt_audit_prepared",
+        "next_action": "prepare_tech_debt_audit",
+        "artifact_schema": "tech_debt_ledger/v1",
+        "claim_boundary_suffix": "It is not a completed cleanup, a measured quality improvement, review, CI, or merge evidence.",
+        "actions": [
+            {"id": "prepare_tech_debt_audit", "label": "Audit tech debt", "style": "primary"},
+            {"id": "prepare_command_operator_card", "label": "Prepare command card", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "orient_from_repo_evidence",
+            "audit_dimensions_from_reference",
+            "rank_findings_by_severity_and_effort",
+            "reconcile_with_prior_ledger",
+        ],
+        "evidence_not_observed": [
+            "detection command runs",
+            "cleanup or fixes",
+            "quality improvement",
+            "review",
+            "CI",
+        ],
+    },
+    "award-bar-score": {
+        "kind": "award_bar_score",
+        "headline": "I can score this surface against the published award bar.",
+        "body": (
+            "I will score UI, UX, and innovation separately from rendered evidence, compute the weighted total "
+            "against the published threshold, and name the binding constraint - the axis holding the total down. "
+            "Innovation moves that cost an accessibility or performance budget are recorded as tradeoffs you "
+            "choose, because those budgets outrank the score."
+        ),
+        "phase": "award_bar_score_prepared",
+        "next_action": "prepare_award_bar_score",
+        "artifact_schema": "award_bar_score/v1",
+        "claim_boundary_suffix": "It is a self-assessment against a published rubric, not a jury score, a placement, or an award.",
+        "actions": [
+            {"id": "prepare_award_bar_score", "label": "Score award bar", "style": "primary"},
+            {"id": "prepare_visual_qa", "label": "Capture the page", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "confirm_rendered_evidence",
+            "score_each_axis_with_evidence",
+            "compute_weighted_total_against_threshold",
+            "name_binding_constraint_and_tradeoffs",
+        ],
+        "evidence_not_observed": [
+            "rendered captures",
+            "jury or award outcome",
+            "accessibility conformance",
+            "performance budget runs",
+            "implementation",
+        ],
+    },
+    "codegraph-refresh": {
+        "kind": "codegraph_refresh",
+        "headline": "I can prepare a CodeGraph refresh without claiming an index update.",
+        "body": (
+            "I will prepare the repo root, sync/status command choice, staleness scope, file-write policy, and observed-only summary slots. "
+            "Command execution and generated files stay separate until observed."
+        ),
+        "phase": "codegraph_refresh_prepared",
+        "next_action": "prepare_codegraph_refresh",
+        "artifact_schema": "codegraph_refresh_plan/v1",
+        "claim_boundary_suffix": "It is not command execution, index sync, generated file write, code intelligence freshness, or handoff evidence.",
+        "actions": [
+            {"id": "prepare_codegraph_refresh", "label": "Refresh codegraph", "style": "primary"},
+            {"id": "prepare_command_operator_card", "label": "Prepare command card", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "confirm_repo_root",
+            "choose_status_or_sync_command",
+            "scope_staleness_and_write_policy",
+            "record_index_result_only_after_command_evidence",
+        ],
+        "evidence_not_observed": [
+            "command execution",
+            "index sync",
+            "generated file write",
+            "code intelligence freshness",
+            "handoff evidence",
+        ],
+    },
+    "instinct-ledger": {
+        "kind": "instinct_ledger",
+        "headline": "I can turn repeated lessons into scoped instinct candidates.",
+        "body": (
+            "I will prepare the instinct ledger: atomic trigger/action candidates, source evidence, confidence, "
+            "domain, project/global scope, promotion state, import/export review, and missing approvals. Hooks, "
+            "raw observation capture, memory writes, skill mutation, global promotion, and future behavior changes "
+            "stay observed-only."
+        ),
+        "phase": "instinct_ledger_prepared",
+        "next_action": "prepare_instinct_ledger",
+        "artifact_schema": "instinct_ledger_plan/v1",
+        "claim_boundary_suffix": "It is not hook installation, automatic observation, model training, hidden memory mutation, skill mutation, prompt mutation, global promotion, import/export, or proof that future behavior changed.",
+        "actions": [
+            {"id": "prepare_instinct_ledger", "label": "Prepare instincts", "style": "primary"},
+            {"id": "record_instinct_candidate", "label": "Record candidate", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "scope_project_or_global_boundary",
+            "redact_source_observations",
+            "write_atomic_trigger_action_candidates",
+            "score_confidence_and_domain",
+            "review_promotion_or_export_when_requested",
+        ],
+        "evidence_not_observed": [
+            "hook installation",
+            "automatic observation",
+            "model training",
+            "memory mutation",
+            "skill mutation",
+            "prompt mutation",
+            "global promotion",
+            "import/export",
+            "future behavior change",
+        ],
+    },
+    "gateway-intent-card": {
+        "kind": "gateway_intent",
+        "headline": "I can normalize this gateway intent before platform work.",
+        "body": (
+            "I will prepare the gateway intent: origin, thread key, delivery policy, silent updates, attachment rules, "
+            "status-update behavior, and what the wrapper should ask next. Platform login, message sends, thread mutation, "
+            "attachments, and delivery stay observed-only."
+        ),
+        "phase": "gateway_intent_prepared",
+        "next_action": "prepare_gateway_intent_card",
+        "artifact_schema": "gateway_intent_card/v1",
+        "claim_boundary_suffix": "It is not platform login, message send, thread mutation, attachment upload, or delivery evidence.",
+        "actions": [
+            {"id": "prepare_gateway_intent_card", "label": "Open gateway card", "style": "primary"},
+            {"id": "prepare_toolbelt_readiness", "label": "Check toolbelt", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "normalize_origin_and_thread",
+            "choose_delivery_and_silence_policy",
+            "separate_attachment_rules_from_upload_evidence",
+            "prepare_status_update_contract",
+        ],
+        "evidence_not_observed": [
+            "platform login",
+            "message send",
+            "thread mutation",
+            "attachment upload",
+            "delivery",
+            "recipient acknowledgement",
+        ],
+    },
+    "deliverable-package": {
+        "kind": "deliverable_package",
+        "headline": "I can prepare the deliverable package and its delivery trail.",
+        "body": (
+            "I will prepare the deliverable path: required files, generation owner, export steps, render or formula QA, "
+            "approval points, attachment status, and delivery evidence slots. Generated binaries, uploads, attachments, "
+            "and approvals stay observed-only."
+        ),
+        "phase": "deliverable_package_prepared",
+        "next_action": "prepare_deliverable_package",
+        "artifact_schema": "deliverable_package_card/v1",
+        "claim_boundary_suffix": "It is not binary generation, render QA, formula recalculation, approval, upload, attachment, or delivery evidence.",
+        "actions": [
+            {"id": "prepare_deliverable_package", "label": "Prepare deliverable", "style": "primary"},
+            {"id": "prepare_material_package", "label": "Prepare source package", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "inventory_required_files",
+            "assign_generation_owner",
+            "prepare_export_and_qa_checks",
+            "record_attachment_and_delivery_evidence_slots",
+        ],
+        "evidence_not_observed": [
+            "binary generation",
+            "render QA",
+            "formula recalculation",
+            "approval",
+            "upload",
+            "attachment",
+            "delivery",
+        ],
+    },
+    "voice-operator": {
+        "kind": "voice_operator",
+        "headline": "I can turn the short request into a safe operator card.",
+        "body": (
+            "I will normalize the voice or mobile-style request into a concise clarify, plan, status, handoff, or "
+            "confirmation action. Speech recognition, notification delivery, platform action, and risky execution stay "
+            "unobserved until explicitly confirmed."
+        ),
+        "phase": "voice_operator_prepared",
+        "next_action": "prepare_voice_operator_card",
+        "artifact_schema": "voice_operator_card/v1",
+        "claim_boundary_suffix": "It is not speech recognition proof, mobile notification delivery, platform action, or accepted execution evidence.",
+        "actions": [
+            {"id": "prepare_voice_operator_card", "label": "Open voice card", "style": "primary"},
+            {"id": "answer:clarify", "label": "Ask/answer clarification", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "normalize_short_input",
+            "detect_risky_or_destructive_intent",
+            "ask_one_confirmation_when_needed",
+            "route_to_concrete_workflow_after_confirmation",
+        ],
+        "evidence_not_observed": [
+            "speech recognition proof",
+            "mobile notification delivery",
+            "accepted execution",
+            "platform action",
+            "destructive approval",
+            "workflow completion",
+        ],
+    },
+    "browser-operator": {
+        "kind": "browser_operator",
+        "headline": "I can prepare the browser task without claiming the page was touched.",
+        "body": (
+            "I will prepare the browser task card: target URL, allowed clicks or form actions, auth boundary, "
+            "destructive-action confirmation, observation slots, and stop condition. Browser launch, login, page "
+            "mutation, screenshot, and form submission stay observed-only."
+        ),
+        "phase": "browser_operator_prepared",
+        "next_action": "prepare_browser_operator_card",
+        "artifact_schema": "browser_task_card/v1",
+        "claim_boundary_suffix": "It is not browser launch, login, credential validation, page mutation, screenshot, scraping, or form submission evidence.",
+        "actions": [
+            {"id": "prepare_browser_operator_card", "label": "Open browser card", "style": "primary"},
+            {"id": "confirm_browser_action", "label": "Confirm action", "style": "secondary", "enabled": False},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_target_url",
+            "list_allowed_browser_actions",
+            "separate_auth_and_destructive_boundaries",
+            "record_observations_only after browser evidence exists",
+        ],
+        "evidence_not_observed": [
+            "browser launch",
+            "credential validation",
+            "page mutation",
+            "form submission",
+            "screenshot capture",
+            "successful interaction",
+        ],
+    },
+    "workspace-file-operator": {
+        "kind": "workspace_file_operator",
+        "headline": "I can prepare the file task without claiming files changed.",
+        "body": (
+            "I will prepare the workspace file task card: path root, allowed file operations, excluded paths, "
+            "destructive-action confirmation, observation slots, and stop condition. File reads, writes, moves, "
+            "renames, deletes, archive changes, uploads, and downloads stay observed-only."
+        ),
+        "phase": "workspace_file_operator_prepared",
+        "next_action": "prepare_workspace_file_operator_card",
+        "artifact_schema": "workspace_file_task_card/v1",
+        "claim_boundary_suffix": "It is not file read, write, copy, move, rename, delete, archive, upload, download, or permission-change evidence.",
+        "actions": [
+            {"id": "prepare_workspace_file_operator_card", "label": "Open file card", "style": "primary"},
+            {"id": "confirm_file_operation", "label": "Confirm file action", "style": "secondary", "enabled": False},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_path_root",
+            "list_allowed_file_operations",
+            "separate_excluded_paths_and_destructive_boundaries",
+            "record_observations_only after file-operation evidence exists",
+        ],
+        "evidence_not_observed": [
+            "file read",
+            "file write",
+            "copy or move",
+            "rename or delete",
+            "archive mutation",
+            "upload or download",
+            "permission change",
+        ],
+    },
+    "command-operator": {
+        "kind": "command_operator",
+        "headline": "I can prepare the command task without claiming it ran.",
+        "body": (
+            "I will prepare the command task card: command text, working directory, environment assumptions, "
+            "timeout, safety gate, result-evidence slots, and stop condition. Terminal launch, shell execution, "
+            "stdout/stderr capture, exit-code success, package-manager effects, and filesystem mutations stay observed-only."
+        ),
+        "phase": "command_operator_prepared",
+        "next_action": "prepare_command_operator_card",
+        "artifact_schema": "command_task_card/v1",
+        "claim_boundary_suffix": "It is not terminal launch, shell execution, test run, stdout/stderr, exit-code success, package-manager effect, filesystem mutation, network access, or destructive command evidence.",
+        "actions": [
+            {"id": "prepare_command_operator_card", "label": "Open command card", "style": "primary"},
+            {"id": "confirm_command_execution", "label": "Confirm command", "style": "secondary", "enabled": False},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_command_text",
+            "record_working_directory_and_environment",
+            "classify_safety_level_and_timeout",
+            "record_results_only after command evidence exists",
+        ],
+        "evidence_not_observed": [
+            "terminal launch",
+            "shell execution",
+            "stdout or stderr",
+            "exit code",
+            "test result",
+            "package-manager effect",
+            "filesystem mutation",
+        ],
+    },
+    "connector-operator": {
+        "kind": "connector_operator",
+        "headline": "I can prepare the external app action without claiming it ran.",
+        "body": (
+            "I will prepare the connector task card: provider, target object, allowed action, recipient or assignee, "
+            "payload summary, credential boundary, confirmation gate, result-evidence slots, and stop condition. "
+            "API calls, message sends, ticket mutations, external writes, webhook delivery, and connector success stay observed-only."
+        ),
+        "phase": "connector_operator_prepared",
+        "next_action": "prepare_connector_operator_card",
+        "artifact_schema": "connector_task_card/v1",
+        "claim_boundary_suffix": "It is not connector availability, credential validation, API call, message send, ticket creation, external write, webhook delivery, or provider success evidence.",
+        "actions": [
+            {"id": "prepare_connector_operator_card", "label": "Open connector card", "style": "primary"},
+            {"id": "confirm_connector_action", "label": "Confirm connector action", "style": "secondary", "enabled": False},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_provider_and_target",
+            "record_allowed_connector_action",
+            "separate_auth_payload_confirmation_and_dry_run_boundaries",
+            "record_results_only after connector evidence exists",
+        ],
+        "evidence_not_observed": [
+            "connector availability",
+            "credential validation",
+            "API call",
+            "message send",
+            "ticket mutation",
+            "external write",
+            "webhook delivery",
+        ],
+    },
+    "live-info-operator": {
+        "kind": "live_info_operator",
+        "headline": "I can prepare the live information lookup without claiming the data was fetched.",
+        "body": (
+            "I will prepare the live information card: requested domain, location or symbol, time window, "
+            "provider preference, freshness requirement, units, source-quality rule, result slots, and stop condition. "
+            "Weather, price, score, exchange-rate, time-zone, map, and local-place answers stay observed-only."
+        ),
+        "phase": "live_info_operator_prepared",
+        "next_action": "prepare_live_info_operator_card",
+        "artifact_schema": "live_info_task_card/v1",
+        "claim_boundary_suffix": "It is not provider availability, API access, live data retrieval, weather, market price, sports score, exchange-rate, time-zone, map, or place-result evidence.",
+        "actions": [
+            {"id": "prepare_live_info_operator_card", "label": "Open live info card", "style": "primary"},
+            {"id": "record_live_info_result", "label": "Record provider result", "style": "secondary", "enabled": False},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_domain_location_symbol_or_time_window",
+            "record_provider_and_freshness_boundary",
+            "separate_units_source_quality_and_result_evidence",
+            "record_results_only after provider evidence exists",
+        ],
+        "evidence_not_observed": [
+            "provider availability",
+            "API access",
+            "live data retrieval",
+            "weather result",
+            "market price",
+            "sports score",
+            "map/place result",
+        ],
+    },
+    "content-operator": {
+        "kind": "content_operator",
+        "headline": "I can prepare the content task without claiming it was published, sent, or approved.",
+        "body": (
+            "I will prepare the content operator card: source scope, audience, channel, language, tone, style guide, "
+            "fact-risk, review gate, output slots, and stop condition. Source retrieval, fact verification, approval, "
+            "publishing, sending, file export, and delivery stay observed-only."
+        ),
+        "phase": "content_operator_prepared",
+        "next_action": "prepare_content_operator_card",
+        "artifact_schema": "content_task_card/v1",
+        "claim_boundary_suffix": "It is not source retrieval, fact verification, hallucination-free copy, stakeholder approval, publishing, email/message sending, file export, delivery, or accepted-final-copy evidence.",
+        "actions": [
+            {"id": "prepare_content_operator_card", "label": "Open content card", "style": "primary"},
+            {"id": "record_content_output", "label": "Record output", "style": "secondary", "enabled": False},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_source_scope_and_fact_risk",
+            "record_audience_channel_tone_and_style",
+            "separate_draft_review_publish_send_and_export_boundaries",
+            "record_outputs_only after draft or approval evidence exists",
+        ],
+        "evidence_not_observed": [
+            "source retrieval",
+            "fact verification",
+            "stakeholder approval",
+            "publishing",
+            "email or message sending",
+            "file export",
+            "delivery",
+            "accepted final copy",
+        ],
+    },
+    "media-input-operator": {
+        "kind": "media_input",
+        "headline": "I can prepare the media input task without claiming media was accessed or transcribed.",
+        "body": (
+            "I will prepare the media input card: source location, media type, permission boundary, supplied transcript "
+            "or extraction need, language, speaker, OCR/receipt field, and timestamp requirements, summary method, "
+            "result slots, and stop condition. Media access, download, transcription, OCR output, screenshot text, "
+            "receipt fields, timestamps, and summary correctness stay observed-only."
+        ),
+        "phase": "media_input_prepared",
+        "next_action": "prepare_media_input_card",
+        "artifact_schema": "media_input_task_card/v1",
+        "claim_boundary_suffix": "It is not media access, file upload, download, transcript extraction, OCR output, screenshot text extraction, receipt fields, speech-to-text output, timestamp accuracy, copyright clearance, source retrieval, or media-summary correctness evidence.",
+        "actions": [
+            {"id": "prepare_media_input_card", "label": "Open media card", "style": "primary"},
+            {"id": "record_transcript_boundary", "label": "Record transcript boundary", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_media_source_and_permission_boundary",
+            "record_transcript_or_extraction_availability_language_and_speaker_needs",
+            "choose_timestamp_or_summary_method",
+            "record_results_only after media, transcript, or extraction evidence exists",
+        ],
+        "evidence_not_observed": [
+            "media access",
+            "file upload",
+            "download",
+            "transcript extraction",
+            "OCR output",
+            "screenshot text extraction",
+            "receipt fields",
+            "speech-to-text output",
+            "timestamp accuracy",
+            "copyright clearance",
+            "media summary correctness",
+        ],
+    },
+    "data-analysis": {
+        "kind": "data_analysis",
+        "headline": "I can prepare the data analysis without claiming results.",
+        "body": (
+            "I will prepare the data analysis task card: dataset or corpus source and scope, schema or extraction "
+            "method, relationship-claim boundary, analysis plan, result-evidence slots, and stop condition. File "
+            "extraction, query execution, chart generation, numeric findings, and causal claims stay observed-only."
+        ),
+        "phase": "data_analysis_prepared",
+        "next_action": "prepare_data_analysis_card",
+        "artifact_schema": "data_analysis_task_card/v1",
+        "claim_boundary_suffix": "It is not file extraction, query execution, chart generation, statistical proof, data correctness, numeric finding, association, or causal evidence.",
+        "actions": [
+            {"id": "prepare_data_analysis_card", "label": "Open analysis card", "style": "primary"},
+            {"id": "record_dataset_scope", "label": "Record scope", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_dataset_source_and_scope",
+            "record_schema_corpus_or_extraction_method",
+            "record_relationship_claim_boundary",
+            "choose_analysis_method",
+            "record_results_only after data or query evidence exists",
+        ],
+        "evidence_not_observed": [
+            "file extraction",
+            "query execution",
+            "chart generation",
+            "statistical proof",
+            "data correctness",
+            "numeric findings",
+        ],
+    },
+    "toolbelt-readiness": {
+        "kind": "toolbelt_readiness",
+        "headline": "I can check the tools this workflow needs before claiming it can run.",
+        "body": (
+            "I will prepare the toolbelt readiness card: required MCP servers, CLIs, APIs, credentials, connectors, "
+            "missing pieces, fallback mode, and safe setup next step. Installation, credential validation, API access, "
+            "connector invocation, and workflow execution stay observed-only."
+        ),
+        "phase": "toolbelt_readiness_prepared",
+        "next_action": "prepare_toolbelt_readiness",
+        "artifact_schema": "toolbelt_readiness_card/v1",
+        "claim_boundary_suffix": "It is not MCP installation, credential validation, API access, connector invocation, or successful workflow execution evidence.",
+        "actions": [
+            {"id": "prepare_toolbelt_readiness", "label": "Check toolbelt", "style": "primary"},
+            {"id": "run_omh_doctor", "label": "Run doctor", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "list_required_tools",
+            "separate_installed_from_unobserved",
+            "name_missing_credentials_or_connectors",
+            "choose_safe_fallback_or_setup_step",
+        ],
+        "evidence_not_observed": [
+            "MCP installation",
+            "credential validation",
+            "API access",
+            "connector invocation",
+            "workflow execution",
+            "external service success",
+        ],
+    },
+    "prompt-import-readiness": {
+        "kind": "prompt_import_readiness",
+        "headline": "I can check prompt imports before exposing slash commands.",
+        "body": (
+            "I will prepare the prompt import readiness card: prompt sources, agent family, file formats, argument "
+            "interpolation, slash command collisions, trust review, and dry-run evidence slots. Prompt file reads, "
+            "parser success, command registration, prompt mutation, command activation, and imported prompt trust stay observed-only."
+        ),
+        "phase": "prompt_import_readiness_prepared",
+        "next_action": "prepare_prompt_import_readiness",
+        "artifact_schema": "prompt_import_readiness_card/v1",
+        "claim_boundary_suffix": "It is not prompt file access, prompt parsing success, slash command registration, prompt mutation, command activation, imported prompt trust, or dry-run evidence.",
+        "actions": [
+            {"id": "prepare_prompt_import_readiness", "label": "Check prompt import", "style": "primary"},
+            {"id": "prepare_security_safety_review", "label": "Review safety", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_prompt_sources_and_agent_family",
+            "classify_prompt_formats",
+            "map_argument_interpolation",
+            "record_slash_command_collisions",
+            "review_prompt_trust_and_safety",
+            "record_import_manifest_only_after observed file or dry-run evidence",
+        ],
+        "evidence_not_observed": [
+            "prompt file access",
+            "prompt parsing success",
+            "slash command registration",
+            "prompt mutation",
+            "command activation",
+            "imported prompt trust",
+            "dry-run execution",
+        ],
+    },
+    "physical-device-readiness": {
+        "kind": "physical_device_readiness",
+        "headline": "I can check physical device workflows before hardware actions.",
+        "body": (
+            "I will prepare the physical device readiness card: device scope, actuator hazards, sensor or camera gates, "
+            "operator approval, dry-run or simulation policy, emergency stop, and device trial evidence slots. "
+            "Heat commands, relay toggles, robot movement, print starts, camera inspections, sensor readings, and "
+            "hardware trial success stay observed-only."
+        ),
+        "phase": "physical_device_readiness_prepared",
+        "next_action": "prepare_physical_device_readiness",
+        "artifact_schema": "physical_device_readiness_card/v1",
+        "claim_boundary_suffix": "It is not device discovery, pairing, sensor/camera evidence, relay actuation, robot movement, heat command, print start, emergency stop success, or hardware trial evidence.",
+        "actions": [
+            {"id": "prepare_physical_device_readiness", "label": "Check device readiness", "style": "primary"},
+            {"id": "prepare_security_safety_review", "label": "Review safety", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "record_device_scope_and_authority",
+            "inventory_hazards_and_actuators",
+            "record_sensor_camera_gate_policy",
+            "record_operator_approval_policy",
+            "record_dry_run_and_emergency_stop_policy",
+            "record_device_trial_only_after observed telemetry, capture, command, or operator evidence",
+        ],
+        "evidence_not_observed": [
+            "device discovery",
+            "network pairing",
+            "credential validation",
+            "slicer or G-code correctness",
+            "camera inspection",
+            "sensor reading",
+            "relay actuation",
+            "robot movement",
+            "heat command",
+            "print start",
+            "emergency stop success",
+            "hardware trial success",
+        ],
+    },
+    "harness-session-inventory": {
+        "kind": "harness_session_inventory",
+        "headline": "I can inventory sessions, MCP configs, and worktrees without inventing runtime proof.",
+        "body": (
+            "I will prepare a cross-harness inventory: Codex, Claude Code, Hermes, OpenCode, Cursor, wrapper sessions, "
+            "MCP host configs, connector entries, worktree roots, stale or drifted slots, and the next safe observation "
+            "step. Config files and prepared session records stay separate from host load, MCP tool-call, connector "
+            "availability, executor dispatch, worktree cleanup, merge-conflict resolution, and session progress."
+        ),
+        "phase": "harness_session_inventory_prepared",
+        "next_action": "prepare_harness_session_inventory",
+        "artifact_schema": "harness_session_inventory/v1",
+        "claim_boundary_suffix": "It is not host load, MCP tool-call, connector availability, executor dispatch, worktree cleanup, merge-conflict resolution, or session progress evidence.",
+        "actions": [
+            {"id": "prepare_harness_session_inventory", "label": "Open inventory", "style": "primary"},
+            {"id": "prepare_toolbelt_readiness", "label": "Check toolbelt", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "scope_harnesses_and_wrappers",
+            "redact_mcp_and_connector_configs",
+            "resolve_mcp_tool_name_compatibility",
+            "classify_sessions_as_observed_prepared_missing_or_stale",
+            "record_worktree_snapshot_when_available",
+            "report_drift_without_cleanup_or_runtime_claims",
+        ],
+        "evidence_not_observed": [
+            "host load",
+            "MCP tool-call",
+            "connector availability",
+            "executor dispatch",
+            "worktree cleanup",
+            "merge-conflict resolution",
+            "session progress",
+        ],
+    },
+    "ops-observability-card": {
+        "kind": "ops_observability",
+        "headline": "I can prepare observability without inventing provider truth.",
+        "body": (
+            "I will prepare a wrapper-safe observability card: token, cost, latency, run history, queue, failure modes, "
+            "external metric-provider payloads, service-quality gaps, and evidence boundaries. Local estimates and supplied "
+            "metric exports stay separate from provider billing, quota truth, live metric-provider access, full tracing, "
+            "SLO pass, incident closure, remediation completion, performance proof, and workflow completion."
+        ),
+        "phase": "ops_observability_prepared",
+        "next_action": "prepare_ops_observability_card",
+        "artifact_schema": "ops_service_quality_board/v1",
+        "claim_boundary_suffix": "It is not provider billing truth, provider quota truth, live metric-provider access, complete tracing, SLO pass, incident closure, remediation completion, performance proof, or workflow completion evidence.",
+        "actions": [
+            {"id": "prepare_ops_observability_card", "label": "Open observability", "style": "primary"},
+            {"id": "refresh_status", "label": "Refresh status", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "collect_local_runtime_records",
+            "accept_external_metric_provider_payloads",
+            "separate_estimates_from_provider_truth",
+            "type_service_quality_downgrade_gaps",
+            "summarize_failure_modes",
+            "mark_missing_trace_or_billing_evidence",
+        ],
+        "evidence_not_observed": [
+            "provider billing truth",
+            "provider quota truth",
+            "live metric-provider access",
+            "complete tracing",
+            "SLO pass",
+            "incident closure",
+            "remediation completion",
+            "performance proof",
+            "workflow completion",
+            "external telemetry fetch",
+        ],
+    },
+    "operating-rhythm": {
+        "kind": "operating_rhythm",
+        "headline": "I can turn this into an operating rhythm record.",
+        "body": (
+            "I will prepare the operating rhythm: cadence, meeting topics, decisions, owners, follow-up slots, "
+            "and what needs confirmation. Meeting outcomes, owner acceptance, and completed follow-ups stay unobserved "
+            "until recorded."
+        ),
+        "phase": "operating_rhythm_prepared",
+        "next_action": "prepare_operating_record",
+        "artifact_schema": "operating_rhythm_card/v1",
+        "claim_boundary_suffix": "It is not meeting completion, decision approval, owner acceptance, or follow-up evidence.",
+        "actions": [
+            {"id": "prepare_operating_record", "label": "Prepare rhythm", "style": "primary"},
+            {"id": "prepare_report_package", "label": "Prepare record package", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "capture_cadence",
+            "list_meeting_topics",
+            "separate_decisions_from_open_questions",
+            "record_owner_follow_up_slots",
+        ],
+        "evidence_not_observed": [
+            "meeting completion",
+            "decision approval",
+            "owner acceptance",
+            "follow-up completion",
+            "source notes reviewed",
+            "delivery",
+        ],
+    },
+    "materials-package": {
+        "kind": "materials_package",
+        "headline": "I can prepare the material package without pretending files exist.",
+        "body": (
+            "I will prepare the material package: source files, target formats, extraction needs, formulas or layout risks, "
+            "export checklist, render QA, approval, and delivery steps. Binary files, uploads, render checks, and attachments "
+            "remain observed-only."
+        ),
+        "phase": "materials_package_prepared",
+        "next_action": "prepare_material_package",
+        "artifact_schema": "materials_package_card/v1",
+        "claim_boundary_suffix": "It is not binary export, render QA, upload, attachment, approval, or delivery evidence.",
+        "actions": [
+            {"id": "prepare_material_package", "label": "Prepare package", "style": "primary"},
+            {"id": "prepare_deliverable_package", "label": "Prepare deliverable", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "inventory_source_files",
+            "choose_target_formats",
+            "name_extraction_or_layout_risks",
+            "prepare_export_and_render_qa_checks",
+        ],
+        "evidence_not_observed": [
+            "source extraction",
+            "binary export",
+            "formula validation",
+            "render QA",
+            "upload",
+            "attachment",
+            "approval",
+        ],
+    },
+    "research-department": {
+        "kind": "research_department",
+        "headline": "I can organize this into a research department flow.",
+        "body": (
+            "I will prepare Scout, Analyst, and Briefer lanes: source inbox, synthesis questions, briefing format, cadence, "
+            "knowledge-store readiness, and delivery policy. Source retrieval, synthesis, verification, storage, and delivery "
+            "stay unobserved until recorded."
+        ),
+        "phase": "research_department_prepared",
+        "next_action": "prepare_research_department_plan",
+        "artifact_schema": "research_department_card/v1",
+        "claim_boundary_suffix": "It is not source retrieval, synthesis, verification, knowledge-store write, or delivery evidence.",
+        "actions": [
+            {"id": "prepare_research_department_plan", "label": "Prepare research flow", "style": "primary"},
+            {"id": "run_hermes_research", "label": "Start research", "style": "secondary"},
+            {"id": "prepare_report_package", "label": "Prepare brief", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "define_scout_sources",
+            "prepare_analyst_questions",
+            "choose_briefing_format",
+            "separate_retrieval_from_synthesis_and_delivery",
+        ],
+        "evidence_not_observed": [
+            "source retrieval",
+            "source verification",
+            "synthesis",
+            "knowledge-store write",
+            "brief delivery",
+            "stakeholder approval",
+        ],
+    },
+    "github-event-ops": {
+        "kind": "github_event_ops",
+        "headline": "I can prepare this GitHub event without claiming webhook work happened.",
+        "body": (
+            "I will prepare the GitHub event card: event type, issue or PR context, triage labels, review path, CI questions, "
+            "docs-sync needs, and follow-up handoff. Webhook receipt, GitHub mutation, code changes, review, CI, and docs sync "
+            "stay observed-only."
+        ),
+        "phase": "github_event_ops_prepared",
+        "next_action": "prepare_github_event_ops_card",
+        "artifact_schema": "github_event_ops_card/v1",
+        "claim_boundary_suffix": "It is not webhook receipt, webhook delivery, GitHub mutation, code execution, review, CI, docs-sync, or merge evidence.",
+        "actions": [
+            {"id": "prepare_github_event_ops_card", "label": "Open event card", "style": "primary"},
+            {"id": "prepare_review_or_followup_handoff", "label": "Prepare review", "style": "secondary"},
+            {
+                "id": "prepare_coding_handoff",
+                "label": "Prepare fix handoff",
+                "style": "secondary",
+                "enabled": False,
+                "payload": {"requires": "observed event context and accepted implementation scope"},
+            },
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "classify_github_event",
+            "prepare_triage_or_review_path",
+            "separate_ci_and_docs_questions",
+            "prepare_follow_up_handoff_if_scope_is_accepted",
+        ],
+        "evidence_not_observed": [
+            "webhook receipt",
+            "GitHub mutation",
+            "label application",
+            "code execution",
+            "completed review",
+            "CI",
+            "docs sync",
+            "merge",
+        ],
+    },
+    "long-document-reading": {
+        "kind": "long_document_reading",
+        "headline": "I can read this document in page ranges without claiming pages I never read.",
+        "body": (
+            "I will prepare the long document card: the page count and scanned-page flags from a probe, page ranges "
+            "sized to the read budget (about 60 pages per call), a chunk ledger with covered / next / missing page "
+            "anchors, and a fixed per-range brief for delegated ranges above four. Every merged claim keeps its page "
+            "anchor, and a resumed or compacted session continues from the ledger's next range."
+        ),
+        "phase": "long_document_reading_prepared",
+        "next_action": "prepare_long_document_reading",
+        "artifact_schema": "long_document_card/v1",
+        "claim_boundary_suffix": "It is not page-count, extraction, scanned-page OCR, range delegation, or whole-document coverage evidence.",
+        "actions": [
+            {"id": "prepare_long_document_reading", "label": "Plan page ranges", "style": "primary"},
+            {"id": "show_chunk_ledger", "label": "Show chunk ledger", "style": "secondary"},
+            {"id": "continue_next_range", "label": "Read next range", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "confirm_reading_goal",
+            "probe_page_count_and_scanned_flags",
+            "plan_page_ranges_to_read_budget",
+            "extract_each_range_with_page_anchors",
+            "delegate_ranges_above_threshold",
+            "close_each_range_covered_next_missing",
+            "merge_notes_in_page_order",
+        ],
+        "evidence_not_observed": [
+            "page count",
+            "text extraction",
+            "scanned-page OCR",
+            "range delegation",
+            "hosted OCR",
+            "whole-document coverage",
+        ],
+    },
+    "github-issue-intake": {
+        "kind": "github_issue_intake",
+        "headline": "I can prepare this GitHub issue without claiming anything was filed.",
+        "body": (
+            "I will prepare the intake card: classification, a bounded interview of at most three decision-changing "
+            "questions, duplicate search status, a direction check with observed evidence versus inference, and the "
+            "scoped issue package. Issue creation runs only after your explicit confirmation through an authorized "
+            "connector, and only its read-back counts as observed evidence."
+        ),
+        "phase": "github_issue_intake_prepared",
+        "next_action": "prepare_github_issue_intake",
+        "artifact_schema": "github_issue_intake/v1",
+        "claim_boundary_suffix": "It is not issue creation, label application, GitHub mutation, coding, PR, merge, or deployment evidence.",
+        "actions": [
+            {"id": "prepare_github_issue_intake", "label": "Open intake card", "style": "primary"},
+            {"id": "show_direction_check", "label": "Show direction check", "style": "secondary"},
+            {
+                "id": "confirm_issue_creation",
+                "label": "Confirm issue creation",
+                "style": "secondary",
+                "enabled": False,
+                "payload": {"requires": "confirmed direction check and authorized connector"},
+            },
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "classify_report",
+            "run_bounded_interview",
+            "search_duplicates",
+            "present_direction_check",
+            "confirm_then_hand_off_to_authorized_connector",
+            "verify_read_back",
+        ],
+        "evidence_not_observed": [
+            "issue creation",
+            "GitHub mutation",
+            "label application",
+            "coding execution",
+            "PR",
+            "merge",
+            "deployment",
+        ],
+    },
+    "apple-design": {
+        "kind": "apple_design",
+        "headline": "I can prepare an Apple platform-aware design brief.",
+        "body": (
+            "I will prepare the mode, target platform and convention, current tokens, applicable source records, "
+            "observed-versus-hypothesized findings, remediation owners, and missing checks. Implementation, accessibility "
+            "PASS, visual QA, and Apple certification stay observed-only."
+        ),
+        "phase": "apple_design_prepared",
+        "next_action": "prepare_design_orchestration",
+        "artifact_schema": "apple_design_brief/v1",
+        "claim_boundary_suffix": "It is not implementation, accessibility PASS, visual QA, Apple certification, review, CI, or delivery evidence.",
+        "actions": [
+            {"id": "prepare_design_orchestration", "label": "Prepare Apple design brief", "style": "primary"},
+            {"id": "prepare_accessibility_audit", "label": "Prepare accessibility audit", "style": "secondary"},
+            {"id": "prepare_visual_qa", "label": "Prepare visual QA", "style": "secondary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "scope_mode_platform_and_convention",
+            "separate_observations_from_hypotheses",
+            "prepare_platform_aware_remediation",
+            "route_missing_checks_to_existing_owners",
+        ],
+        "evidence_not_observed": [
+            "implementation",
+            "accessibility PASS",
+            "visual QA",
+            "Apple certification",
+            "review",
+            "CI",
+            "delivery",
+        ],
+    },
+    "design-orchestration": {
+        "kind": "design_orchestration",
+        "headline": "I can prepare a design orchestration contract for this.",
+        "body": (
+            "I will prepare the design direction: goals, audience, constraints, visual references, quality gates, "
+            "and the handoff shape for frontend or materials work. Implementation, browser rendering, accessibility "
+            "PASS, and visual QA stay observed-only."
+        ),
+        "phase": "design_orchestration_prepared",
+        "next_action": "prepare_design_orchestration",
+        "artifact_schema": "design_orchestration_card/v1",
+        "claim_boundary_suffix": "It is not executor selection, implementation, browser rendering, accessibility PASS, visual QA, review, or delivery evidence.",
+        "actions": [
+            {"id": "prepare_design_orchestration", "label": "Prepare design direction", "style": "primary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "capture_design_goals",
+            "collect_visual_references",
+            "define_quality_gates",
+            "prepare_handoff_shape",
+        ],
+        "evidence_not_observed": [
+            "executor selection",
+            "implementation",
+            "browser rendering",
+            "accessibility PASS",
+            "visual QA",
+            "review",
+            "delivery",
+        ],
+    },
+    "external-connector-readiness": {
+        "kind": "external_connector_readiness",
+        "headline": "I can check what this external connector needs before use.",
+        "body": (
+            "I will prepare the readiness card: provider, credential and scope requirements, install and "
+            "configuration steps, capability limits, and the fallback when the connector is unavailable. Connector "
+            "installation, credential validation, provider access, and live API calls stay observed-only."
+        ),
+        "phase": "external_connector_readiness_prepared",
+        "next_action": "prepare_external_connector_readiness",
+        "artifact_schema": "external_connector_readiness_card/v1",
+        "claim_boundary_suffix": "It is not connector installation, credential validation, provider access, API invocation, or live-data retrieval evidence.",
+        "actions": [
+            {"id": "prepare_external_connector_readiness", "label": "Check connector readiness", "style": "primary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "identify_provider_and_scope",
+            "list_credential_requirements",
+            "outline_install_steps",
+            "define_unavailable_fallback",
+        ],
+        "evidence_not_observed": [
+            "connector installation",
+            "credential validation",
+            "provider access",
+            "API invocation",
+            "live-data retrieval",
+        ],
+    },
+    "failure-signal-audit": {
+        "kind": "failure_signal_audit",
+        "headline": "I can audit these failure signals before any fix.",
+        "body": (
+            "I will prepare the audit: signal inventory, grouping by suspected cause, severity and blast radius, "
+            "missing evidence, and the next diagnostic step per group. Remediation, code changes, runtime repair, "
+            "and incident closure stay observed-only."
+        ),
+        "phase": "failure_signal_audit_prepared",
+        "next_action": "prepare_failure_signal_audit",
+        "artifact_schema": "failure_signal_audit_card/v1",
+        "claim_boundary_suffix": "It is not remediation, code modification, runtime repair, incident closure, or verification evidence.",
+        "actions": [
+            {"id": "prepare_failure_signal_audit", "label": "Audit failure signals", "style": "primary"},
+            {"id": "show_status", "label": "Show status", "style": "secondary"},
+        ],
+        "recommended_flow": [
+            "collect_failure_signals",
+            "group_by_suspected_cause",
+            "rank_severity_and_blast_radius",
+            "name_next_diagnostic_step",
+        ],
+        "evidence_not_observed": [
+            "remediation",
+            "code modification",
+            "runtime repair",
+            "incident closure",
+            "verification",
+        ],
+    },
+}
+
+_WORKFLOW_OPERATIONS_CHAT_CARDS.update(
+    {
+        "decision-recall": {
+            "kind": "decision_recall",
+            "headline": "I can show reviewed rejected decisions without treating them as approved memory.",
+            "body": (
+                "I will prepare a scoped recall of reviewed rejected alternatives, matching query, scope, tags, and stale policy. "
+                "The result remains OMH-local context, not approved memory, Hermes memory, source freshness, or execution evidence."
+            ),
+            "phase": "decision_recall_prepared",
+            "next_action": "show_rejected_decision_recall",
+            "artifact_schema": "rejected_decision_recall/v1",
+            "claim_boundary_suffix": "It is not approved memory, Hermes memory, source freshness, or execution evidence.",
+            "actions": [
+                {"id": "show_rejected_decision_recall", "label": "Show rejected decisions", "style": "primary"},
+                {"id": "show_memory_status", "label": "Show memory status", "style": "secondary"},
+            ],
+            "recommended_flow": ["scope_query", "match_rejected_candidates", "separate_recall_from_approved_memory"],
+            "evidence_not_observed": ["approved memory", "Hermes memory", "source freshness", "execution"],
+        },
+        "run-efficiency": {
+            "kind": "run_efficiency",
+            "headline": "I can show a local run efficiency report from supplied metadata.",
+            "body": (
+                "I will prepare context utilization, surface counts, and supplied timing observations for this run. "
+                "Provider billing, cron activity, host behavior, and performance beyond supplied local metadata stay not observed."
+            ),
+            "phase": "run_efficiency_prepared",
+            "next_action": "show_run_efficiency_report",
+            "artifact_schema": "run_efficiency_report/v1",
+            "claim_boundary_suffix": "It is not provider billing, cron, host, or performance proof beyond supplied local metadata.",
+            "actions": [
+                {"id": "show_run_efficiency_report", "label": "Show run efficiency", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["validate_run_metadata", "render_context_utilization", "show_not_observed_gaps"],
+            "evidence_not_observed": ["provider billing", "cron activity", "host behavior", "performance proof"],
+        },
+        "provider-profile-posture": {
+            "kind": "provider_profile_posture",
+            "headline": "I can prepare provider/profile posture without accessing a provider or secret.",
+            "body": (
+                "I will prepare requested capabilities, metadata-only secret presence, and allowed or prohibited actions. "
+                "Credential validation, provider connectivity, model routing, payment/wallet, and host execution remain unobserved."
+            ),
+            "phase": "provider_profile_posture_prepared",
+            "next_action": "prepare_provider_profile_posture",
+            "artifact_schema": "provider_profile_posture/v1",
+            "claim_boundary_suffix": "It is not credential validation, provider connectivity, model routing, payment/wallet, or host execution evidence.",
+            "actions": [
+                {"id": "prepare_provider_profile_posture", "label": "Prepare provider profile", "style": "primary"},
+                {"id": "prepare_external_connector_readiness", "label": "Check connector readiness", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["scope_profile", "record_secret_presence", "separate_posture_from_connectivity"],
+            "evidence_not_observed": ["credential validation", "provider connectivity", "model routing", "payment/wallet", "host execution"],
+        },
+    }
+)
+
+_WORKFLOW_OPERATIONS_CHAT_CARDS.update(
+    {
+        "capability-toggle": {
+            "kind": "capability_toggle",
+            "headline": "I can turn one OMH capability family on or off.",
+            "body": (
+                "I will name the family, list the workflows it withholds and the core skills it always retains, "
+                "and give you the command that reverses it. Memory is the one family with runtime behavior behind "
+                "it, so disabling it stops capture and recall rather than only hiding them."
+            ),
+            "phase": "capability_toggle_prepared",
+            "next_action": "apply_capability_toggle",
+            "artifact_schema": "omh_capability_policy/v1",
+            "evidence_not_observed": [
+                "policy write",
+                "skill file removal",
+                "Hermes reconfiguration",
+                "memory capture or recall change taking effect",
+            ],
+            "claim_boundary_suffix": (
+                "It records which family surfaces this install offers; it is not Hermes reconfiguration, "
+                "uninstall, execution, review, CI, or merge evidence."
+            ),
+            "actions": [
+                {"id": "apply_capability_toggle", "label": "Show capability policy", "style": "primary"},
+            ],
+        },
+        "running-work-board": {
+            "kind": "running_work_board",
+            "headline": "I can show what coding work is running right now.",
+            "body": (
+                "I will show one row per unit: which runtime, which model, status, elapsed time, and tokens, "
+                "and one per Hermes delegate child or kanban worker with its source and state. A unit's runtime "
+                "and model are exact because omh chose them; a Hermes worker's model is the one Hermes recorded; "
+                "anything nobody observed prints as the literal unknown rather than an estimate."
+            ),
+            "phase": "running_work_board_prepared",
+            "next_action": "show_running_work_board",
+            "artifact_schema": "omh_coding_status_board/v1",
+            "evidence_not_observed": [
+                "unit liveness",
+                "token counts a runtime never reported",
+                "unit completion",
+                "review, CI, or merge outcome",
+            ],
+            "claim_boundary_suffix": (
+                "Presence is not liveness, and the board is not result, verification, review, CI, "
+                "merge-readiness, or merge evidence."
+            ),
+            "actions": [
+                {"id": "show_running_work_board", "label": "Show running work", "style": "primary"},
+            ],
+        },
+        "todo-checklist": {
+            "kind": "todo_checklist",
+            "headline": "I can declare the plan checklist the HUD shows above your prompt.",
+            "body": (
+                "I will declare numbered phases in delivery order with one task per observable outcome, keep exactly "
+                "one item active, and update states as work completes. Items are plan declarations: an item marked "
+                "done records that I say it is done, which is not an observed result. The checklist belongs to this "
+                "session, so no other TUI, Slack, or Discord session sees or overwrites it."
+            ),
+            "phase": "todo_checklist_prepared",
+            "next_action": "declare_plan_checklist",
+            "artifact_schema": "omh_todo/v1",
+            "evidence_not_observed": [
+                "whether a task marked done actually happened",
+                "test, build, review, CI, or merge outcome",
+                "work in any session other than this one",
+            ],
+            "claim_boundary_suffix": (
+                "A checklist state is a declaration, not execution, verification, review, CI, "
+                "merge-readiness, or merge evidence."
+            ),
+            "actions": [
+                {"id": "declare_plan_checklist", "label": "Declare checklist", "style": "primary"},
+            ],
+        },
+        "achievements": {
+            "kind": "achievements_summary",
+            "headline": "I can summarize your Hermes badges, tiers, and progress.",
+            "body": (
+                "I will read the locally recorded hermes-achievements artifacts and show unlocked badges, current "
+                "tiers, recent unlocks, and the badges closest to their next tier. A number those artifacts do not "
+                "record stays unavailable rather than zero, and a badge is never recomputed or granted here."
+            ),
+            "phase": "achievements_summary_prepared",
+            "next_action": "show_achievements_summary",
+            "artifact_schema": "hermes_achievements_observation/v1",
+            "claim_boundary_suffix": (
+                "It is not a session-history rescan, badge recomputation, unlock proof beyond those artifacts, "
+                "or productivity evidence."
+            ),
+            "actions": [
+                {"id": "show_achievements_summary", "label": "Show achievements", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": [
+                "read_local_achievement_artifacts",
+                "summarize_unlocked_badges_and_tiers",
+                "show_recent_unlocks_and_next_tier_progress",
+                "mark_unrecorded_metrics_unavailable",
+            ],
+            "evidence_not_observed": [
+                "session-history rescan",
+                "badge recomputation",
+                "unlocks beyond the local artifacts",
+                "productivity",
+            ],
+        },
+        "wiki": {
+            "kind": "wiki_blueprint",
+            "headline": "I can design a wiki you can start today, or file knowledge into the store you keep.",
+            "body": (
+                "I will size the structure to who reads and maintains it, propose one organization model with its "
+                "rationale, breaking conditions, and one alternative, then lay out the skeleton, entry points, "
+                "conventions, maintenance routine, and at most ten seed pages. For knowledge going into a store you "
+                "already keep, I will prepare destination-aware notes with a retrieval hint and a staleness warning. "
+                "Creating the store and writing its pages stay unobserved until a write is recorded."
+            ),
+            "phase": "wiki_blueprint_prepared",
+            "next_action": "prepare_wiki_blueprint",
+            "artifact_schema": "wiki_blueprint/v1",
+            "claim_boundary_suffix": (
+                "It is not store creation, external write, connector run, or memory mutation evidence."
+            ),
+            "actions": [
+                {"id": "prepare_wiki_blueprint", "label": "Prepare wiki blueprint", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": [
+                "size_audience_and_maintainer",
+                "propose_model_with_breaking_conditions",
+                "lay_out_skeleton_conventions_and_seed_pages",
+                "prepare_destination_guidance",
+            ],
+            "evidence_not_observed": [
+                "store creation",
+                "external write",
+                "connector run",
+                "memory mutation",
+            ],
+        },
+        "ultraperf": {
+            "kind": "ultraperf_loop",
+            "headline": "I can find where this is actually slow, leaking, or expensive - then fix one measured hot path at a time.",
+            "body": (
+                "I will record a baseline and evaluator command, profile and rank hot-path hypotheses, hand the smallest reversible fix "
+                "to the selected executor, re-measure, and set the regression budget. A declared single metric with a baseline and "
+                "benchmark command enters the same loop at the re-measure step, with the baseline you already have."
+            ),
+            "phase": "ultraperf_loop_prepared",
+            "next_action": "prepare_ultraperf_loop",
+            "artifact_schema": "ultraperf_loop_card/v1",
+            "claim_boundary_suffix": "It is not profiling, benchmark execution, measurement proof, code change, regression-gate, review, CI, or merge evidence.",
+            "actions": [
+                {"id": "prepare_ultraperf_loop", "label": "Prepare performance loop", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["record_baseline_and_evaluator_command", "profile_and_rank_hot_path_hypotheses", "hand_off_the_smallest_reversible_fix", "re_measure_and_set_the_regression_budget"],
+            "evidence_not_observed": ["baseline measurement", "profile", "benchmark execution", "code change", "regression gate", "merge"],
+        },
+    }
+)
+_WORKFLOW_OPERATIONS_CHAT_CARDS.update(
+    {
+        "dag-ulw": {
+            "kind": "dag_run",
+            "headline": "I can run this as a graph of small parts, in parallel where they allow, and check it against the goal.",
+            "body": (
+                "I will plan the work as a graph, hand the ready parts to Hermes subagents, settle each part from its handoff, "
+                "verify the goal with a separate check, and repair what fails before I report. A planned graph is not execution, "
+                "verification, review, CI, or merge evidence."
+            ),
+            "phase": "dag_run_prepared",
+            "next_action": "start_dag_run",
+            "artifact_schema": "omh_dag/v1",
+            "claim_boundary_suffix": "It is not execution, verification, review, CI, or merge evidence.",
+            "actions": [
+                {"id": "start_dag_run", "label": "Start graph run", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["define_graph", "dispatch_ready_nodes", "settle_from_handoffs", "verify_goal_and_repair"],
+            "evidence_not_observed": ["dispatch", "execution", "verification", "review", "CI", "merge"],
+        },
+    }
+)
+_WORKFLOW_OPERATIONS_CHAT_CARDS.update(
+    {
+        "finance-analysis": {
+            "kind": "finance_analysis",
+            "headline": "I can prepare a decision-ready finance variance, cash, and close-risk brief.",
+            "body": (
+                "I will prepare the period and source boundary, actual-versus-plan narrative, calculation assumptions, cash or close risks, "
+                "decision questions, and next review route. This is not authoritative accounting, an ERP or ledger action, payment, tax, filing, or approval evidence."
+            ),
+            "phase": "finance_analysis_prepared",
+            "next_action": "prepare_finance_analysis",
+            "artifact_schema": "finance_analysis_card/v1",
+            "claim_boundary_suffix": "It is not authoritative calculation, ERP, bank, ledger, tax, payment, filing, approval, or decision evidence.",
+            "actions": [
+                {"id": "prepare_finance_analysis", "label": "Prepare finance analysis", "style": "primary"},
+                {"id": "prepare_strategy_brief", "label": "Prepare strategy", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["state_period_and_source_boundary", "analyze_variance_and_assumptions", "register_cash_close_and_control_risks", "name_decision_questions_and_next_route"],
+            "evidence_not_observed": ["source validation", "authoritative calculation", "ERP or ledger action", "payment or filing", "decision approval"],
+        },
+        "people-ops": {
+            "kind": "people_ops",
+            "headline": "I can prepare a fair recruiting or people-operations brief.",
+            "body": (
+                "I will prepare role outcomes, must-have and trainable criteria, a structured interview scorecard, an evidence-based debrief, "
+                "process owners, and inclusion, privacy, policy, and evidence gaps. This is not candidate contact, evaluation, hiring, rejection, ATS, or HRIS evidence."
+            ),
+            "phase": "people_ops_prepared",
+            "next_action": "prepare_people_ops_brief",
+            "artifact_schema": "people_ops_brief_card/v1",
+            "claim_boundary_suffix": "It is not candidate contact, evaluation, hiring, rejection, ATS, HRIS, or employment-status evidence.",
+            "actions": [
+                {"id": "prepare_people_ops_brief", "label": "Prepare people ops", "style": "primary"},
+                {"id": "prepare_legal_compliance_review", "label": "Prepare legal review", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["define_role_outcomes_and_criteria", "prepare_structured_scorecard_and_debrief", "name_process_and_decision_owners", "surface_inclusion_privacy_policy_and_evidence_gaps"],
+            "evidence_not_observed": ["candidate contact", "candidate evaluation", "hiring decision", "ATS mutation", "HRIS mutation"],
+        },
+        "support-operations": {
+            "kind": "support_operations",
+            "headline": "I can prepare a customer-safe reply, severity path, and owned support next step.",
+            "body": (
+                "I will prepare a reply draft with stated facts and unknowns, an issue/severity/impact matrix, escalation ownership, and missing repro, account, entitlement, or approval evidence. "
+                "This is not a sent reply, ticket change, refund, account action, or customer outcome."
+            ),
+            "phase": "support_operations_prepared",
+            "next_action": "prepare_support_operations",
+            "artifact_schema": "support_operations_card/v1",
+            "claim_boundary_suffix": "It is not a sent reply, ticket mutation, refund, account action, escalation completion, or customer outcome evidence.",
+            "actions": [
+                {"id": "prepare_support_operations", "label": "Prepare support guidance", "style": "primary"},
+                {"id": "prepare_review_or_followup_handoff", "label": "Prepare follow-up review", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["state_customer_safe_facts_and_unknowns", "classify_issue_severity_impact_and_escalation", "draft_reply_and_internal_owner_handoff", "list_missing_case_evidence"],
+            "evidence_not_observed": ["message send", "ticket mutation", "refund", "account action", "customer outcome"],
+        },
+        "curriculum-design": {
+            "kind": "curriculum_design",
+            "headline": "I can prepare a teachable curriculum, assessment plan, and learner-ready sequence.",
+            "body": (
+                "I will prepare learner and prerequisite assumptions, outcomes, scope and sequence, module rationale, formative and summative assessments, "
+                "accessibility, adaptation, and source-rights questions. This is not LMS creation, enrollment, grading, certification, publication, or learning-outcome evidence."
+            ),
+            "phase": "curriculum_design_prepared",
+            "next_action": "prepare_curriculum_design",
+            "artifact_schema": "curriculum_design_card/v1",
+            "claim_boundary_suffix": "It is not LMS creation, enrollment, grading, certification, material publication, or learning-outcome evidence.",
+            "actions": [
+                {"id": "prepare_curriculum_design", "label": "Prepare curriculum", "style": "primary"},
+                {"id": "prepare_material_package", "label": "Prepare materials package", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["scope_learners_prerequisites_outcomes_and_constraints", "build_scope_and_sequence", "prepare_assessment_rubric_and_completion_evidence", "surface_accessibility_adaptation_and_rights_gaps"],
+            "evidence_not_observed": ["LMS creation", "learner enrollment", "grading", "certification", "learning outcome"],
+        },
+        "jit-learn": {
+            "kind": "jit_learn",
+            "headline": "I can find the one thing worth learning for this problem right now.",
+            "body": (
+                "I will ask one confirmation question before any research - even when the request already looks complete - to settle why this "
+                "matters now, what you already know, and where the learning gets applied. Then I confirm the target as `Learn X now so I can "
+                "do/decide Y in context Z by T.` and prepare a source-gated Markdown brief with Books, Podcasts, Creators, and Courses ranked by "
+                "fit, authority, currency, time to first value, and direct transfer instead of popularity. An empty section says why nothing "
+                "qualified rather than padding the list."
+            ),
+            "phase": "learning_target_confirmation",
+            "next_action": "prepare_learning_brief",
+            "artifact_schema": "jit_learn_brief_card/v1",
+            "claim_boundary_suffix": (
+                "A confirmed target is an interview decision, not research; recommendations stay prepared until the sources "
+                "behind them are observed."
+            ),
+            "actions": [
+                {"id": "prepare_learning_brief", "label": "Confirm learning target", "style": "primary"},
+                {"id": "answer:clarify", "label": "Answer the question", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": [
+                "review_supplied_and_approved_context",
+                "ask_one_confirmation_question",
+                "confirm_the_immediate_learning_target",
+                "scope_source_gated_research",
+                "prepare_the_application_first_learning_brief",
+            ],
+            "evidence_not_observed": [
+                "source retrieval",
+                "link or currency verification",
+                "source consumption",
+                "learning or progress",
+                "application of the recommendation",
+                "blocker resolution",
+            ],
+        },
+        "sales-development": {
+            "kind": "sales_development",
+            "headline": "I can prepare a focused account discovery, qualification, and next-step brief.",
+            "body": (
+                "I will prepare account and buyer hypotheses, evidence gaps, discovery and qualification questions, value and objection framing, outreach-draft outline, "
+                "and an owned next-step plan. This is not current fact retrieval, prospect contact, CRM mutation, meeting booking, or revenue evidence."
+            ),
+            "phase": "sales_development_prepared",
+            "next_action": "prepare_sales_development",
+            "artifact_schema": "sales_development_card/v1",
+            "claim_boundary_suffix": "It is not observed company research, prospect contact, CRM mutation, opportunity creation, meeting booking, revenue, or progress evidence.",
+            "actions": [
+                {"id": "prepare_sales_development", "label": "Prepare sales brief", "style": "primary"},
+                {"id": "run_hermes_research", "label": "Start research", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["scope_account_segment_buyer_and_evidence_gaps", "prepare_discovery_and_qualification_questions", "draft_value_and_objection_hypotheses", "name_owned_non_executing_next_steps"],
+            "evidence_not_observed": ["company fact retrieval", "prospect contact", "CRM mutation", "meeting booking", "revenue progress"],
+        },
+        "jev-ask": {
+            "kind": "typed_ask",
+            "headline": "I can send your typed question to Jev once you ask for it.",
+            "body": "I will write independent yes/no, pick-one, or scored questions over the text you give, tell you what leaves the machine, and report Jev's probabilities with the served model and cost. Jev writes no text, and its numbers are not review, approval, or verification evidence.",
+            "phase": "typed_ask_prepared",
+            "next_action": "prepare_typed_ask",
+            "artifact_schema": "typed_ask_card/v1",
+            "claim_boundary_suffix": "Jev's probabilities are typed answers only; a non-answer status is never an answer.",
+            "actions": [
+                {"id": "prepare_typed_ask", "label": "Prepare typed ask", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["confirm_consent_this_turn", "name_what_state_carries", "send_independent_typed_questions", "report_numbers_with_model_and_cost"],
+            "evidence_not_observed": ["Jev reply", "served model", "account billing"],
+        },
+        "jev-route": {
+            "kind": "route_question_answer",
+            "headline": "I can ask Jev which workflow fits this undecidable route and record its pick.",
+            "body": "I will send the route question unchanged with your message, show Jev's pick as a question to you, and record the answer. The deterministic route stays in force and nothing is dispatched on Jev's pick alone.",
+            "phase": "route_question_answer_prepared",
+            "next_action": "prepare_route_question_answer",
+            "artifact_schema": "route_question_answer_card/v1",
+            "claim_boundary_suffix": "A recorded route answer changes no route and dispatches nothing.",
+            "actions": [
+                {"id": "prepare_route_question_answer", "label": "Prepare route answer", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["confirm_route_question_and_consent", "send_block_unchanged", "offer_pick_as_clarification", "record_with_ask_id"],
+            "evidence_not_observed": ["Jev reply", "route change", "dispatch"],
+        },
+        "jev-failure-triage": {
+            "kind": "failure_next_move",
+            "headline": "I can ask Jev which next move fits this failing run.",
+            "body": "I will send the failing command and an error excerpt with the retry count, and report OMH's fixed-rule next move beside Jev's answers. The fix stays with the ordinary triage workflow, and any rerun still needs your approval.",
+            "phase": "failure_next_move_prepared",
+            "next_action": "prepare_failure_next_move",
+            "artifact_schema": "failure_next_move_card/v1",
+            "claim_boundary_suffix": "A failure_triage/v1 outcome is advisory; it is not a root cause, a fix, or approval to rerun.",
+            "actions": [
+                {"id": "prepare_failure_next_move", "label": "Prepare failure next move", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["name_what_leaves_the_machine", "send_failure_triage_preset", "report_outcome_and_rule", "hand_fix_to_triage_workflow"],
+            "evidence_not_observed": ["Jev reply", "root cause", "fix", "rerun approval"],
+        },
+        "jev-review-gate": {
+            "kind": "review_flags",
+            "headline": "I can add Jev's typed review flags for this diff.",
+            "body": "I will name the files and the cost first, send one file's diff per ask, and add the flags to the review as advisory lines. Flags never approve a merge.",
+            "phase": "review_flags_prepared",
+            "next_action": "prepare_review_flags",
+            "artifact_schema": "review_flags_card/v1",
+            "claim_boundary_suffix": "Review flags are advisory; no_flags is not an approval or a review verdict.",
+            "actions": [
+                {"id": "prepare_review_flags", "label": "Prepare review flags", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["name_files_and_cost", "send_review_flags_per_file", "report_union_of_flags", "keep_review_verdict_with_code_review"],
+            "evidence_not_observed": ["Jev reply", "review verdict", "merge approval"],
+        },
+        "jev-action-check": {
+            "kind": "action_hold_check",
+            "headline": "I can ask Jev to screen this command before it runs; it can only add a hold.",
+            "body": "I will send the command, working directory, and your stated task, and report hold, refuse_recommended, or no_extra_hold with its rule before anything runs. A failure is a labelled hold, and no_extra_hold is never an approval.",
+            "phase": "action_hold_check_prepared",
+            "next_action": "prepare_action_hold_check",
+            "artifact_schema": "action_hold_check_card/v1",
+            "claim_boundary_suffix": "An action_check/v1 outcome can only add a hold; the host's normal approval still applies.",
+            "actions": [
+                {"id": "prepare_action_hold_check", "label": "Prepare action check", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["name_what_leaves_the_machine", "send_action_check_preset", "report_outcome_before_running", "keep_host_approval"],
+            "evidence_not_observed": ["Jev reply", "command execution", "approval"],
+        },
+        "jev-done-check": {
+            "kind": "completion_objection_check",
+            "headline": "I can ask Jev whether the observed evidence supports each completion claim.",
+            "body": "I will send each claim with an excerpt of observed output and the goal, and report any objection with its rule. Jev can only object; no_objection never marks work done.",
+            "phase": "completion_objection_check_prepared",
+            "next_action": "prepare_completion_objection_check",
+            "artifact_schema": "completion_objection_check_card/v1",
+            "claim_boundary_suffix": "A done_check/v1 outcome can only object; it is not verification or completion evidence.",
+            "actions": [
+                {"id": "prepare_completion_objection_check", "label": "Prepare completion check", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["name_what_leaves_the_machine", "send_done_check_per_claim", "report_objections", "fix_or_withdraw_objected_claims"],
+            "evidence_not_observed": ["Jev reply", "verification", "completion"],
+        },
+        "decision-prototype": {
+            "kind": "decision_prototype",
+            "headline": "I can prepare one bounded prototype to answer a decision before planning.",
+            "body": "I will frame one falsifiable question, the smallest disposable experiment, a scratch-workspace boundary, budgets, stop conditions, and a receipt that separates observed results from interpretation. This does not run an experiment, approve a plan, promote prototype code, or establish implementation, validation, review, CI, or merge evidence.",
+            "phase": "decision_prototype_prepared",
+            "next_action": "prepare_decision_prototype",
+            "artifact_schema": "decision_prototype_card/v1",
+            "claim_boundary_suffix": "It is not execution, cleanup, approval, implementation, validation, review, CI, or merge evidence.",
+            "actions": [
+                {"id": "prepare_decision_prototype", "label": "Prepare decision prototype", "style": "primary"},
+                {"id": "prepare_context_budget_review", "label": "Review experiment boundary", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["frame_one_falsifiable_decision", "bound_disposable_experiment_and_workspace", "prepare_measurement_and_stop_conditions", "record_receipt_for_later_planning"],
+            "evidence_not_observed": ["executor dispatch", "prototype execution", "workspace cleanup", "observed result", "plan acceptance", "implementation or production promotion"],
+        },
+        "market-research": {
+            "kind": "market_research",
+            "headline": "I can scope the market analysis and its evidence requirements.",
+            "body": "I will frame the decision, buyer segment, geography, units, period, source cutoff and budget, then select sizing, customer/JTBD or comparable competitor/pricing methods. Sources, calculation results, interviews and validation remain unobserved until evidence is recorded.",
+            "phase": "market_research_prepared",
+            "next_action": "prepare_market_research",
+            "artifact_schema": "market_research_card/v1",
+            "claim_boundary_suffix": "It is not retrieval, calculation, customer validation, outreach, payment, scheduling or investment approval evidence.",
+            "actions": [
+                {"id": "prepare_market_research", "label": "Scope market analysis", "style": "primary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["frame_scope_units_cutoff_and_budget", "register_sources_and_assumptions", "apply_requested_market_methods", "report_contrary_evidence_and_verification_needs"],
+            "evidence_not_observed": ["source retrieval", "calculation results", "customer evidence", "customer validation", "outreach, payments or scheduling", "investment approval"],
+        },
+        "lifecycle-growth": {
+            "kind": "lifecycle_growth",
+            "headline": "I can prepare an evidence-bounded lifecycle journey and experiment plan.",
+            "body": "I will define the target behavior and baseline, eligible audience and exclusions, consent and frequency policy, treatment and holdout, measurement readout, approval gate, and stop decision. This does not identify users, send a message, schedule work, change a flag, launch an experiment, or prove delivery, exposure, outcome, or causality.",
+            "phase": "lifecycle_growth_prepared",
+            "next_action": "prepare_lifecycle_growth",
+            "artifact_schema": "lifecycle_growth_card/v1",
+            "claim_boundary_suffix": "It is not consent confirmation, a send, schedule, feature-flag change, launch, delivery, exposure, outcome, or causal evidence.",
+            "actions": [
+                {"id": "prepare_lifecycle_growth", "label": "Prepare lifecycle plan", "style": "primary"},
+                {"id": "prepare_data_analysis_card", "label": "Prepare baseline analysis", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["define_target_behavior_baseline_and_owner", "bound_audience_consent_suppression_and_frequency", "design_treatment_holdout_and_actual_exposure", "prepare_approval_gated_readout_and_disposition"],
+            "evidence_not_observed": ["audience eligibility", "consent or suppression confirmation", "message send or schedule", "feature-flag mutation or experiment launch", "delivery, display, action, outcome, or causality"],
+        },
+        "product-discovery-validation": {
+            "kind": "product_discovery_validation",
+            "headline": "I can prepare evidence-bounded product discovery before a PRD or delivery plan.",
+            "body": "I will frame the problem and segment, classify evidence, rank the riskiest assumptions, prepare customer-evidence re-entry and bounded tests, and record a kill, pivot, persevere, or inconclusive decision. This does not recruit or contact participants, create a survey, validate demand, build a prototype, approve a PRD, write code, or launch a product.",
+            "phase": "product_discovery_validation_prepared",
+            "next_action": "prepare_product_discovery_validation",
+            "artifact_schema": "product_discovery_validation_card/v1",
+            "claim_boundary_suffix": "It is not customer contact, customer validation, product-market-fit, PRD acceptance, prototype execution, implementation, or launch evidence.",
+            "actions": [
+                {"id": "prepare_product_discovery_validation", "label": "Prepare discovery validation", "style": "primary"},
+                {"id": "prepare_product_brief", "label": "Prepare product brief", "style": "secondary", "enabled": False},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["frame_problem_segment_owner_and_learning_boundary", "classify_evidence_and_prepare_customer_reentry", "rank_assumptions_and_precommit_tests", "record_decision_before_a_prd"],
+            "evidence_not_observed": ["customer recruitment or contact", "customer evidence re-entry", "validated problem or demand", "product-market fit", "PRD acceptance", "prototype, implementation, or launch"],
+        },
+        "sales-pipeline-review": {
+            "kind": "sales_pipeline_review",
+            "headline": "I can prepare an evidence-bounded pipeline health, forecast, and follow-up review.",
+            "body": "I will validate the supplied snapshot's freshness and definitions, separate stage, seller forecast, scenario, and buyer commitment, then prepare aging, slips, concentration, calibration limits, and owned proposed follow-ups. This does not retrieve CRM data, mutate CRM records, create a seller commitment, book revenue, send outreach, or establish a financial forecast.",
+            "phase": "sales_pipeline_review_prepared",
+            "next_action": "prepare_sales_pipeline_review",
+            "artifact_schema": "sales_pipeline_review_card/v1",
+            "claim_boundary_suffix": "It is not CRM retrieval or mutation, seller commitment, outreach, revenue, authoritative forecast, approval, or customer outcome evidence.",
+            "actions": [
+                {"id": "prepare_sales_pipeline_review", "label": "Prepare pipeline review", "style": "primary"},
+                {"id": "prepare_sales_development", "label": "Prepare account follow-up", "style": "secondary"},
+                {"id": "show_status", "label": "Show status", "style": "secondary"},
+            ],
+            "recommended_flow": ["validate_snapshot_freshness_and_definitions", "assess_movement_aging_slips_and_concentration", "separate_seller_forecast_scenarios_and_commitment", "prepare_owned_followups_without_crm_mutation"],
+            "evidence_not_observed": ["CRM retrieval or mutation", "source freshness confirmation", "buyer commitment", "seller forecast calibration", "outreach or follow-up completion", "revenue or customer outcome"],
+        },
+    }
+)
+
+
+def _ack_actions_for_next_action(next_action: str) -> list[dict[str, object]]:
+    actions: list[dict[str, object]] = []
+    primary = _ACK_PRIMARY_ACTIONS_BY_NEXT_ACTION.get(next_action)
+    if primary:
+        actions.append(_action(primary[0], primary[1], "primary"))
+    status_action = "show_memory_status" if next_action in {"prepare_memory_new", "prepare_memory_sync"} else "show_status"
+    status_label = "Show memory status" if status_action == "show_memory_status" else "Show status"
+    actions.append(_action(status_action, status_label, "secondary"))
+    return actions
+
+
+def build_chat_interaction_payload(
+    event_or_message: dict[str, Any] | str,
+    *,
+    source: str = "generic",
+    mode: str = "auto",
+    limit: int = 3,
+    min_confidence: str = "high",
+    include_message: bool = False,
+    executor_target: str = "choose",
+    source_metadata: dict[str, str] | None = None,
+    main_agent_model: str = "",
+    target_notice: dict[str, object] | None = None,
+    paths: OmhPaths | None = None,
+    skill_policy: dict[str, object] | None = None,
+    platform_context: Mapping[str, Any] | None = None,
+    routing_observation: Mapping[str, object] | None = None,
+    tracker_host_context: Mapping[str, object] | None = None,
+    design_direction_iteration_context: Mapping[str, object] | None = None,
+    hermes_session_id: str = "",
+    _host_project_binding_factory: HostProjectBindingFactory | None = None,
+    _route_question_sink: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    if source not in CHAT_SOURCES:
+        raise ValueError(f"unsupported chat interaction source: {source}")
+    if mode not in INTERACTION_MODES:
+        raise ValueError(f"unsupported chat interaction mode: {mode}")
+    if limit < 1:
+        raise ValueError("chat interact --limit must be at least 1")
+
+    # Build and validate the platform envelope before anything else -- an
+    # unsafe or contradictory context fails closed here, before routing,
+    # rendering, or any persistence the caller may chain onto this payload.
+    platform_envelope = (
+        build_platform_envelope(platform_context, source=source)
+        if platform_context is not None
+        else None
+    )
+
+    tracker_content = (
+        normalize_tracker_content(event_or_message, host_context=tracker_host_context)
+        if isinstance(event_or_message, dict)
+        else None
+    )
+    if tracker_content is not None:
+        return _build_tracker_interaction_payload(
+            tracker_content,
+            source_metadata=_source_metadata(event_or_message, source_metadata),
+            include_message=include_message,
+            target_notice=target_notice,
+        )
+
+    message = extract_message_text(event_or_message)
+    if _can_use_chat_interaction_cache(
+        event_or_message,
+        include_message=include_message,
+        source_metadata=source_metadata,
+        main_agent_model=main_agent_model,
+        target_notice=target_notice,
+        paths=paths,
+        skill_policy=skill_policy,
+        platform_context=platform_context,
+        routing_observation=routing_observation,
+        host_project_binding_factory=_host_project_binding_factory,
+        design_direction_iteration_context=design_direction_iteration_context,
+    ):
+        return _copy_chat_interaction_payload(
+            _build_chat_interaction_payload_cached(
+                message,
+                source,
+                mode,
+                limit,
+                min_confidence,
+                executor_target,
+            )
+        )
+
+    payload = _build_chat_interaction_payload_uncached(
+        event_or_message,
+        source=source,
+        mode=mode,
+        limit=limit,
+        min_confidence=min_confidence,
+        include_message=include_message,
+        executor_target=executor_target,
+        source_metadata=source_metadata,
+        main_agent_model=main_agent_model,
+        target_notice=target_notice,
+        paths=paths,
+        skill_policy=skill_policy,
+        platform_envelope=platform_envelope,
+        host_project_binding_factory=_host_project_binding_factory,
+        design_direction_iteration_context=design_direction_iteration_context,
+        hermes_session_id=hermes_session_id,
+    )
+    if paths is not None:
+        _record_accepted_owner_choice(payload, paths)
+        _record_in_message_named_owner(payload, paths)
+        # The one seam every chat surface with an OMH home passes through, so
+        # `off` withholds the question on the plugin tool, the CLI, and a
+        # wrapper session alike. `shadow` and `unknown` leave the payload as
+        # the router built it.
+        route = payload.get("route")
+        if isinstance(route, dict):
+            reading = read_route_question_mode(paths.omh_home)
+            # Read before the mode applies, so a sink sees the question the
+            # router built even when `off` withholds it. The observation goes
+            # to the caller's list, never into the payload: `shadow` stays the
+            # router's bytes.
+            if _route_question_sink is not None and isinstance(route.get("route_question"), dict):
+                _route_question_sink.append(route_question_observation(route, message, reading))
+            apply_route_question_mode(route, reading["mode"])
+    # Attached at the one point every chat surface passes through -- the plugin
+    # tool's session and no-session paths both land here -- so Slack, Telegram,
+    # Discord, CLI, and desktop all carry the notice from a single seam. The
+    # cached branch above never reaches this: it requires `paths is None`, and
+    # without an OMH home there is no brief to read.
+    if paths is not None:
+        # Its sentence takes the language of the person's own words.
+        payload = _with_memory_consolidation_notice(
+            payload, paths, person_request_text(message, messaging=source in MESSAGING_CHAT_SOURCES)
+        )
+    if routing_observation is not None:
+        payload = enhance_chat_interaction_with_routing_observation(payload, routing_observation)
+    return payload
+
+
+def _build_tracker_interaction_payload(
+    envelope: dict[str, object],
+    *,
+    source_metadata: dict[str, str],
+    include_message: bool,
+    target_notice: dict[str, object] | None,
+) -> dict[str, object]:
+    """Project a tracker event without ever promoting its body to chat authority."""
+    route = public_chat_route_payload(
+        "$github-event-ops",
+        source="github",
+        include_message=False,
+    )
+    base = _base_interaction(
+        "GitHub tracker event",
+        source="github",
+        source_metadata=source_metadata,
+        mode="route",
+        include_message=False,
+    )
+    base["route"] = route
+    base["tracker_content"] = envelope
+    state = str(envelope.get("state", "blocked"))
+    base["tracker_scope_acceptance"] = {
+        "schema_version": "tracker_scope_acceptance/v1",
+        "state": "required" if state == "accepted" else state,
+        "coding_enabled": False,
+        "claim_boundary": (
+            "A host-observed scope decision is required before any separate coding handoff; "
+            "tracker content cannot provide that decision."
+        ),
+    }
+    base["chat_response"] = build_chat_response_from_route(
+        route,
+        thread_key=str(base["thread_key"]),
+        message="GitHub tracker event",
+        include_message=False,
+    )
+    base["next_action"] = "prepare_github_event_ops_card"
+    if include_message:
+        base["tracker_content"]["message_projection_suppressed"] = True
+    return _finish_interaction(base, target_notice)
+
+
+def _record_accepted_owner_choice(payload: Mapping[str, object], paths: OmhPaths) -> None:
+    """Persist a safe explicit picker acceptance after routing has completed."""
+    resolution = payload.get("executor_resolution")
+    decision = payload.get("coding_route_decision")
+    delegation = payload.get("delegation")
+    if (
+        not isinstance(resolution, Mapping)
+        or resolution.get("source") != "explicit"
+        or not isinstance(decision, Mapping)
+        or decision.get("source") != "request_named_executor"
+        or decision.get("owner_preference_reason_code") != "owner_named_in_request"
+        or not isinstance(delegation, Mapping)
+    ):
+        return
+    selected_owner = str(delegation.get("selected_executor_profile", "") or "")
+    route_family = str(decision.get("owner_preference_route_family", "") or "")
+    if not selected_owner or selected_owner != resolution.get("resolved_executor_target") or not route_family:
+        return
+    updated = record_accepted_explicit_choice(
+        read_owner_preference(paths),
+        route_family=route_family,
+        selected_owner=selected_owner,
+        occurred_at=datetime.now(timezone.utc).isoformat(),
+    )
+    write_owner_preference(paths, updated)
+
+
+def _record_in_message_named_owner(payload: Mapping[str, object], paths: OmhPaths) -> None:
+    """Persist an in-message CLI naming as explicit-choice provenance.
+
+    Naming is choosing: when routing resolved an external coding CLI because
+    the user named that CLI in their own message, the naming is recorded by
+    the in-message explicit-choice writer at the resolution site, so no card
+    or prepared handoff ever carries an external owner without recorded
+    explicit-choice provenance. Only the routing cue (for example
+    ``named_executor:codex``) is stored — never the message prose.
+    """
+    resolution = payload.get("executor_resolution")
+    decision = payload.get("coding_route_decision")
+    delegation = payload.get("delegation")
+    if (
+        not isinstance(resolution, Mapping)
+        or resolution.get("source") != "message_mention"
+        or not isinstance(decision, Mapping)
+        or decision.get("source") != "request_named_executor"
+        or decision.get("owner_preference_reason_code") != "owner_named_in_request"
+        or not isinstance(delegation, Mapping)
+    ):
+        return
+    selected_owner = str(delegation.get("selected_executor_profile", "") or "")
+    route_family = str(decision.get("owner_preference_route_family", "") or "")
+    if (
+        selected_owner not in EXTERNAL_CLI_PROFILES
+        or selected_owner != resolution.get("resolved_executor_target")
+        or not route_family
+    ):
+        return
+    matched_cues = decision.get("matched_cues")
+    cues = matched_cues if isinstance(matched_cues, (list, tuple)) else ()
+    naming_cue = next(
+        (str(cue) for cue in cues if str(cue) == f"named_executor:{selected_owner}"),
+        "",
+    )
+    if not naming_cue:
+        return
+    updated = record_in_message_explicit_naming(
+        read_owner_preference(paths),
+        route_family=route_family,
+        selected_owner=selected_owner,
+        naming_cue=naming_cue,
+        occurred_at=datetime.now(timezone.utc).isoformat(),
+    )
+    write_owner_preference(paths, updated)
+
+
+def _can_use_chat_interaction_cache(
+    event_or_message: dict[str, Any] | str,
+    *,
+    include_message: bool,
+    source_metadata: dict[str, str] | None,
+    main_agent_model: str,
+    target_notice: dict[str, object] | None,
+    paths: OmhPaths | None,
+    skill_policy: dict[str, object] | None,
+    platform_context: Mapping[str, Any] | None,
+    routing_observation: Mapping[str, object] | None,
+    host_project_binding_factory: HostProjectBindingFactory | None,
+    design_direction_iteration_context: Mapping[str, object] | None = None,
+) -> bool:
+    return (
+        isinstance(event_or_message, str)
+        and not include_message
+        and source_metadata is None
+        and not main_agent_model
+        and target_notice is None
+        and paths is None
+        and skill_policy is None
+        and platform_context is None
+        and routing_observation is None
+        and host_project_binding_factory is None
+        and design_direction_iteration_context is None
+    )
+
+
+def _copy_chat_interaction_payload(payload: dict[str, object]) -> dict[str, object]:
+    copied = dict(payload)
+    handled = {
+        "source_metadata",
+        "overclaim_guard",
+        "route",
+        "executor_resolution",
+        "chat_response",
+    }
+
+    source_metadata = copied.get("source_metadata")
+    if isinstance(source_metadata, dict):
+        copied["source_metadata"] = dict(source_metadata)
+
+    overclaim_guard = copied.get("overclaim_guard")
+    if isinstance(overclaim_guard, list):
+        copied["overclaim_guard"] = list(overclaim_guard)
+
+    route = copied.get("route")
+    if isinstance(route, dict):
+        copied["route"] = _copy_chat_interaction_route(route)
+
+    executor_resolution = copied.get("executor_resolution")
+    if isinstance(executor_resolution, dict):
+        copied["executor_resolution"] = dict(executor_resolution)
+
+    response = copied.get("chat_response")
+    if isinstance(response, dict):
+        copied["chat_response"] = _copy_chat_response_payload(response)
+
+    for key, value in list(copied.items()):
+        if key in handled:
+            continue
+        if isinstance(value, dict):
+            copied[key] = _clone_static_dict(value)
+        elif isinstance(value, list):
+            copied[key] = _clone_static_payload(value)
+    return copied
+
+
+def _copy_chat_interaction_route(route: dict[str, object]) -> dict[str, object]:
+    copied = dict(route)
+    recommendations = route.get("recommendations")
+    copied["recommendations"] = _copy_recommendation_list(recommendations)
+
+    route_explanation = route.get("route_explanation")
+    if isinstance(route_explanation, dict):
+        copied["route_explanation"] = _copy_workflow_explanation_like(route_explanation)
+
+    workflow_route_plan = route.get("workflow_route_plan")
+    if isinstance(workflow_route_plan, dict):
+        copied["workflow_route_plan"] = _copy_workflow_route_plan_payload(workflow_route_plan)
+
+    for key in ("task_card", "learning_candidate_card"):
+        value = route.get(key)
+        if isinstance(value, dict):
+            copied[key] = _clone_static_dict(value)
+    return copied
+
+
+def _copy_chat_response_payload(response: dict[str, object]) -> dict[str, object]:
+    copied = dict(response)
+    state = response.get("state")
+    if isinstance(state, dict):
+        copied["state"] = _copy_chat_response_state(state)
+
+    usage_trace = response.get("usage_trace")
+    if isinstance(usage_trace, dict):
+        copied["usage_trace"] = dict(usage_trace)
+
+    messenger_rendering = response.get("messenger_rendering")
+    if isinstance(messenger_rendering, dict):
+        copied["messenger_rendering"] = _copy_messenger_rendering_payload(messenger_rendering)
+
+    # The gate carries a nested `fields` dict and a `roster` list of dicts, so
+    # the shallow `dict(response)` above would hand every cached caller the same
+    # objects. Same aliasing class `chunked_body_texts` was fixed for.
+    message_gate = response.get("message_gate")
+    if isinstance(message_gate, dict):
+        copied["message_gate"] = _clone_static_dict(message_gate)
+
+    actions = response.get("actions")
+    if isinstance(actions, list):
+        copied["actions"] = _copy_action_list(actions)
+
+    status_card = response.get("status_card")
+    if isinstance(status_card, dict):
+        copied["status_card"] = _clone_static_dict(status_card)
+
+    continuity_briefing = response.get("continuity_briefing")
+    if isinstance(continuity_briefing, dict):
+        copied["continuity_briefing"] = _clone_static_dict(continuity_briefing)
+    return copied
+
+
+def _copy_chat_response_state(state: dict[str, object]) -> dict[str, object]:
+    copied = dict(state)
+
+    for key in (
+        "direct_invocation_aliases",
+        "evidence_not_observed",
+        "recommended_flow",
+        "next_steps",
+        "missing_evidence",
+    ):
+        value = state.get(key)
+        if isinstance(value, list):
+            copied[key] = list(value)
+
+    for key in ("executor_resolution", "source_metadata"):
+        value = state.get(key)
+        if isinstance(value, dict):
+            copied[key] = dict(value)
+
+    workflow_explanation = state.get("workflow_explanation")
+    if isinstance(workflow_explanation, dict):
+        copied["workflow_explanation"] = _copy_workflow_explanation_like(workflow_explanation)
+
+    context_primer = state.get("context_primer")
+    if isinstance(context_primer, dict):
+        copied["context_primer"] = _copy_context_primer_payload(context_primer)
+
+    skill_picker = state.get("skill_picker")
+    if isinstance(skill_picker, dict):
+        copied["skill_picker"] = _copy_skill_picker_payload(skill_picker)
+
+    capability_summary = state.get("capability_summary")
+    if isinstance(capability_summary, dict):
+        copied["capability_summary"] = _copy_catalog_capability_summary_payload(capability_summary)
+
+    for key, value in list(copied.items()):
+        if key in {
+            "direct_invocation_aliases",
+            "evidence_not_observed",
+            "recommended_flow",
+            "next_steps",
+            "missing_evidence",
+            "executor_resolution",
+            "source_metadata",
+            "workflow_explanation",
+            "context_primer",
+            "skill_picker",
+            "capability_summary",
+        }:
+            continue
+        if isinstance(value, dict):
+            copied[key] = _clone_static_dict(value)
+        elif isinstance(value, list):
+            copied[key] = _clone_static_payload(value)
+    return copied
+
+
+def _copy_recommendation_list(value: object) -> list[dict[str, object]]:
+    copied: list[dict[str, object]] = []
+    if not isinstance(value, list):
+        return copied
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        recommendation = dict(item)
+        matched = recommendation.get("matched")
+        recommendation["matched"] = list(matched) if isinstance(matched, list) else []
+        copied.append(recommendation)
+    return copied
+
+
+def _copy_workflow_explanation_like(value: dict[str, object]) -> dict[str, object]:
+    copied = dict(value)
+    not_evidence_yet = value.get("not_evidence_yet")
+    copied["not_evidence_yet"] = list(not_evidence_yet) if isinstance(not_evidence_yet, list) else []
+    context_card = value.get("workflow_context_card")
+    if isinstance(context_card, dict):
+        copied["workflow_context_card"] = _copy_workflow_context_card(context_card)
+    return copied
+
+
+def _copy_workflow_route_plan_payload(value: dict[str, object]) -> dict[str, object]:
+    copied = dict(value)
+    steps = value.get("steps")
+    copied["steps"] = [_copy_route_plan_step(item) for item in steps if isinstance(item, dict)] if isinstance(steps, list) else []
+    stages = value.get("stages")
+    copied["stages"] = list(stages) if isinstance(stages, list) else []
+    return copied
+
+
+def _copy_route_plan_step(step: dict[str, object]) -> dict[str, object]:
+    copied = dict(step)
+    matched = step.get("matched")
+    if isinstance(matched, list):
+        copied["matched"] = list(matched)
+    return copied
+
+
+def _copy_action_list(value: object) -> list[dict[str, object]]:
+    copied: list[dict[str, object]] = []
+    if not isinstance(value, list):
+        return copied
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        action = dict(item)
+        payload = action.get("payload")
+        if isinstance(payload, dict):
+            action["payload"] = _copy_action_payload(payload)
+        copied.append(action)
+    return copied
+
+
+def _copy_action_payload(value: dict[str, object]) -> dict[str, object]:
+    copied = dict(value)
+    handled = {"options", "featured_options", "capability_families", "groups", "input_schema"}
+    if "options" in copied:
+        copied["options"] = _copy_picker_options(value.get("options"))
+    if "featured_options" in copied:
+        copied["featured_options"] = _copy_compact_picker_options(value.get("featured_options"))
+    if "capability_families" in copied:
+        copied["capability_families"] = _copy_family_cards(value.get("capability_families"))
+    if "groups" in copied:
+        copied["groups"] = _copy_picker_groups(value.get("groups"))
+    input_schema = value.get("input_schema")
+    if isinstance(input_schema, dict):
+        copied["input_schema"] = dict(input_schema)
+    for key, item in list(copied.items()):
+        if key in handled:
+            continue
+        if isinstance(item, dict):
+            copied[key] = _clone_static_dict(item)
+        elif isinstance(item, list):
+            copied[key] = _clone_static_payload(item)
+    return copied
+
+
+def _copy_skill_picker_payload(value: dict[str, object]) -> dict[str, object]:
+    copied = dict(value)
+    copied["options"] = _copy_picker_options(value.get("options"))
+    copied["featured_options"] = _copy_compact_picker_options(value.get("featured_options"))
+    copied["capability_families"] = _copy_family_cards(value.get("capability_families"))
+    copied["groups"] = _copy_picker_groups(value.get("groups"))
+    rendering_hints = value.get("rendering_hints")
+    if isinstance(rendering_hints, dict):
+        copied["rendering_hints"] = dict(rendering_hints)
+    return copied
+
+
+def _copy_picker_options(value: object) -> list[dict[str, object]]:
+    copied: list[dict[str, object]] = []
+    if not isinstance(value, list):
+        return copied
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        option = dict(item)
+        payload = option.get("payload")
+        if isinstance(payload, dict):
+            option["payload"] = dict(payload)
+        copied.append(option)
+    return copied
+
+
+def _copy_compact_picker_options(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _copy_picker_groups(value: object) -> list[dict[str, object]]:
+    copied: list[dict[str, object]] = []
+    if not isinstance(value, list):
+        return copied
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        group = dict(item)
+        option_ids = group.get("option_ids")
+        if isinstance(option_ids, list):
+            group["option_ids"] = list(option_ids)
+        group["options"] = _copy_compact_picker_options(group.get("options"))
+        copied.append(group)
+    return copied
+
+
+def _copy_context_primer_payload(value: dict[str, object]) -> dict[str, object]:
+    copied = dict(value)
+    copied["capability_families"] = _copy_family_cards(value.get("capability_families"))
+    copied["workflow_groups"] = _copy_workflow_groups(value.get("workflow_groups"))
+    copied["workflow_context_cards"] = _copy_workflow_context_cards(value.get("workflow_context_cards"))
+    return copied
+
+
+def _copy_catalog_capability_summary_payload(value: dict[str, object]) -> dict[str, object]:
+    copied = dict(value)
+    copied["capability_families"] = _copy_family_cards(value.get("capability_families"))
+    copied["lanes"] = _copy_capability_lanes(value.get("lanes"))
+    copied["workflow_context_cards"] = _copy_workflow_context_cards(value.get("workflow_context_cards"))
+    for key in ("direct_response_guidance", "evidence_boundary"):
+        items = value.get(key)
+        if isinstance(items, list):
+            copied[key] = list(items)
+    return copied
+
+
+def _copy_family_cards(value: object) -> list[dict[str, object]]:
+    copied: list[dict[str, object]] = []
+    if not isinstance(value, list):
+        return copied
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        card = dict(item)
+        primary_workflows = card.get("primary_workflows")
+        if isinstance(primary_workflows, list):
+            card["primary_workflows"] = list(primary_workflows)
+        executor_choices = card.get("executor_choices")
+        if isinstance(executor_choices, list):
+            card["executor_choices"] = list(executor_choices)
+        copied.append(card)
+    return copied
+
+
+def _copy_workflow_groups(value: object) -> list[dict[str, object]]:
+    copied: list[dict[str, object]] = []
+    if not isinstance(value, list):
+        return copied
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        group = dict(item)
+        workflows = group.get("workflows")
+        if isinstance(workflows, (list, tuple)):
+            group["workflows"] = tuple(workflows)
+        copied.append(group)
+    return copied
+
+
+def _copy_workflow_context_cards(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [_copy_compact_workflow_context_card(item) for item in value if isinstance(item, dict)]
+
+
+def _copy_workflow_context_card(value: dict[str, object]) -> dict[str, object]:
+    copied = dict(value)
+    for key in ("representative_workflows", "user_examples", "not_evidence_until_observed"):
+        copied[key] = _copy_string_items(value.get(key))
+    return copied
+
+
+def _copy_compact_workflow_context_card(value: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": str(value.get("id", "")),
+        "label": str(value.get("label", "")),
+        "user_signal": _trim_catalog_text(value.get("user_signal"), 96),
+        "omh_pattern": _trim_catalog_text(value.get("omh_pattern"), 112),
+        "representative_workflows": _copy_string_items(value.get("representative_workflows")),
+        "user_examples": _copy_string_items(value.get("user_examples"), limit=1),
+        "first_response_shape": _trim_catalog_text(value.get("first_response_shape"), 140),
+        "not_evidence_until_observed": _copy_string_items(value.get("not_evidence_until_observed")),
+    }
+
+
+def _copy_string_items(value: object, *, limit: int | None = None) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    items = [item for item in value if isinstance(item, str) and item]
+    return items if limit is None else items[:limit]
+
+
+def _trim_catalog_text(value: object, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    trimmed = text[:max_chars].rsplit(" ", 1)[0].strip()
+    return trimmed or text[:max_chars].strip()
+
+
+def _copy_capability_lanes(value: object) -> list[dict[str, object]]:
+    copied: list[dict[str, object]] = []
+    if not isinstance(value, list):
+        return copied
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        lane = dict(item)
+        for key in ("primary_skills", "wrapper_actions", "examples"):
+            items = lane.get(key)
+            if isinstance(items, list):
+                lane[key] = list(items)
+        playbooks = lane.get("representative_playbooks")
+        if isinstance(playbooks, list):
+            lane["representative_playbooks"] = _copy_representative_playbooks(playbooks)
+        copied.append(lane)
+    return copied
+
+
+def _copy_representative_playbooks(value: list[object]) -> list[dict[str, object]]:
+    copied: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        playbook = dict(item)
+        first_stage = playbook.get("first_stage")
+        if isinstance(first_stage, dict):
+            playbook["first_stage"] = dict(first_stage)
+        copied.append(playbook)
+    return copied
+
+
+def _copy_messenger_rendering_payload(value: dict[str, object]) -> dict[str, object]:
+    copied = dict(value)
+    for key in ("body_blocks", "fallback_body_blocks"):
+        blocks = value.get(key)
+        if isinstance(blocks, list):
+            copied[key] = [dict(block) for block in blocks if isinstance(block, dict)]
+    for key in (
+        "preferred_blocks",
+        "avoid_blocks",
+        "transforms_applied",
+        "fallback_transforms_applied",
+        "chunked_body_texts",
+        "follow_up_texts",
+    ):
+        items = value.get(key)
+        if isinstance(items, list):
+            copied[key] = list(items)
+    chunking = value.get("chunking")
+    if isinstance(chunking, dict):
+        copied["chunking"] = dict(chunking)
+        split_on = chunking.get("split_on")
+        if isinstance(split_on, list):
+            copied["chunking"]["split_on"] = list(split_on)
+    for key in ("prefix_policy", "platform_hints"):
+        item = value.get(key)
+        if isinstance(item, dict):
+            copied[key] = dict(item)
+    for key in ("capabilities", "omh_message_gate", "adapter_payload"):
+        item = value.get(key)
+        if isinstance(item, dict):
+            copied[key] = deepcopy(item)
+    # `density_policy` nests a list, so a flat `dict()` would still alias it.
+    density_policy = value.get("density_policy")
+    if isinstance(density_policy, dict):
+        copied["density_policy"] = dict(density_policy)
+        avoid = density_policy.get("avoid")
+        if isinstance(avoid, list):
+            copied["density_policy"]["avoid"] = list(avoid)
+    return copied
+
+
+@lru_cache(maxsize=2048)
+def _build_chat_interaction_payload_cached(
+    message: str,
+    source: str,
+    mode: str,
+    limit: int,
+    min_confidence: str,
+    executor_target: str,
+) -> dict[str, object]:
+    return _build_chat_interaction_payload_uncached(
+        message,
+        source=source,
+        mode=mode,
+        limit=limit,
+        min_confidence=min_confidence,
+        include_message=False,
+        executor_target=executor_target,
+        source_metadata=None,
+        main_agent_model="",
+        target_notice=None,
+        paths=None,
+        skill_policy=None,
+        host_project_binding_factory=None,
+    )
+
+
+def _build_chat_interaction_payload_uncached(
+    event_or_message: dict[str, Any] | str,
+    *,
+    source: str,
+    mode: str,
+    limit: int,
+    min_confidence: str,
+    include_message: bool,
+    executor_target: str,
+    source_metadata: dict[str, str] | None,
+    main_agent_model: str,
+    target_notice: dict[str, object] | None,
+    paths: OmhPaths | None,
+    skill_policy: dict[str, object] | None,
+    platform_envelope: dict[str, Any] | None = None,
+    host_project_binding_factory: HostProjectBindingFactory | None,
+    design_direction_iteration_context: Mapping[str, object] | None = None,
+    hermes_session_id: str = "",
+) -> dict[str, object]:
+    turn_text = extract_message_text(event_or_message)
+    # The wrapper's own decisions below (mode, catalog picker, intro, status,
+    # command preview, the executor named in the message, the loop card) read
+    # the person's own words: a messaging gateway's trigger note, reply
+    # pointer, backfill and sender prefix are Hermes' material, and a reply's
+    # quoted text is context, not the request. The turn's own text goes where
+    # the turn is identified or handed on: the router (which decides on the
+    # person's words itself and renders its routing prompt and question digest
+    # from the turn), the message hash, length and thread key, the coding
+    # handoff, and the plan's statement. The handoff is built from the whole
+    # turn, as before, so its safety preflight judges exactly what it carries;
+    # the plan is decided on the words. A slash skill of OMH's own is handed
+    # on as the invocation typed (`handed_on_text`): the skill body Hermes
+    # loaded is its instruction to its own agent, not the person's context.
+    message = person_request_text(turn_text, messaging=source in MESSAGING_CHAT_SOURCES)
+    handoff_text = handed_on_text(turn_text)
+    metadata = _source_metadata(event_or_message, source_metadata)
+    # Files the platform attached to the message are declared media inputs
+    # (name and media type only, never bytes); the coding handoff below has
+    # to prove the selected route can take each modality before it dispatches.
+    input_representation = merged_input_representation(
+        input_representations_from_attachments(extract_event_attachments(event_or_message))
+    )
+    route_payload = public_chat_route_payload(
+        turn_text,
+        source=source,
+        limit=limit,
+        min_confidence=min_confidence,
+        include_message=include_message,
+        skill_policy=skill_policy,
+        active_design_direction_iteration=design_direction_iteration_context,
+    )
+    resolved_mode = _resolve_mode(mode, route_payload, message=message)
+    domain_context = None
+    if resolved_mode == "clarify":
+        domain_context = resolve_attached_domain_context(
+            route_payload,
+            message,
+            host_project_binding_factory=host_project_binding_factory,
+            resolver=resolve_domain_routing_context_result,
+        )
+    orchestration_guidance = build_omh_orchestration_guidance(
+        route_payload,
+        source_metadata=metadata,
+        paths=paths,
+    )
+    base = _base_interaction(turn_text, source=source, source_metadata=metadata, mode=resolved_mode, include_message=include_message)
+    if platform_envelope is not None:
+        # One seam: every downstream card and the session store read
+        # base["thread_key"], so the platform-identity key is installed here,
+        # immediately after the legacy base derivation. The legacy key just
+        # computed by _base_interaction is passed through so the
+        # event-fallback path reuses it exactly -- including its message-hash
+        # event substitute -- instead of re-deriving one from an empty
+        # message.
+        base["thread_key"] = _platform_thread_key(
+            source,
+            platform_envelope,
+            metadata,
+            legacy_thread_key=str(base["thread_key"]),
+        )
+        base["platform"] = platform_envelope
+    is_catalog_question = _is_generic_skill_catalog_route(message, route_payload)
+    if is_catalog_question and _route_recommendation_next_action(route_payload) != "show_command_preview":
+        route_payload = _catalog_question_route_payload(route_payload)
+    base["route"] = route_payload
+    if not _is_omh_intro_question(message) and not is_catalog_question:
+        base["omh_orchestration_guidance"] = orchestration_guidance
+    if isinstance(route_payload.get("task_card"), dict):
+        base["task_card"] = route_payload["task_card"]
+    learning_candidate_card = build_learning_candidate_card(
+        message,
+        source=source,
+        source_metadata=metadata,
+        selected_workflow=str(route_payload.get("selected_skill", "")),
+        selected_harness=str(route_payload.get("selected_harness", "")),
+        thread_key=str(base["thread_key"]),
+    )
+    if (
+        learning_candidate_card
+        and route_payload.get("selected_skill") == "workflow-learning"
+        and learning_candidate_card.get("recommended_workflow") != "workflow-learning"
+    ):
+        learning_candidate_card = None
+    if learning_candidate_card:
+        base["learning_candidate_card"] = learning_candidate_card
+        route_payload["learning_candidate_card"] = learning_candidate_card
+    goal_quality_coaching_card = build_goal_quality_coaching_card(message)
+    if goal_quality_coaching_card:
+        base["goal_quality_coaching_card"] = goal_quality_coaching_card
+
+    # A loop on a timer and a turn Hermes wrote for its own session command
+    # are answered as the route says; their text is never a question about
+    # OMH's intro, quickstart, or status, as it is never a catalog question.
+    # Neither is a question about an invoked skill ("/omh-plan 这是什么"): it
+    # asks about that skill, and the route answers it. An invoked skill's
+    # `omh-` label is no question about OMH either, so the intro and
+    # quickstart read the words after it ("/omh-paper-learning what is it?"
+    # runs paper-learning).
+    answered_as_routed = _is_loop_timer_answer(route_payload) or host_command_turn(message)
+    asks_the_invoked_skill = invoked_skill_stops_or_asks(message) and not invoked_skill_asks_status(message)
+    omh_question = invoked_skill_instruction(message) or message
+    if (
+        _is_omh_intro_question(omh_question)
+        and not answered_as_routed
+        and not asks_the_invoked_skill
+        and resolved_mode in {"route", "plan", "clarify"}
+    ):
+        base["mode"] = "route"
+        base["route"] = _omh_intro_route_payload(route_payload)
+        base["chat_response"] = build_chat_response_from_omh_context_brief(
+            message,
+            source=source,
+            thread_key=str(base["thread_key"]),
+        )
+        base["next_action"] = str(_nested(base["chat_response"], "state").get("next_action", "show_context_brief"))
+        return _finish_interaction(base, target_notice)
+
+    if (
+        _is_omh_quickstart_question(omh_question)
+        and not answered_as_routed
+        and not asks_the_invoked_skill
+        and resolved_mode in {"route", "plan", "clarify"}
+    ):
+        base["mode"] = "status"
+        base["route"] = _omh_quickstart_route_payload(route_payload)
+        base["chat_response"] = build_chat_response_from_omh_quickstart(
+            paths or resolve_paths(),
+            source=source,
+            thread_key=str(base["thread_key"]),
+        )
+        base["next_action"] = str(_nested(base["chat_response"], "state").get("next_action", "show_quickstart"))
+        return _finish_interaction(base, target_notice)
+
+    if (
+        (_is_omh_status_question(message) or invoked_skill_asks_status(message))
+        and str(route_payload.get("selected_skill", "")) == _ROUTER_SKILL
+        and not answered_as_routed
+        and resolved_mode in {"route", "plan", "clarify"}
+    ):
+        base["mode"] = "status"
+        base["route"] = _omh_status_route_payload(route_payload)
+        base["chat_response"] = build_chat_response_from_omh_status_roadmap(
+            paths or resolve_paths(),
+            thread_key=str(base["thread_key"]),
+        )
+        base["next_action"] = str(_nested(base["chat_response"], "state").get("next_action", "show_status"))
+        return _finish_interaction(base, target_notice)
+
+    if resolved_mode == "route" and _is_command_preview_invocation(message):
+        base["chat_response"] = build_chat_response_from_route(
+            route_payload,
+            thread_key=str(base["thread_key"]),
+            message=message,
+            include_message=include_message,
+        )
+        base["next_action"] = str(_nested(base["chat_response"], "state").get("next_action", "show_command_preview"))
+        return _finish_interaction(base, target_notice)
+
+    resolved_executor_target, executor_resolution = _resolve_delegate_executor_target(executor_target, paths, message=message)
+
+    if resolved_mode == "delegate":
+        delegation = build_coding_delegation_payload(
+            handoff_text,
+            source=source,
+            limit=limit,
+            include_message=include_message,
+            source_metadata=metadata,
+            executor_target=resolved_executor_target,
+            main_agent_model=main_agent_model,
+            memory_recall_pack=memory_recall_pack_for_handoff(
+                paths,
+                handoff_text,
+                executor_target=resolved_executor_target,
+                surface_class=memory_surface_for_source(source),
+                hermes_session_id=hermes_session_id,
+            )
+            if paths
+            else None,
+            capability_snapshot_directory=(paths.omh_home / "coding" / "executor-capability-snapshots") if paths else None,
+            model_recommendation=_resolved_hermes_model_recommendation(
+                resolved_executor_target,
+                paths,
+            ),
+            input_representation=input_representation,
+        )
+        if paths:
+            record_attached_recall_usage(paths, delegation)
+        delegation["executor_resolution"] = executor_resolution
+        delegation["route_decision"] = route_payload.get("route_decision", {})
+        coding_route_decision = _coding_route_decision_for_delegation(message, executor_resolution, paths)
+        delegation["coding_route_decision"] = coding_route_decision
+        _attach_executor_choice_context(delegation, paths)
+        base["delegation"] = delegation
+        base["executor_resolution"] = executor_resolution
+        base["coding_route_decision"] = coding_route_decision
+        agentic_playbook = delegation.get("agentic_playbook")
+        if isinstance(agentic_playbook, dict):
+            base["agentic_playbook"] = agentic_playbook
+        base["next_action"] = _delegation_next_action(delegation)
+        base["chat_response"] = build_chat_response_from_delegation(delegation, thread_key=str(base["thread_key"]))
+        if _nested(delegation, "delegation").get("action") == "delegate":
+            base["chat_response"]["continuity_briefing"] = build_continuity_briefing(delegation)
+        return _finish_interaction(base, target_notice)
+
+    if resolved_mode == "clarify" or route_payload["action"] != "dispatch":
+        applied_domain_context: dict[str, object] | None = None
+        if isinstance(domain_context, dict):
+            attached_context = domain_context.get("domain_routing_context")
+            if isinstance(attached_context, dict):
+                applied_domain_context = attached_context
+        base["chat_response"] = build_chat_response_from_route(
+            route_payload,
+            thread_key=str(base["thread_key"]),
+            message=message,
+            include_message=include_message,
+            domain_routing_context=applied_domain_context,
+        )
+        agentic_playbook = maybe_build_agentic_playbook(message, route_payload=route_payload)
+        if agentic_playbook:
+            base["agentic_playbook"] = agentic_playbook
+        base["next_action"] = str(_nested(base["chat_response"], "state").get("next_action", "answer_clarification"))
+        finished = _finish_interaction(base, target_notice)
+        rendered_context = rendered_domain_context_fragment(
+            domain_context,
+            _nested(finished, "chat_response"),
+        )
+        if rendered_context is not None:
+            finished.update(rendered_context)
+        return finished
+
+    if resolved_mode == "route":
+        route_response = build_chat_response_from_route(
+            route_payload,
+            thread_key=str(base["thread_key"]),
+            message=message,
+            include_message=include_message,
+        )
+        if _route_requires_coding_owner(route_payload, route_response, message):
+            return _finish_interaction(
+                _attach_coding_owner_handoff(
+                    base,
+                    message,
+                    turn_text=handoff_text,
+                    source=source,
+                    limit=limit,
+                    include_message=include_message,
+                    source_metadata=metadata,
+                    main_agent_model=main_agent_model,
+                    resolved_executor_target=resolved_executor_target,
+                    executor_resolution=executor_resolution,
+                    route_payload=route_payload,
+                    paths=paths,
+                    input_representation=input_representation,
+                    hermes_session_id=hermes_session_id,
+                ),
+                target_notice,
+            )
+        base["chat_response"] = route_response
+        base["next_action"] = str(_nested(base["chat_response"], "state").get("next_action", "dispatch_to_workflow"))
+        loop_start_card = _nested(_nested(base["chat_response"], "state"), "loop_start_card")
+        if loop_start_card:
+            base["loop_start_card"] = loop_start_card
+        return _finish_interaction(base, target_notice)
+
+    plan = build_hermes_plan_payload(
+        message,
+        source=source,
+        limit=limit,
+        source_metadata=metadata,
+        executor_target=resolved_executor_target,
+    )
+    # Planned on the person's words; its statement is the whole turn, because
+    # the plan artifact is what a coding owner receives once it is accepted.
+    plan_statement = _nested(plan, "plan")
+    if plan_statement.get("task_statement"):
+        plan_statement["task_statement"] = handoff_text
+    if _plan_has_coding_delegate(plan):
+        coding_delegate = _nested(_nested(plan, "wrapper_contract"), "coding_delegate")
+        coding_delegate["executor_resolution"] = executor_resolution
+        base["executor_resolution"] = executor_resolution
+    base["plan"] = _public_plan_payload(plan, include_message=include_message)
+    contract = _nested(plan, "wrapper_contract")
+    coding_delegate = _nested(contract, "coding_delegate")
+    agentic_playbook = maybe_build_agentic_playbook(
+        message,
+        route_payload=route_payload,
+        delegation_payload=coding_delegate if coding_delegate else None,
+    )
+    if agentic_playbook:
+        base["agentic_playbook"] = agentic_playbook
+    next_action = str(contract.get("next_action", "present_plan"))
+    base["next_action"] = "present_plan" if next_action == "prepare_coding_delegation_after_plan_acceptance" else next_action
+    base["chat_response"] = build_chat_response_from_plan(plan, thread_key=str(base["thread_key"]))
+    return _finish_interaction(base, target_notice)
+
+
+def _resolve_delegate_executor_target(executor_target: str, paths: OmhPaths | None, *, message: str = "") -> tuple[str, dict[str, object]]:
+    requested = str(executor_target or "choose").strip() or "choose"
+    message_hint = _executor_target_from_message(message)
+    setup_default = "choose"
+    setup_available = False
+    if paths is not None:
+        try:
+            profile = read_setup_profile(paths)
+        except (OSError, ValueError):
+            profile = None
+        if isinstance(profile, dict):
+            candidate = str(profile.get("default_executor", "") or "").strip()
+            if candidate in CODING_EXECUTOR_TARGETS:
+                setup_default = candidate
+                setup_available = True
+
+    if requested != "choose":
+        resolved = requested
+        source = "explicit"
+    elif message_hint:
+        resolved = message_hint
+        source = "message_mention"
+    elif setup_available:
+        resolved = setup_default
+        source = "setup_profile"
+    else:
+        learned = resolve_coding_route_decision(
+            normalized_phrase(message),
+            owner_preference_state=read_owner_preference(paths) if paths else None,
+        )
+        if learned.source == "learned_owner_preference":
+            resolved = learned.selected_owner
+            source = "learned_owner_preference"
+        else:
+            resolved = "choose"
+            source = "caller_default"
+
+    return resolved, {
+        "schema_version": "executor_resolution/v1",
+        "source": source,
+        "requested_executor_target": requested,
+        "message_executor_target": message_hint,
+        "default_executor": setup_default,
+        "resolved_executor_target": resolved,
+        "explicit_override": requested != "choose",
+        "claim_boundary": "Executor default resolution is routing preference only; it is not dispatch, execution, review, CI, or merge evidence.",
+    }
+
+
+@lru_cache(maxsize=4096)
+def _executor_target_from_message(message: str) -> str:
+    lowered = f" {message.lower()} "
+    for target, hints in _MESSAGE_EXECUTOR_HINTS:
+        if any(hint in lowered for hint in hints):
+            return target
+    return ""
+
+
+def _attach_coding_owner_handoff(
+    base: dict[str, object],
+    message: str,
+    *,
+    turn_text: str,
+    source: str,
+    limit: int,
+    include_message: bool,
+    source_metadata: dict[str, str],
+    main_agent_model: str,
+    resolved_executor_target: str,
+    executor_resolution: dict[str, object],
+    route_payload: dict[str, object],
+    paths: OmhPaths | None,
+    input_representation: object = "text_only",
+    hermes_session_id: str = "",
+) -> dict[str, object]:
+    # `message` is the person's words, which the decisions here read; the
+    # handoff carries the whole turn (`turn_text`) as on any other path.
+    delegation = build_coding_delegation_payload(
+        turn_text,
+        source=source,
+        limit=limit,
+        include_message=include_message,
+        source_metadata=source_metadata,
+        executor_target=resolved_executor_target,
+        main_agent_model=main_agent_model,
+        force_coding_handoff=True,
+        # Narrower than `force_coding_handoff` above (which this call always
+        # sets): only "explicit" (an operator/CLI-named owner) and
+        # "message_mention" (named in the chat message text) are a genuine
+        # per-run owner choice. "setup_profile", "learned_owner_preference",
+        # and "caller_default" are resolved defaults, never a choice for this
+        # run, so they never bypass the intent-genre veto.
+        explicit_owner_choice=executor_resolution.get("source") in {"explicit", "message_mention"},
+        preferred_workflow=str(route_payload.get("selected_skill", "")),
+        preferred_workflow_score=_intish(route_payload.get("score", 0)),
+        preserve_preferred_workflow=resolved_executor_target == "hermes",
+        memory_recall_pack=memory_recall_pack_for_handoff(
+            paths,
+            turn_text,
+            executor_target=resolved_executor_target,
+            surface_class=memory_surface_for_source(source),
+            hermes_session_id=hermes_session_id,
+        )
+        if paths
+        else None,
+        capability_snapshot_directory=(paths.omh_home / "coding" / "executor-capability-snapshots") if paths else None,
+        model_recommendation=_resolved_hermes_model_recommendation(
+            resolved_executor_target,
+            paths,
+        ),
+        input_representation=input_representation,
+    )
+    if paths:
+        record_attached_recall_usage(paths, delegation)
+    delegation["executor_resolution"] = executor_resolution
+    delegation["route_decision"] = route_payload.get("route_decision", {})
+    delegation["route_context"] = {
+        "schema_version": "coding_route_context/v1",
+        "selected_skill": route_payload.get("selected_skill", ""),
+        "reason": route_payload.get("reason", ""),
+        "coding_status_request": _route_is_coding_status_request(route_payload),
+        "claim_boundary": "Route context explains why the wrapper shaped this handoff; it is not dispatch or runtime evidence.",
+    }
+    coding_route_decision = _coding_route_decision_for_delegation(message, executor_resolution, paths)
+    delegation["coding_route_decision"] = coding_route_decision
+    _attach_executor_choice_context(delegation, paths)
+    agentic_playbook = delegation.get("agentic_playbook")
+    if isinstance(agentic_playbook, dict):
+        base["agentic_playbook"] = agentic_playbook
+    base["delegation"] = delegation
+    base["executor_resolution"] = executor_resolution
+    base["coding_route_decision"] = coding_route_decision
+    base["next_action"] = _delegation_next_action(delegation)
+    base["chat_response"] = build_chat_response_from_delegation(delegation, thread_key=str(base["thread_key"]))
+    if _nested(delegation, "delegation").get("action") == "delegate":
+        base["chat_response"]["continuity_briefing"] = build_continuity_briefing(delegation)
+    return base
+
+
+def _resolved_hermes_model_recommendation(
+    executor_target: str,
+    paths: OmhPaths | None,
+) -> dict[str, object] | None:
+    # Shared with `omh coding delegate` so both lanes bind the same route.
+    return resolved_hermes_model_recommendation(executor_target, paths)
+
+
+def _attach_executor_choice_context(delegation: dict[str, object], paths: OmhPaths | None) -> None:
+    """Attach cached per-candidate readiness/auth/limit context where a choice is live.
+
+    Only cached readiness state and cheap local markers are read — no
+    subprocess runs — so the chat lane stays as deterministic as the CLI lane
+    that already attaches the same block.
+
+    The accepted plan travels with it (#810) so the card cannot rank an owner
+    whose required capabilities are recorded unavailable above one that can do
+    the work.
+    """
+    if paths is None:
+        return
+    if not (delegation.get("delegation_policy") or _nested(delegation, "executor_selection").get("choice_required")):
+        return
+    from ..coding.executor_readiness import executor_choice_context
+    from ..coding.owner_fit import accepted_plan_from_delegation
+
+    delegation["executor_choice_context"] = executor_choice_context(
+        paths,
+        plan=accepted_plan_from_delegation(delegation),
+    )
+
+
+def _coding_route_decision_for_delegation(
+    message: str,
+    executor_resolution: dict[str, object],
+    paths: OmhPaths | None = None,
+) -> dict[str, object]:
+    """Return the same four-state coding-owner decision the plugin route hints report.
+
+    `next_action` on this payload stays the wrapper's handoff action. The decision answers
+    the separate question of *who* owns the code, so `choose_executor` no longer has to
+    mean both "Hermes resolved a compatible route" and "the user must pick".
+    """
+    return coding_route_decision_payload(
+        resolve_coding_route_decision(
+            normalized_phrase(message),
+            requested_owner=str(executor_resolution.get("requested_executor_target", "") or ""),
+            recorded_owner=str(executor_resolution.get("default_executor", "") or ""),
+            owner_preference_state=read_owner_preference(paths) if paths else None,
+        )
+    )
+
+
+def _owner_preference_state(delegation: Mapping[str, object]) -> dict[str, object]:
+    decision = _nested(delegation, "coding_route_decision")
+    return {
+        key: value
+        for key, value in decision.items()
+        if key.startswith("owner_preference_")
+    }
+
+
+def _append_owner_preference_actions(
+    actions: list[dict[str, object]],
+    delegation: Mapping[str, object],
+    *,
+    before_last: bool = False,
+) -> None:
+    decision = _nested(delegation, "coding_route_decision")
+    if not decision.get("owner_preference_override_available"):
+        actions.append(_action("choose_executor", "Change coding agent", "secondary"))
+        return
+    owner_actions = [
+        _action("choose_executor", "Override learned coding agent", "secondary"),
+        _action(
+            "reset_coding_owner_preference",
+            "Reset learned coding agent",
+            "secondary",
+            payload={"route_family": decision.get("owner_preference_route_family", "")},
+        ),
+    ]
+    insertion = max(0, len(actions) - 1) if before_last else len(actions)
+    actions[insertion:insertion] = owner_actions
+
+
+def _delegation_next_action(delegation: dict[str, object]) -> str:
+    action = str(_nested(delegation, "delegation").get("action", "fallback"))
+    if _nested(delegation, "action_gate").get("outcome") == "deny":
+        return "route_coding_request"
+    if action == "delegate" and _delegation_is_coding_status_request(delegation):
+        return "show_coding_handoff_status"
+    if action == "delegate" and delegation.get("executor_handoff"):
+        return "send_to_executor"
+    if action == "delegate" and delegation.get("runtime_handoff"):
+        return "show_runtime_handoff"
+    if action == "delegate" and delegation.get("prompt_handoff"):
+        return "show_prompt_handoff"
+    if action == "delegate" and _nested(delegation, "executor_selection").get("choice_required"):
+        return "choose_executor"
+    if action == "clarify":
+        return "answer_clarification"
+    return "route_coding_request"
+
+
+def _route_requires_coding_owner(route_payload: dict[str, object], route_response: dict[str, object], message: str) -> bool:
+    if str(route_payload.get("action", "")) != "dispatch":
+        return False
+    selected = str(route_payload.get("selected_skill", "") or _nested(route_response, "state").get("selected_workflow", ""))
+    policy_next_action = str(_nested(route_response, "state").get("policy_next_action", ""))
+    if _route_is_coding_status_request(route_payload) and not _executor_target_from_message(message):
+        return False
+    if selected in _CODING_OWNER_WORKFLOWS:
+        return True
+    if policy_next_action in _CODING_OWNER_NEXT_ACTIONS:
+        return True
+    if selected in _CODING_OWNER_WHEN_CODE_SHAPED:
+        return is_coding_shaped_task(message)
+    return False
+
+
+def _route_is_delivery_capability_request(route_payload: dict[str, object]) -> bool:
+    """A route that lands on ultrawork's delivery-boundary capability.
+
+    Two producers mark it: a retired-engine alias resolution selecting
+    `delivery_boundary`, or the delivery-shaped routing guards that used to
+    prefer `ultraprocess` (#954 stage 5).
+    """
+    alias_resolution = route_payload.get("alias_resolution")
+    if isinstance(alias_resolution, dict) and (
+        alias_resolution.get("selected_capability") == "delivery_boundary"
+    ):
+        return True
+    recommendations = route_payload.get("recommendations", [])
+    if not isinstance(recommendations, list):
+        return False
+    for recommendation in recommendations:
+        if not isinstance(recommendation, dict):
+            continue
+        matched = {str(item) for item in recommendation.get("matched", []) if str(item)}
+        if {
+            "guard:direct_coding_task",
+            "guard:delivery_cycle_before_research_only",
+            "guard:named_coding_agent_delivery",
+        } & matched:
+            return True
+    return False
+
+
+# What a research card carries when the request is point-in-time: the receipt
+# every historical claim must cite, the two-surface split a then-versus-now
+# answer keeps, and the gap shape an unbacked claim falls into. Constants, not
+# observations -- the card prepares the contract, it retrieves nothing.
+_POINT_IN_TIME_RESEARCH_STATE: dict[str, object] = {
+    "receipt_schema": TEMPORAL_SOURCE_RECEIPT_SCHEMA_VERSION,
+    "surfaces_schema": TEMPORAL_EVIDENCE_SURFACES_SCHEMA_VERSION,
+    "gap_schema": TEMPORAL_RETRIEVAL_GAP_SCHEMA_VERSION,
+    "historical_claims_require_receipt": True,
+    "live_page_is_historical_evidence": False,
+    "missing_capture_resolution": "abstain_with_unresolved_annex_gap",
+    "network_action": "none",
+}
+
+
+def _route_is_realtime_voice_connector_request(route_payload: dict[str, object]) -> bool:
+    """Whether the connector question is about a realtime voice stack.
+
+    The router marks these with one direct label, so the card reads the
+    decision rather than re-matching the message and drifting from routing.
+    """
+    for recommendation in route_payload.get("recommendations", []):
+        if not isinstance(recommendation, dict):
+            continue
+        matched = {str(item) for item in recommendation.get("matched", []) if str(item)}
+        if "direct:realtime_voice_connector_readiness" in matched:
+            return True
+    return False
+
+
+def _route_is_point_in_time_web_request(route_payload: dict[str, object]) -> bool:
+    for recommendation in route_payload.get("recommendations", []):
+        if not isinstance(recommendation, dict):
+            continue
+        matched = {str(item) for item in recommendation.get("matched", []) if str(item)}
+        if POINT_IN_TIME_WEB_GUARD.matched_label in matched:
+            return True
+    return False
+
+
+def _route_is_coding_status_request(route_payload: dict[str, object]) -> bool:
+    reason = str(route_payload.get("reason", "")).lower()
+    if "coding progress questions" in reason or "progress/status" in reason:
+        return True
+    for recommendation in route_payload.get("recommendations", []):
+        if not isinstance(recommendation, dict):
+            continue
+        matched = {str(item) for item in recommendation.get("matched", []) if str(item)}
+        if {"guard:coding_progress_status", "guard:coding_handoff_status"} & matched:
+            return True
+    return False
+
+
+def _route_is_explicit_hermes_coding_team_request(route_payload: dict[str, object], message: str) -> bool:
+    selected = str(route_payload.get("selected_skill", ""))
+    if selected != "ultrawork":
+        return False
+    for recommendation in route_payload.get("recommendations", []):
+        if not isinstance(recommendation, dict) or str(recommendation.get("skill", "")) != "ultrawork":
+            continue
+        matched = {str(item) for item in recommendation.get("matched", []) if str(item)}
+        if "guard:hermes_coding_team" in matched:
+            return True
+
+    lowered = f" {message.lower()} "
+    team_terms = (
+        "coding team",
+        "team mode",
+        "team runtime",
+        "코딩팀",
+        "코딩 팀",
+        "팀처럼",
+        "팀으로",
+        "팀 모드",
+    )
+    coding_terms = ("coding", "code", "refactor", "implementation", "코딩", "구현", "개발", "리팩터링")
+    return (
+        _executor_target_from_message(message) == "hermes"
+        and any(term in lowered for term in team_terms)
+        and any(term in lowered for term in coding_terms)
+    )
+
+
+def _delegation_is_coding_status_request(delegation_payload: dict[str, object]) -> bool:
+    route_context = _nested(delegation_payload, "route_context")
+    if route_context.get("coding_status_request"):
+        return True
+    for recommendation in delegation_payload.get("recommendations", []):
+        if not isinstance(recommendation, dict):
+            continue
+        matched = {str(item) for item in recommendation.get("matched", []) if str(item)}
+        if "trigger:session" in matched and {"trigger:codex", "trigger:claude", "trigger:coding"} & matched:
+            return True
+    return False
+
+
+def _plan_has_coding_delegate(plan_payload: dict[str, object]) -> bool:
+    coding_delegate = _nested(_nested(plan_payload, "wrapper_contract"), "coding_delegate")
+    return bool(coding_delegate.get("available", False))
+
+
+def build_chat_status_interaction(
+    status_payload: dict[str, Any],
+    *,
+    source: str = "generic",
+    source_metadata: dict[str, str] | None = None,
+) -> dict[str, object]:
+    status_metadata = _nested(status_payload, "source_metadata")
+    metadata = _source_metadata("", {**{str(key): str(value) for key, value in status_metadata.items()}, **(source_metadata or {})})
+    effective_source = source if source != "generic" else str(status_payload.get("source", "generic"))
+    run_id = str(status_payload.get("run_id", ""))
+    thread_key = _thread_key(effective_source, metadata, run_id=run_id)
+    payload: dict[str, object] = {
+        "schema_version": CHAT_INTERACTION_SCHEMA_VERSION,
+        "source": effective_source,
+        "source_metadata": metadata,
+        "message_sha256": "",
+        "message_length": 0,
+        "thread_key": thread_key,
+        "mode": "status",
+        "next_action": status_payload.get("next_action", "show_status"),
+        "status": status_payload,
+        "status_card": build_status_card_from_status(status_payload),
+        "chat_response": build_chat_response_from_status(status_payload, thread_key=thread_key),
+        "redaction_policy": "metadata_only",
+        "overclaim_guard": status_payload.get("overclaim_guard", _default_overclaim_guard()),
+    }
+    return _finish_interaction(payload, None)
+
+
+def build_agent_board_status_interaction(
+    request: AgentBoardRequest, *, source: str = "generic",
+    source_metadata: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Render a validated prepare/status result from the native board bridge.
+
+    This is not a JSON observation intake or grant. Native action arguments stay
+    on the ephemeral tool result, never in wrapper metadata or status actions.
+    """
+    status = deepcopy(request)
+    status["native_action"] = None
+    request_id = status["request_id"]
+    activity = "in_flight" if status["in_flight"] else status["state"]
+    lines = [f"{status['operation']}: {activity}."]
+    if status["reason"]:
+        lines.append(f"Reason: {status['reason']}.")
+    if status["missing_capabilities"]:
+        lines.append("Missing capabilities: " + ", ".join(status["missing_capabilities"]) + ".")
+    for receipt in status["observed_receipts"]:
+        lines.append(f"{receipt['operation']}: {receipt['state']} | task {receipt.get('task_id') or 'not_observed'}.")
+    actions = [_action("refresh_status", "Refresh status", "primary", payload={
+        "tool_name": "omh_agent_board", "arguments": {"action": "status", "request_id": request_id},
+        "execution_policy": "read_only",
+    })]
+    return _work_status_interaction(
+        status=dict(status), source=source, source_metadata=source_metadata,
+        kind="agent_board", headline="Here is the agent board observation.", body="\n".join(lines),
+        state={"agent_board": dict(status), "execution_observed": False,
+               "review_status": "not_observed", "ci_status": "not_observed", "merge_status": "not_observed"},
+        steps=[_status_card_step(status["operation"], status["operation"], activity, request_id)],
+        actions=actions, claim_boundary=status["claim_boundary"],
+    )
+
+
+def build_fanout_status_interaction(
+    paths: OmhPaths, *, fanout_id: str, unit_id: str | None = None,
+    source: str = "generic", source_metadata: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Read current journal evidence; resume is copy-only for an explicit unit.
+
+    The canonical reader checks session/workspace/binary lineage and projects
+    current-attempt capacity and diagnostics. No wrapper receipt substitutes for
+    those checks, and a read never redispatches capacity-blocked work.
+    """
+    from ..coding.fanout_status import project_fanout_status, render_fanout_status_text
+
+    roster: dict[str, object] = project_fanout_status(paths, fanout_id, unit_id=unit_id)
+    argv = ["omh", "coding", "fanout", "status", "--fanout-id", fanout_id]
+    if unit_id is not None:
+        argv.extend(["--unit", unit_id])
+    argv.append("--json")
+    actions = [_action("refresh_status", "Refresh status", "primary", payload={
+        "argv": argv, "execution_policy": "read_only",
+    })]
+    steps: list[dict[str, object]] = []
+    for unit in _as_dict_list(roster["units"]):
+        steps.append(_status_card_step(str(unit["unit_id"]), str(unit["unit_id"]),
+                                       str(unit["lifecycle_state"]), str(unit["run_ref"])))
+        resume: dict[str, object] = _nested(unit, "resume")
+        if unit_id is not None and resume["available"]:
+            actions.append(_action("copy_fanout_resume", "Copy resume command", "secondary", payload={
+                "fanout_id": fanout_id, "unit_id": unit_id, **resume,
+            }))
+    return _work_status_interaction(
+        status=roster, source=source, source_metadata=source_metadata,
+        kind="fanout_status", headline="Here is the observed fanout status.",
+        body=render_fanout_status_text(roster), state={"fanout_status": roster},
+        steps=steps, actions=actions, claim_boundary=str(roster["claim_boundary"]),
+    )
+
+
+def _work_status_interaction(
+    *, status: dict[str, object], source: str, source_metadata: dict[str, str] | None,
+    kind: str, headline: str, body: str, state: dict[str, object],
+    steps: list[dict[str, object]], actions: list[dict[str, object]], claim_boundary: str,
+) -> dict[str, object]:
+    metadata = _source_metadata("", source_metadata)
+    thread_key = _thread_key(source, metadata)
+    card: dict[str, object] = {
+        "schema_version": STATUS_CARD_SCHEMA_VERSION, "run_id": "", "kind": kind,
+        "severity": "info", "headline": headline, "summary": body,
+        "next_action": "refresh_status", "primary_action": "refresh_status",
+        "steps": steps, "claim_boundary": claim_boundary,
+    }
+    response = _chat_response(
+        kind=kind, headline=headline, body=body, phase="status", next_action="refresh_status",
+        thread_key=thread_key, actions=actions, claim_boundary=claim_boundary,
+        extra_state=state, status_card=card,
+    )
+    return _finish_interaction({
+        "schema_version": CHAT_INTERACTION_SCHEMA_VERSION, "source": source,
+        "source_metadata": metadata, "message_sha256": "", "message_length": 0,
+        "thread_key": thread_key, "mode": "status", "next_action": "refresh_status",
+        "status": status, "status_card": card, "chat_response": response,
+        "redaction_policy": "metadata_only", "overclaim_guard": _default_overclaim_guard(),
+    }, None)
+
+
+def _operating_brief_chat_response(
+    *,
+    selected: str,
+    policy_next_action: str,
+    policy: dict[str, object],
+    decision: dict[str, object],
+    action: str,
+    thread_key: str,
+    workflow_explanation_reason: str,
+) -> dict[str, object] | None:
+    if selected in _WORKFLOW_OPERATIONS_CHAT_CARDS:
+        return None
+    workflow = selected if selected in _OPERATING_BRIEF_CHAT_CARDS else _OPERATING_BRIEF_WORKFLOW_BY_NEXT_ACTION.get(policy_next_action, "")
+    if not workflow:
+        return None
+    config = _OPERATING_BRIEF_CHAT_CARDS[workflow]
+    next_action = str(config["next_action"])
+    action_specs = config.get("actions", [])
+    actions = [_action_from_spec(spec) for spec in action_specs if isinstance(spec, dict)]
+    evidence_boundary = str(policy.get("evidence_boundary", "")) or "This prepared operating card is not observed work evidence."
+    extra_state = {
+        "route_action": action,
+        "confidence": decision.get("confidence", "low"),
+        "selected_workflow": workflow,
+        "workflow_explanation_reason": workflow_explanation_reason,
+        "policy_next_action": policy_next_action,
+        "artifact_schema": str(config["artifact_schema"]),
+        "recommended_flow": list(config.get("recommended_flow", [])),
+        "evidence_not_observed": list(config.get("evidence_not_observed", [])),
+    }
+    if workflow == "context":
+        extra_state["frontier_policy"] = decision_frontier_policy()
+    if workflow == "visual-qa":
+        extra_state.update(build_prepared_web_visual_qa_chat_state())
+    return _chat_response(
+        kind=str(config["kind"]),
+        headline=str(config["headline"]),
+        body=str(config["body"]),
+        phase=str(config["phase"]),
+        next_action=next_action,
+        thread_key=thread_key,
+        actions=actions,
+        claim_boundary=evidence_boundary,
+        extra_state=extra_state,
+    )
+
+def _review_quality_chat_response(
+    *,
+    selected: str,
+    policy_next_action: str,
+    policy: dict[str, object],
+    decision: dict[str, object],
+    action: str,
+    thread_key: str,
+    workflow_explanation_reason: str,
+) -> dict[str, object] | None:
+    if selected not in _REVIEW_QUALITY_CHAT_CARDS:
+        return None
+    config = _REVIEW_QUALITY_CHAT_CARDS[selected]
+    next_action = str(config["next_action"])
+    action_specs = config.get("actions", [])
+    actions = [_action_from_spec(spec) for spec in action_specs if isinstance(spec, dict)]
+    evidence_boundary = str(policy.get("evidence_boundary", "")) or "This prepared review card is not observed review evidence."
+    claim_boundary_suffix = str(config.get("claim_boundary_suffix", "")).strip()
+    if claim_boundary_suffix and claim_boundary_suffix.lower() not in evidence_boundary.lower():
+        evidence_boundary = f"{evidence_boundary} {claim_boundary_suffix}".strip()
+    extra_state = {
+        "route_action": action,
+        "confidence": decision.get("confidence", "low"),
+        "selected_workflow": selected,
+        "workflow_explanation_reason": workflow_explanation_reason,
+        "policy_next_action": policy_next_action,
+        "artifact_schema": str(config["artifact_schema"]),
+        "recommended_flow": list(config.get("recommended_flow", [])),
+        "evidence_not_observed": list(config.get("evidence_not_observed", [])),
+    }
+    if selected == "visual-qa":
+        extra_state.update(build_prepared_web_visual_qa_chat_state())
+    return _chat_response(
+        kind=str(config["kind"]),
+        headline=str(config["headline"]),
+        body=str(config["body"]),
+        phase=str(config["phase"]),
+        next_action=next_action,
+        thread_key=thread_key,
+        actions=actions,
+        claim_boundary=evidence_boundary,
+        extra_state=extra_state,
+    )
+
+
+def _meta_router_chat_response(
+    *,
+    selected: str,
+    policy_next_action: str,
+    policy: dict[str, object],
+    decision: dict[str, object],
+    action: str,
+    thread_key: str,
+    workflow_explanation_reason: str,
+) -> dict[str, object] | None:
+    if selected not in _META_ROUTER_CHAT_CARDS:
+        return None
+    config = _META_ROUTER_CHAT_CARDS[selected]
+    next_action = str(config["next_action"])
+    action_specs = config.get("actions", [])
+    actions = [_action_from_spec(spec) for spec in action_specs if isinstance(spec, dict)]
+    evidence_boundary = str(policy.get("evidence_boundary", "")) or (
+        "A meta-routing decision names the workflow(s) to run; it is not execution, review, CI, or merge evidence."
+    )
+    return _chat_response(
+        kind=str(config["kind"]),
+        headline=str(config["headline"]),
+        body=str(config["body"]),
+        phase=str(config["phase"]),
+        next_action=next_action,
+        thread_key=thread_key,
+        actions=actions,
+        claim_boundary=evidence_boundary,
+        extra_state={
+            "route_action": action,
+            "confidence": decision.get("confidence", "low"),
+            "selected_workflow": selected,
+            "workflow_explanation_reason": workflow_explanation_reason,
+            "policy_next_action": policy_next_action,
+            "artifact_schema": str(config["artifact_schema"]),
+            "recommended_flow": list(config.get("recommended_flow", [])),
+            "evidence_not_observed": list(config.get("evidence_not_observed", [])),
+        },
+    )
+
+
+def _delivery_runtime_chat_response(
+    *,
+    selected: str,
+    policy_next_action: str,
+    policy: dict[str, object],
+    decision: dict[str, object],
+    action: str,
+    thread_key: str,
+    workflow_explanation_reason: str,
+) -> dict[str, object] | None:
+    if selected not in _DELIVERY_RUNTIME_CHAT_CARDS:
+        return None
+    config = _DELIVERY_RUNTIME_CHAT_CARDS[selected]
+    next_action = str(config["next_action"])
+    action_specs = config.get("actions", [])
+    actions = [_action_from_spec(spec) for spec in action_specs if isinstance(spec, dict)]
+    evidence_boundary = str(policy.get("evidence_boundary", "")) or "This prepared delivery/runtime card is not observed execution evidence."
+    if "execution" not in evidence_boundary.lower():
+        evidence_boundary = f"{evidence_boundary} It is not execution evidence.".strip()
+    return _chat_response(
+        kind=str(config["kind"]),
+        headline=str(config["headline"]),
+        body=str(config["body"]),
+        phase=str(config["phase"]),
+        next_action=next_action,
+        thread_key=thread_key,
+        actions=actions,
+        claim_boundary=evidence_boundary,
+        extra_state={
+            "route_action": action,
+            "confidence": decision.get("confidence", "low"),
+            "selected_workflow": selected,
+            "workflow_explanation_reason": workflow_explanation_reason,
+            "policy_next_action": policy_next_action,
+            "artifact_schema": str(config["artifact_schema"]),
+            "recommended_flow": list(config.get("recommended_flow", [])),
+            "evidence_not_observed": list(config.get("evidence_not_observed", [])),
+        },
+    )
+
+
+def _workflow_operations_chat_response(
+    *,
+    selected: str,
+    policy_next_action: str,
+    policy: dict[str, object],
+    decision: dict[str, object],
+    action: str,
+    thread_key: str,
+    workflow_explanation_reason: str,
+) -> dict[str, object] | None:
+    if selected not in _WORKFLOW_OPERATIONS_CHAT_CARDS:
+        return None
+    config = _WORKFLOW_OPERATIONS_CHAT_CARDS[selected]
+    next_action = str(config["next_action"])
+    action_specs = config.get("actions", [])
+    actions = [_action_from_spec(spec) for spec in action_specs if isinstance(spec, dict)]
+    if selected == "agent-board":
+        for item in actions:
+            if item["id"] == "prepare_agent_board_card":
+                item["payload"] = {
+                    "tool_name": "omh_agent_board",
+                    "arguments": {"action": "prepare"},
+                    "required_input": ["request_id", "coordination", "operation", "board", "profile", "arguments"],
+                    "coordination_options": {"durable": "kanban", "bounded_research": "delegation"},
+                    "execution_policy": "prepare_only",
+                }
+            elif item["id"] == "refresh_status":
+                item["payload"] = {
+                    "tool_name": "omh_agent_board", "arguments": {"action": "status"},
+                    "required_input": ["request_id"], "execution_policy": "read_only",
+                }
+            elif item["id"] == "show_status":
+                item["payload"] = {
+                    "command_prefix": ["omh", "coding", "fanout", "status"],
+                    "required_input": ["fanout_id"], "optional_input": ["unit_id"],
+                    "wrapper_api": "omh.wrapper.contract.build_fanout_status_interaction",
+                    "execution_policy": "read_only",
+                }
+    if selected == "lifecycle-growth":
+        for item in actions:
+            if item["id"] == "prepare_lifecycle_growth":
+                item["payload"] = {
+                    "command_prefix": ["omh", "runtime", "workflow-artifact", "lifecycle-growth"],
+                    "operations": list(WORKFLOW_ARTIFACT_OPERATIONS["lifecycle-growth"]),
+                    "required_input": ["operation", "input"],
+                    "execution_policy": "metadata_only",
+                }
+    evidence_boundary = str(policy.get("evidence_boundary", "")) or "This prepared workflow operations card is not observed work evidence."
+    claim_boundary_suffix = str(config.get("claim_boundary_suffix", "")).strip()
+    if claim_boundary_suffix and claim_boundary_suffix.lower() not in evidence_boundary.lower():
+        evidence_boundary = f"{evidence_boundary} {claim_boundary_suffix}".strip()
+    extra_state = {
+        "route_action": action,
+        "confidence": decision.get("confidence", "low"),
+        "selected_workflow": selected,
+        "workflow_explanation_reason": workflow_explanation_reason,
+        "policy_next_action": policy_next_action,
+        "artifact_schema": str(config["artifact_schema"]),
+        "recommended_flow": list(config.get("recommended_flow", [])),
+        "evidence_not_observed": list(config.get("evidence_not_observed", [])),
+    }
+    if selected == "visual-qa":
+        extra_state.update(build_prepared_web_visual_qa_chat_state())
+    if selected == "external-connector-readiness" and _route_is_realtime_voice_connector_request(decision):
+        extra_state["realtime_voice_trial"] = build_prepared_realtime_voice_chat_state()
+        extra_state["evidence_not_observed"] = [
+            "realtime voice trial execution",
+            "spoken turn observation",
+            "spoken tool action",
+            *extra_state["evidence_not_observed"],
+        ]
+    return _chat_response(
+        kind=str(config["kind"]),
+        headline=str(config["headline"]),
+        body=str(config["body"]),
+        phase=str(config["phase"]),
+        next_action=next_action,
+        thread_key=thread_key,
+        actions=actions,
+        claim_boundary=evidence_boundary,
+        extra_state=extra_state,
+    )
+
+
+def build_chat_response_from_route(
+    decision: dict[str, object],
+    *,
+    thread_key: str = "",
+    message: str = "",
+    include_message: bool = False,
+    domain_routing_context: dict[str, object] | None = None,
+) -> dict[str, object]:
+    action = str(decision.get("action", "fallback"))
+    copy_locale = detect_copy_locale(message)
+    localized_copy = is_localized_locale(copy_locale)
+    if _is_command_preview_invocation(message):
+        return _command_preview_response(decision, thread_key=thread_key, message=message)
+    if (
+        str(decision.get("selected_skill", "")) == _ROUTER_SKILL
+        and _route_recommendation_next_action(decision) == "show_command_preview"
+    ):
+        return _command_preview_response(decision, thread_key=thread_key, message=message)
+    if _is_generic_skill_catalog_route(message, decision):
+        return _skill_picker_response(decision, thread_key=thread_key, message=message)
+    if action == "dispatch":
+        selected = str(decision.get("selected_skill", "the selected workflow"))
+        iteration_context = decision.get("design_direction_iteration")
+        if isinstance(iteration_context, dict):
+            return _chat_response(
+                kind="design_direction_iteration",
+                headline="I can prepare a revision bound to this rendered direction set.",
+                body=(
+                    "The revision action still requires an opaque feedback reference, structured feedback delta, "
+                    "and a materially different closed direction set. Direction-fit is advisory evidence, not "
+                    "implementation or visual-QA PASS."
+                ),
+                phase="design_direction_feedback_pending",
+                next_action="revise_design_direction_iteration",
+                thread_key=thread_key,
+                actions=[
+                    _action(
+                        "revise_design_direction_iteration",
+                        "Revise directions",
+                        "primary",
+                        payload={
+                            "iteration_id": iteration_context["iteration_id"],
+                            "revision_digest": iteration_context["revision_digest"],
+                            "feedback_reference_required": True,
+                            "feedback_delta_required": True,
+                        },
+                    ),
+                    _action(
+                        "show_design_direction_iteration",
+                        "Show direction history",
+                        "secondary",
+                        payload={"iteration_id": iteration_context["iteration_id"]},
+                    ),
+                    _action("show_status", "Show status", "secondary"),
+                ],
+                claim_boundary=(
+                    "Prepared direction feedback is not implementation, fresh exact-lineage capture, "
+                    "accessibility, visual-QA, browser, model, provider, executor, review, CI, or delivery evidence."
+                ),
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "design_direction_iteration": dict(iteration_context),
+                    "evidence_not_observed": [
+                        "implementation",
+                        "fresh exact-lineage capture",
+                        "visual QA",
+                        "accessibility review",
+                    ],
+                },
+            )
+        if selected == _ROUTER_SKILL and _is_skill_picker_invocation(message):
+            return _skill_picker_response(decision, thread_key=thread_key, message=message)
+        if selected == "cancel":
+            return _chat_response(
+                kind="cancellation",
+                headline="I will stop this Hermes workflow.",
+                body="This is a wrapper control action; it does not create a plan, handoff, or execution claim.",
+                phase="cancelling",
+                next_action="cancel",
+                thread_key=thread_key,
+                actions=[_action("cancel", "Cancel workflow", "primary"), _action("show_status", "Show status", "secondary")],
+                claim_boundary="Cancellation is observed only after the wrapper records the state change.",
+                extra_state={"route_action": action, "confidence": decision.get("confidence", "low"), "selected_workflow": selected},
+            )
+        if selected in _CLARIFICATION_SKILLS:
+            return _chat_response(
+                kind="clarification",
+                headline="This needs a clarification workflow before planning.",
+                body=f"I will ask one blocking question at a time in this thread — at most {DEEP_INTERVIEW_MAX_ROUNDS} rounds — then hand off a clarified brief.",
+                phase="clarifying",
+                next_action="answer_clarification",
+                thread_key=thread_key,
+                actions=[_action("answer:clarify", "Answer clarification", "primary"), _action("cancel", "Cancel", "secondary")],
+                claim_boundary="No plan or execution has started.",
+                extra_state={"route_action": action, "confidence": decision.get("confidence", "low"), "selected_workflow": selected},
+            )
+        policy = _selected_recommendation_policy(decision, selected)
+        policy_next_action = str(policy.get("next_action", ""))
+        alias_resolution = decision.get("alias_resolution")
+        alias_selected_capability = (
+            str(alias_resolution.get("selected_capability", ""))
+            if isinstance(alias_resolution, dict)
+            else ""
+        )
+        workflow_explanation_reason = _workflow_explanation_reason_for_route(decision, policy, selected)
+        task_card = _route_task_card(decision)
+        if task_card and str(task_card.get("task_type", "")) != "router_design_feedback":
+            return _chat_response_from_task_card(
+                task_card,
+                decision=decision,
+                thread_key=thread_key,
+                workflow_explanation_reason=workflow_explanation_reason,
+            )
+        learning_candidate_card = decision.get("learning_candidate_card")
+        if isinstance(learning_candidate_card, dict) and learning_candidate_card:
+            return _chat_response_from_learning_candidate_card(
+                learning_candidate_card,
+                decision=decision,
+                thread_key=thread_key,
+                workflow_explanation_reason=workflow_explanation_reason,
+            )
+        if selected == "feedback-triage" or policy_next_action == "triage_feedback":
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or "Feedback triage is not implementation evidence."
+            body = (
+                "I will treat this as a customer or product signal first: cluster reports, separate bug, request, "
+                "and question paths, name severity and affected surface, then prepare investigation and reproduction "
+                "questions. A coding handoff only follows after the signal is classified and reproduction or acceptance "
+                "evidence exists."
+            )
+            return _chat_response(
+                kind="feedback_triage",
+                headline="I can triage this signal before anyone codes.",
+                body=body,
+                phase="feedback_triage_prepared",
+                next_action="triage_feedback",
+                thread_key=thread_key,
+                actions=[
+                    _action("triage_feedback", "Triage signal", "primary"),
+                    _action(
+                        "prepare_coding_handoff",
+                        "Prepare fix handoff",
+                        "secondary",
+                        enabled=False,
+                        payload={"requires": "classified bug/request/question path and reproduction or acceptance evidence"},
+                    ),
+                    _action("prepare_report_package", "Prepare triage report", "secondary"),
+                    _action("show_status", "Show status", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "artifact_schema": "feedback_triage_card/v1",
+                    "recommended_flow": [
+                        "cluster_signal",
+                        "classify_bug_request_question",
+                        "prepare_investigation_or_repro_plan",
+                        "prepare_coding_handoff_if_needed",
+                    ],
+                    "evidence_not_observed": [
+                        "completed feedback triage",
+                        "observed customer examples",
+                        "severity confirmation",
+                        "reproduction evidence",
+                        "coding handoff",
+                        "fix implementation",
+                        "root cause",
+                        "roadmap decision",
+                        "verification",
+                    ],
+                },
+            )
+        operating_brief_response = _operating_brief_chat_response(
+            selected=selected,
+            policy_next_action=policy_next_action,
+            policy=policy,
+            decision=decision,
+            action=action,
+            thread_key=thread_key,
+            workflow_explanation_reason=workflow_explanation_reason,
+        )
+        if operating_brief_response:
+            return operating_brief_response
+        meta_router_response = _meta_router_chat_response(
+            selected=selected,
+            policy_next_action=policy_next_action,
+            policy=policy,
+            decision=decision,
+            action=action,
+            thread_key=thread_key,
+            workflow_explanation_reason=workflow_explanation_reason,
+        )
+        if meta_router_response:
+            return meta_router_response
+        review_quality_response = _review_quality_chat_response(
+            selected=selected,
+            policy_next_action=policy_next_action,
+            policy=policy,
+            decision=decision,
+            action=action,
+            thread_key=thread_key,
+            workflow_explanation_reason=workflow_explanation_reason,
+        )
+        if review_quality_response:
+            return review_quality_response
+        delivery_runtime_response = _delivery_runtime_chat_response(
+            selected=selected,
+            policy_next_action=policy_next_action,
+            policy=policy,
+            decision=decision,
+            action=action,
+            thread_key=thread_key,
+            workflow_explanation_reason=workflow_explanation_reason,
+        )
+        if delivery_runtime_response:
+            return delivery_runtime_response
+        workflow_operations_response = _workflow_operations_chat_response(
+            selected=selected,
+            policy_next_action=policy_next_action,
+            policy=policy,
+            decision=decision,
+            action=action,
+            thread_key=thread_key,
+            workflow_explanation_reason=workflow_explanation_reason,
+        )
+        if workflow_operations_response:
+            return workflow_operations_response
+        if selected == "loop" or policy_next_action == "start_goal_loop":
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or "A goal loop is orchestration state only."
+            body = str(policy.get("wrapper_guidance", "")) or (
+                "Start the loop and keep moving through interviewer, planner, builder, reviewer, and next-loop gates while keeping observed evidence separate."
+            )
+            loop_start_card = build_loop_start_card(
+                message or selected,
+                include_goal=include_message,
+                source=str(decision.get("source", "generic")),
+            )
+            assessment = loop_start_card.get("loopability_assessment", {})
+            loop_next_action = str(loop_start_card.get("next_action") or assessment.get("recommended_next_action", "start_goal_loop"))
+            loopability = str(assessment.get("loopability", "loopable"))
+            loop_invocation = _nested(loop_start_card, "loop_invocation")
+            explicit_loop = loop_invocation.get("invoked") is True
+            if explicit_loop and loop_next_action == "start_loop_cycle":
+                headline = "Loop started; I will keep going until a real gate."
+                body = (
+                    "I will advance through interviewer, planner, researcher, builder, reviewer, and loop-controller lanes; "
+                    "prepared steps stay separate from observed execution, review, CI, merge, or publication evidence."
+                )
+                primary_action = "start_loop"
+            elif loopability == "needs_clarification":
+                headline = "This needs a loop goal clarification."
+                body = "I need a bounded arena, observable problem, next verification, or stop condition before a loop can start."
+                primary_action = "assess_loopability"
+            elif loopability == "direct_task":
+                headline = "This looks like a direct task, not a loop."
+                body = "I can route it to a one-cycle delivery workflow unless you explicitly want repeated discovery."
+                primary_action = "route_direct_task"
+            elif loopability in {"needs_reframe", "north_star_only"}:
+                headline = "This is a north star; I will shape the first loop goal."
+                body = "I will keep the ambition, then ask for or propose a bounded arena, observable problem, and next verification before cycling."
+                primary_action = "convert_to_loop_goal"
+            elif loopability == "external_wait_only":
+                headline = "This depends on external evidence."
+                body = "I can record the external wait or help choose a local proxy loop goal before continuing."
+                primary_action = "assess_loopability"
+            else:
+                headline = "I can start a goal loop for this."
+                primary_action = "choose_permission_profile"
+            loop_actions = [_action(primary_action, primary_action.replace("_", " "), "primary")]
+            if primary_action != "choose_permission_profile":
+                loop_actions.append(
+                    _action("choose_permission_profile", "Choose permission profile", "secondary", enabled=loopability == "loopable")
+                )
+            if primary_action != "start_loop":
+                loop_actions.append(
+                    _action(
+                        "start_loop",
+                        "Start loop",
+                        "primary",
+                        enabled=loopability == "loopable" or (explicit_loop and loop_next_action == "start_loop_cycle"),
+                    )
+                )
+            loop_actions.extend(
+                [
+                    _action("run_loop_tick", "Run loop tick", "secondary", enabled=False),
+                    _action("show_loop_queue", "Show loop queue", "secondary", enabled=False),
+                    _action("show_loop_status", "Show loop status", "secondary"),
+                    _action("cancel", "Cancel", "secondary"),
+                ]
+            )
+            return _chat_response(
+                kind="loop",
+                headline=headline,
+                body=body,
+                phase="loop_setup",
+                next_action=loop_next_action if loop_next_action else "start_goal_loop",
+                thread_key=thread_key,
+                actions=loop_actions,
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "loop_invocation": loop_invocation,
+                    "role_pipeline": loop_start_card.get("role_pipeline", []),
+                    "core_skills": loop_start_card.get("core_skills", []),
+                    "loopability_assessment": assessment,
+                    "permission_profile_required": bool(loop_start_card.get("permission_profile_required", True)),
+                    "loop_start_card": loop_start_card,
+                    "evidence_not_observed": [
+                        "executor/runtime dispatch",
+                        "implementation",
+                        "review",
+                        "CI",
+                        "merge",
+                        "external publication",
+                        "market response",
+                        "goal completion",
+                        "worktree creation",
+                        "subagent dispatch",
+                        "connector I/O",
+                    ],
+                    "runtime_tick_contract": "After start, wrappers may call the loop tick backend with deterministic queue shape to prepare the next queued worktree/subagent/connector step without claiming observation.",
+                },
+            )
+        if selected == "ultrawork" and _route_is_coding_status_request(decision):
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or "Coding-agent status is observed only after runtime evidence is recorded."
+            body = (
+                "I can show the coding-agent status card and explain which handoff, dispatch, result, verification, review, CI, "
+                "or merge evidence is still missing. If no executor session is attached yet, I will not invent progress."
+            )
+            return _chat_response(
+                kind="handoff",
+                headline="I can show the coding-agent status for this work.",
+                body=body,
+                phase="handoff_status",
+                next_action="show_coding_handoff_status",
+                thread_key=thread_key,
+                actions=[
+                    _action("show_coding_handoff_status", "Show coding status", "primary"),
+                    _action("attach_executor_session", "Attach executor session", "secondary", enabled=False),
+                    _action("choose_executor", "Choose coding agent", "secondary"),
+                    _action("show_status", "Show status", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "coding_status_request": True,
+                    "handoff_status": "prepared_not_observed",
+                    "evidence_not_observed": [
+                        "executor/runtime dispatch",
+                        "executor session attachment",
+                        "implementation result",
+                        "verification",
+                        "review",
+                        "CI",
+                        "merge readiness",
+                        "merge",
+                    ],
+                },
+            )
+        if policy_next_action == "start_delivery_cycle" or (
+            selected == "ultrawork" and alias_selected_capability == "delivery_boundary"
+        ):
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or "A delivery process route is not execution evidence."
+            body = str(policy.get("wrapper_guidance", "")) or (
+                "I will shape this into one planning, implementation handoff, review, docs sync, and PR-ready cycle."
+            )
+            return _chat_response(
+                kind="process",
+                headline="I can run one delivery process cycle for this.",
+                body=body,
+                phase="process_setup",
+                next_action="start_delivery_cycle",
+                thread_key=thread_key,
+                actions=[
+                    _action("start_delivery_cycle", "Start process", "primary"),
+                    _action("prepare_handoff", "Prepare handoff", "secondary", enabled=False),
+                    _action("show_status", "Show status", "secondary"),
+                    _action("cancel", "Cancel", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "cycle_policy": "single_cycle",
+                    "continues_after_feedback": False,
+                    "process_stages": [
+                        "codebase_or_source_research",
+                        "ralplan",
+                        "implementation_handoff",
+                        "code_review",
+                        "docs_sync_when_needed",
+                        "pr_ready_or_pr_observed_report",
+                        "stop_or_recommend_next_workflow",
+                    ],
+                    "evidence_not_observed": [
+                        "accepted plan",
+                        "executor/runtime dispatch",
+                        "implementation",
+                        "code review",
+                        "docs sync",
+                        "CI",
+                        "PR creation",
+                        "merge readiness",
+                        "merge",
+                    ],
+                },
+            )
+        if selected == "img-summary" or policy_next_action == "prepare_visual_prompt_card":
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or "A prepared image-card brief is not generated image evidence."
+            copy = chat_copy("img_summary", locale=copy_locale)
+            return _chat_response(
+                kind="img_summary",
+                headline=copy.headline,
+                body=copy.body,
+                phase="visual_prompt_prepared",
+                next_action="prepare_visual_prompt_card",
+                thread_key=thread_key,
+                actions=[
+                    _action("show_visual_prompt_card", "Show card", "primary"),
+                    _action("copy_visual_prompt", "Copy prompt", "secondary"),
+                    _action("revise_visual_card", "Revise card", "secondary"),
+                    _action("change_visual_language", "Change language", "secondary"),
+                    _action("choose_image_generator", "Choose image tool", "secondary"),
+                    _action("setup_image_generator", "Set up image tool", "secondary"),
+                    _action("record_visual_image", "Record generated image", "secondary"),
+                    _action("record_visual_qa", "Record visual QA", "secondary"),
+                    _action("record_visual_delivery", "Record delivery", "secondary"),
+                    _action("show_visual_status", "Show visual status", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "artifact_schema": "visual_prompt_card/v1",
+                    "observation_schema": "visual_observation/v1",
+                    "generation_receipt_schema": "visual_generation_receipt/v1",
+                    "route_evidence_schema": "visual_generation_route_evidence/v1",
+                    "image_generation_capability": "unknown",
+                    "image_generation_setup": image_generation_setup_fallback("unknown"),
+                    "evidence_not_observed": [
+                        "image generation",
+                        "visual QA",
+                        "sharing",
+                        "posting",
+                        "attachment",
+                        "delivery",
+                    ],
+                    "capability_action_rule": (
+                        "Show generate_visual_image only when wrapper context reports image_generation_capability/v1 "
+                        "with state connected; that action is still not generation evidence."
+                    ),
+                    "route_claim_rule": (
+                        "Report the requested route and the observed route separately. Leave provider, model, "
+                        "quality, operation, dimensions, and credential class unknown unless a "
+                        "visual_generation_receipt/v1 attests them; a returned file, a connected capability, and a "
+                        "configured selection are none of them evidence of the route that ran."
+                    ),
+                    "route_warning_kinds": [
+                        "route_mismatch",
+                        "unknown_observed_route",
+                        "stale_card_identity",
+                        "artifact_digest_drift",
+                        "provider_response_reuse",
+                    ],
+                },
+            )
+        if selected == "paper-learning" or policy_next_action == "prepare_paper_learning":
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or "A paper-learning card is not paper validation evidence."
+            copy = chat_copy("paper_learning", locale=copy_locale)
+            return _chat_response(
+                kind="paper_learning",
+                headline=copy.headline,
+                body=copy.body,
+                phase="paper_learning_prepared",
+                next_action="prepare_paper_learning",
+                thread_key=thread_key,
+                actions=[
+                    _action("choose_explanation_level", "Choose level", "primary"),
+                    _action("show_paper_source_requirements", "Show source needs", "secondary"),
+                    _action("record_paper_metadata", "Record metadata", "secondary"),
+                    _action("record_paper_excerpt_observed", "Record excerpt", "secondary"),
+                    _action("record_file_text_extraction_observed", "Record text extraction", "secondary"),
+                    _action("show_paper_learning", "Show paper learning", "secondary"),
+                    _action("continue_next_section", "Next section", "secondary"),
+                    _action("revise_explanation_level", "Revise level", "secondary"),
+                    _action("show_coverage_ledger", "Coverage ledger", "secondary"),
+                    _action("record_user_review", "Record user review", "secondary"),
+                    _action("show_status", "Show status", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "artifact_schema": "paper_learning_card/v1",
+                    "source_state_schema": "paper_source_state/v1",
+                    "coverage_ledger_schema": "paper_coverage_ledger/v1",
+                    "default_level": "choose",
+                    "evidence_not_observed": [
+                        "full PDF extraction",
+                        "figure OCR",
+                        "external citation checking",
+                        "math validation",
+                        "code reproduction",
+                        "peer review",
+                        "proof that paper claims are true",
+                    ],
+                },
+            )
+        if selected == "source-finder" or policy_next_action == "prepare_source_finder_plan":
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or "A source-finder plan is not source retrieval evidence."
+            copy = chat_copy("source_finder", locale=copy_locale)
+            return _chat_response(
+                kind="source_finder",
+                headline=copy.headline,
+                body=copy.body,
+                phase="source_finder_prepared",
+                next_action="prepare_source_finder_plan",
+                thread_key=thread_key,
+                actions=[
+                    _action("show_source_candidates", "Show candidates", "primary"),
+                    _action("record_source_candidate", "Record candidate", "secondary"),
+                    _action("record_source_link_observed", "Record source link", "secondary"),
+                    _action("record_download_observed", "Record download", "secondary"),
+                    _action("record_file_hash", "Record file hash", "secondary"),
+                    _action("record_text_extraction_observed", "Record text extraction", "secondary"),
+                    _action("record_license_check", "Record license check", "secondary"),
+                    _action("choose_source", "Choose source", "secondary"),
+                    _action("route_to_downstream_workflow", "Route downstream", "secondary"),
+                    _action("show_acquisition_status", "Show acquisition status", "secondary"),
+                    _action("show_status", "Show status", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "artifact_schema": "source_finder_plan/v1",
+                    "candidate_schema": "source_candidate_set/v1",
+                    "acquisition_status_schema": "source_acquisition_status/v1",
+                    "downstream_workflow_required": True,
+                    "evidence_not_observed": [
+                        "web search",
+                        "download",
+                        "repository clone",
+                        "file extraction",
+                        "file hash verification",
+                        "license verification",
+                        "source correctness verification",
+                        "downstream processing",
+                    ],
+                },
+            )
+        if selected == "research" or policy_next_action == "run_hermes_research":
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or "A web research card is not source retrieval evidence."
+            copy = chat_copy("web_research", locale=copy_locale)
+            research_state: dict[str, object] = {
+                "route_action": action,
+                "confidence": decision.get("confidence", "low"),
+                "selected_workflow": selected,
+                "workflow_explanation_reason": workflow_explanation_reason,
+                "policy_next_action": policy_next_action,
+                "artifact_schema": "web_research_brief/v1",
+                "observation_schema": "source_observation/v1",
+                "research_scope": "source_backed_current_evidence",
+                "evidence_not_observed": [
+                    "source retrieval",
+                    "source access",
+                    "citation verification",
+                    "source diversity",
+                    "freshness confirmation",
+                    "downstream plan or handoff",
+                ],
+            }
+            if _route_is_point_in_time_web_request(decision):
+                research_state["research_scope"] = "point_in_time_web_evidence"
+                research_state["temporal_evidence"] = dict(_POINT_IN_TIME_RESEARCH_STATE)
+                research_state["evidence_not_observed"] = [
+                    "archive capture retrieval",
+                    *research_state["evidence_not_observed"],
+                ]
+            return _chat_response(
+                kind="web_research",
+                headline=copy.headline,
+                body=copy.body,
+                phase="web_research_prepared",
+                next_action="run_hermes_research",
+                thread_key=thread_key,
+                actions=[
+                    _action("run_hermes_research", "Start research", "primary"),
+                    _action("record_source_observation", "Record source observation", "secondary"),
+                    _action("prepare_source_finder_plan", "Prepare source finder", "secondary"),
+                    _action("prepare_research_department_plan", "Prepare research ops", "secondary"),
+                    _action("prepare_report_package", "Prepare report", "secondary"),
+                    _action("show_status", "Show status", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state=research_state,
+            )
+        if policy_next_action == "run_setup_guide":
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or (
+                "A setup guide is not evidence that prerequisites exist, configuration was applied, or "
+                "verification passed; only the re-read checklist after approved edits is observed setup state."
+            )
+            body = (
+                "I will walk this setup in five steps: confirm prerequisites first and mark anything you do not "
+                "have as not applicable, read the current configuration without changing it, guide the manual "
+                "steps you must do yourself, apply local config edits only after you approve the shown diff, "
+                "then re-read the configuration and report the verification checklist."
+            )
+            return _chat_response(
+                kind="setup_guide",
+                headline="I can guide this setup and verify it against your current configuration.",
+                body=body,
+                phase="setup_guide_prepared",
+                next_action="run_setup_guide",
+                thread_key=thread_key,
+                actions=[
+                    _action("run_setup_guide", "Start setup guide", "primary"),
+                    _action("show_status", "Show status", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "artifact_schema": "setup_guide_card/v1",
+                    "setup_contract": [
+                        "prerequisite check",
+                        "read-only diagnose",
+                        "guided manual steps",
+                        "diff-approved apply",
+                        "verify checklist",
+                    ],
+                    "evidence_not_observed": [
+                        "prerequisite availability",
+                        "configuration reads",
+                        "approved config edits",
+                        "verification checklist results",
+                    ],
+                },
+            )
+        if selected == "doctor" or policy_next_action == "run_local_operator_check":
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or (
+                "A local operator check is health evidence only after the check runs; it is not Hermes reload, "
+                "plugin-load, executor dispatch, implementation, review, CI, or merge evidence."
+            )
+            body = (
+                "I will check the local OMH install path: command availability, managed workflows, runtime state, "
+                "Hermes registration, target detection, plugin surface, and the next repair step if something is stale. "
+                "This keeps setup/update questions in the operator health lane instead of asking for shell approval first."
+            )
+            return _chat_response(
+                kind="doctor_health",
+                headline="I can check whether OMH is installed and connected correctly.",
+                body=body,
+                phase="doctor_health_prepared",
+                next_action="run_local_operator_check",
+                thread_key=thread_key,
+                actions=[
+                    _action("run_local_operator_check", "Run local check", "primary"),
+                    _action("run_omh_doctor", "Run omh doctor", "secondary"),
+                    _action("run_omh_setup", "Repair setup", "secondary"),
+                    _action("run_omh_update", "Refresh workflows", "secondary"),
+                    _action("show_status", "Show status", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "artifact_schema": "doctor_health_card/v1",
+                    "local_operator_check": True,
+                    "evidence_not_observed": [
+                        "command availability",
+                        "workflow installation health",
+                        "Hermes registration reload",
+                        "plugin runtime load",
+                        "executor dispatch",
+                        "implementation",
+                        "review",
+                        "CI",
+                        "merge",
+                    ],
+                },
+            )
+        if selected == "agent-ops-review" or policy_next_action == "prepare_agent_ops_review":
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or "An agent ops review card is not runtime evidence."
+            card = build_agent_operator_productivity_card(
+                message or selected,
+                source=str(decision.get("source", "generic")),
+            )
+            status_card = card["status_card"]
+            copy = chat_copy("agent_ops_review", locale=copy_locale)
+            headline = copy.headline if localized_copy else str(status_card.get("headline", copy.headline))
+            return _chat_response(
+                kind="agent_ops_review",
+                headline=headline,
+                body=copy.body,
+                phase="agent_ops_review_prepared",
+                next_action=str(card.get("next_action", "show_agent_ops_review")),
+                thread_key=thread_key,
+                actions=[
+                    _action("show_agent_ops_review", "Show agent ops review", "primary"),
+                    _action("prepare_research_lane", "Prepare research lane", "secondary"),
+                    _action("prepare_coding_lane", "Prepare coding lane", "secondary"),
+                    _action("prepare_review_lane", "Prepare review lane", "secondary"),
+                    _action("refresh_agent_ops_status", "Refresh status", "secondary"),
+                    _action("record_agent_ops_observation", "Record observation", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "artifact_schema": card["schema_version"],
+                    "status_card_schema": status_card.get("schema_version", ""),
+                    "agent_ops_review": card,
+                    "quality_state": status_card.get("quality_state", "prepared_not_observed"),
+                    "blockers": status_card.get("blockers", []),
+                    "throughput_levers": card.get("throughput_levers", []),
+                    "evidence_not_observed": card.get("not_evidence_until_observed", []),
+                    # The card itself is projection-only; these are the live
+                    # observed-evidence surfaces a briefing should be read
+                    # from before narrating in-flight subagent work.
+                    "live_status_sources": [
+                        "omh coding fanout brief",
+                        "omh runtime progress-status",
+                    ],
+                },
+            )
+        if selected == "workflow-learning":
+            missed_route_feedback = _is_missed_route_feedback(message)
+            primary_learning_action = "record_missed_route" if missed_route_feedback else "audit_learning_readiness"
+            copy = chat_copy(
+                "workflow_learning_missed_route" if missed_route_feedback else "workflow_learning_readiness",
+                locale=copy_locale,
+            )
+            evidence_boundary = str(policy.get("evidence_boundary", "")) or (
+                "Workflow learning records are process-review evidence only; they are not automatic improvement evidence."
+            )
+            return _chat_response(
+                kind="workflow_learning",
+                headline=copy.headline,
+                body=copy.body,
+                phase="workflow_learning_prepared",
+                next_action=primary_learning_action,
+                thread_key=thread_key,
+                actions=[
+                    _action("record_missed_route", "Record missed route", "primary" if missed_route_feedback else "secondary"),
+                    _action("record_workflow_learning_trace", "Record trace", "secondary"),
+                    _action("show_learning_review_queue", "Review queue", "secondary"),
+                    _action("show_learning_eval", "Run eval", "secondary"),
+                    _action("propose_skill_improvement", "Propose improvement", "secondary"),
+                    _action("review_improvement", "Review improvement", "secondary"),
+                    _action("prepare_patch_proposal", "Prepare patch proposal", "secondary"),
+                    _action("show_patch_proposal", "Show patch proposal", "secondary"),
+                    _action("copy_patch_handoff", "Copy patch handoff", "secondary"),
+                    _action("add_regression_case", "Add regression", "secondary"),
+                    _action("audit_learning_readiness", "Audit readiness", "secondary" if missed_route_feedback else "primary"),
+                    _action("export_learning_bundle", "Export bundle", "secondary"),
+                    _action("replay_regression_cases", "Replay cases", "secondary"),
+                    _action("check_learning_index", "Check index", "secondary"),
+                    _action("rebuild_learning_index", "Rebuild index", "secondary"),
+                    _action("show_status", "Show status", "secondary"),
+                ],
+                claim_boundary=evidence_boundary,
+                extra_state={
+                    "route_action": action,
+                    "confidence": decision.get("confidence", "low"),
+                    "selected_workflow": selected,
+                    "workflow_explanation_reason": workflow_explanation_reason,
+                    "policy_next_action": policy_next_action,
+                    "learning_intent": "missed_route" if missed_route_feedback else "readiness_audit",
+                    "primary_learning_action": primary_learning_action,
+                    "artifact_schemas": [
+                        "workflow_learning_trace/v1",
+                        "workflow_eval_result/v1",
+                        "learning_missed_route_result/v1",
+                        "regression_case/v1",
+                        "improvement_candidate/v1",
+                        "improvement_candidate_review_card/v1",
+                        "improvement_patch_proposal/v1",
+                        "workflow_learning_review_queue/v1",
+                        "workflow_learning_audit/v1",
+                        "learning_audit_card/v1",
+                        "workflow_learning_export/v1",
+                    ],
+                    "learning_audit_card_schema": "learning_audit_card/v1",
+                    "learning_review_queue_schema": "workflow_learning_review_queue/v1",
+                    "improvement_candidate_review_card_schema": "improvement_candidate_review_card/v1",
+                    "human_gate_required": True,
+                    "evidence_not_observed": [
+                        "raw prompt storage",
+                        "model training",
+                        "automatic skill patch",
+                        "workflow execution",
+                        "future behavior fixed",
+                        "review approval",
+                        "CI",
+                        "merge",
+                    ],
+                    "learning_flow": [
+                        "record_trace",
+                        "record_missed_route",
+                        "run_eval",
+                        "add_regression_case",
+                        "review_queue",
+                        "review_improvement_candidate",
+                        "prepare_patch_proposal",
+                        "audit_readiness",
+                        "export_redacted_bundle",
+                        "human_review_improvement_candidate",
+                    ],
+                    **_task_card_state(decision),
+                },
+            )
+        next_action = policy_next_action if policy_next_action and policy_next_action != "show_workflow_guidance" else "dispatch_to_workflow"
+        wrapper_guidance = str(policy.get("wrapper_guidance", ""))
+        evidence_boundary = str(policy.get("evidence_boundary", "")) or "Routing is not execution evidence."
+        body = _HUMAN_ACK_BODY_BY_SKILL.get(
+            selected,
+            wrapper_guidance
+            or f"I will prepare a safe next step for `{display_workflow_name(selected)}` before claiming any work happened.",
+        )
+        return _chat_response(
+            kind="ack",
+            headline="I know which workflow should handle this.",
+            body=body,
+            phase="routed",
+            next_action=next_action,
+            thread_key=thread_key,
+            actions=_ack_actions_for_next_action(next_action),
+            claim_boundary=evidence_boundary,
+            extra_state={
+                "route_action": action,
+                "confidence": decision.get("confidence", "low"),
+                "selected_workflow": selected,
+                "workflow_explanation_reason": workflow_explanation_reason,
+                "policy_next_action": policy_next_action,
+            },
+        )
+    if action == "clarify":
+        copy = chat_copy("clarify", locale=copy_locale)
+        body = domain_expert_question_body(domain_routing_context)
+        if body is None:
+            body = copy.body if localized_copy else str(decision.get("clarification") or copy.body)
+        return _chat_response(
+            kind="clarification",
+            headline=copy.headline,
+            body=body,
+            phase="clarifying",
+            next_action="answer_clarification",
+            thread_key=thread_key,
+            actions=[_action("answer:clarify", "Answer clarification", "primary"), _action("cancel", "Cancel", "secondary")],
+            claim_boundary="No execution has started.",
+            extra_state={"route_action": action, "confidence": decision.get("confidence", "low")},
+        )
+    if action == "fallback" and _is_file_lookup_fallback(decision):
+        copy = chat_copy("file_lookup", locale=copy_locale)
+        # The card copy in every locale, not only the localized ones. The
+        # router's clarification for this fallback is a constant addressed to
+        # Hermes ("Answer this as a file or text lookup..."), so using it as the
+        # English body printed an instruction at the reader. It still reaches
+        # Hermes through `routing_instruction` and the route explanation, which
+        # is where an instruction belongs.
+        body = copy.body
+        return _chat_response(
+            kind="clarification",
+            headline=copy.headline,
+            body=body,
+            phase="clarifying",
+            next_action="answer_file_lookup",
+            thread_key=thread_key,
+            actions=[
+                _action("answer:file_lookup", "Answer file lookup", "primary"),
+                _action("cancel", "Cancel", "secondary"),
+            ],
+            claim_boundary="No OMH workflow, execution, or file inspection has started.",
+            extra_state={
+                "route_action": action,
+                "confidence": decision.get("confidence", "low"),
+                "lookup_kind": "file_or_text",
+                "routing_instruction": decision.get("routing_instruction", ""),
+            },
+        )
+    if action == "fallback" and _is_direct_answer_fallback(decision):
+        copy = chat_copy("direct_answer", locale=copy_locale)
+        # Same as the file-lookup fallback above: this decision's clarification
+        # is a constant instruction to Hermes, not a sentence for the reader.
+        body = copy.body
+        return _chat_response(
+            kind="clarification",
+            headline=copy.headline,
+            body=body,
+            phase="clarifying",
+            next_action="answer_directly",
+            thread_key=thread_key,
+            actions=[
+                _action("answer:direct", "Answer directly", "primary"),
+                _action("cancel", "Cancel", "secondary"),
+            ],
+            claim_boundary="No OMH workflow, picker, handoff, execution, or file inspection has started.",
+            extra_state={
+                "route_action": action,
+                "confidence": decision.get("confidence", "low"),
+                "lookup_kind": "direct_answer",
+                "routing_instruction": decision.get("routing_instruction", ""),
+            },
+        )
+    copy = chat_copy("generic_clarify", locale=copy_locale)
+    body = domain_expert_question_body(domain_routing_context) or copy.body
+    return _chat_response(
+        kind="clarification",
+        headline=copy.headline,
+        body=body,
+        phase="clarifying",
+        next_action="answer_clarification",
+        thread_key=thread_key,
+        actions=[_action("answer:clarify", "Answer clarification", "primary"), _action("cancel", "Cancel", "secondary")],
+        claim_boundary="No execution has started.",
+        extra_state={"route_action": action, "confidence": decision.get("confidence", "low")},
+    )
+
+
+def _is_file_lookup_fallback(decision: dict[str, object]) -> bool:
+    return str(decision.get("reason_code", "")) == REASON_CODE_FILE_LOOKUP
+
+
+def _is_direct_answer_fallback(decision: dict[str, object]) -> bool:
+    return str(decision.get("reason_code", "")) in DIRECT_ANSWER_REASON_CODES
+
+
+def _route_task_card(decision: dict[str, object]) -> dict[str, object]:
+    task_card = decision.get("task_card")
+    return dict(task_card) if isinstance(task_card, dict) else {}
+
+
+def _task_card_state(decision: dict[str, object]) -> dict[str, object]:
+    task_card = _route_task_card(decision)
+    return {"task_card": task_card} if task_card else {}
+
+
+def _chat_response_from_learning_candidate_card(
+    card: dict[str, object],
+    *,
+    decision: dict[str, object],
+    thread_key: str,
+    workflow_explanation_reason: str,
+) -> dict[str, object]:
+    target = str(card.get("persistence_target", "review_first"))
+    primary_action = str(card.get("primary_action", "show_learning_candidate"))
+    summary = str(card.get("summary", "")).strip()
+    prompt = card.get("learn_prompt")
+    has_prompt = isinstance(prompt, dict) and bool(prompt.get("copy_text"))
+    if target == "skill_candidate":
+        headline = "I can prepare this for Hermes /learn."
+        body = (
+            "This is a reusable skill candidate. I prepared a sanitized copy-ready /learn prompt for Hermes Agent; "
+            "OMH has not run /learn, created a skill, or changed memory. "
+            f"Candidate: {summary}"
+        )
+    elif target == "memory_candidate":
+        headline = "I can queue this as a memory candidate."
+        body = (
+            "This looks like a durable user preference, so I prepared a new memory candidate for review before anything is saved. "
+            f"Candidate: {summary}"
+        )
+    elif target == "session_only":
+        headline = "This should stay session-only."
+        body = (
+            "The request points at transient task, PR, run, process, branch, or channel state. I will show it as a learning signal "
+            "without preparing persistence. "
+            f"Candidate: {summary}"
+        )
+    else:
+        headline = "This learning request needs review first."
+        body = (
+            "The request is ambiguous, conflicting, or cross-channel. Route it through new-memory candidate review before persistence. "
+            f"Candidate: {summary}"
+        )
+
+    actions: list[dict[str, object]] = []
+    if has_prompt:
+        actions.append(_action("copy_learn_prompt", "Copy /learn prompt", "primary", payload=prompt))
+    actions.append(_action("show_learning_candidate", "Show candidate", "primary" if not actions else "secondary", payload=card))
+    if target in {"memory_candidate", "review_first"}:
+        actions.append(_action("prepare_memory_new", "Add memory", "primary" if not has_prompt else "secondary", payload=card))
+        actions.append(_action("show_memory_status", "Show memory status", "secondary"))
+    actions.append(_action("show_status", "Show status", "secondary"))
+
+    return _chat_response(
+        kind="learning_candidate",
+        headline=headline,
+        body=body,
+        phase="learning_candidate_prepared",
+        next_action=primary_action,
+        thread_key=thread_key,
+        actions=actions,
+        claim_boundary=str(card.get("claim_boundary", "Learning candidate is prepared_not_observed.")),
+        extra_state={
+            "route_action": decision.get("action", "dispatch"),
+            "confidence": decision.get("confidence", "high"),
+            "selected_workflow": card.get("recommended_workflow", decision.get("selected_skill", "")),
+            "workflow_explanation_reason": workflow_explanation_reason,
+            "learning_candidate_card_schema": card.get("schema_version", ""),
+            "learning_candidate_target": target,
+            "learning_candidate_status": card.get("status", "prepared_not_observed"),
+            "primary_learning_action": primary_action,
+            "learning_candidate_card": card,
+            "scope": card.get("scope", {}),
+            "artifact_schemas": ["learning_candidate_card/v1", "hermes_learn_prompt/v1"],
+            "evidence_not_observed": card.get("not_observed", []),
+        },
+    )
+
+
+def _chat_response_from_task_card(
+    task_card: dict[str, object],
+    *,
+    decision: dict[str, object],
+    thread_key: str,
+    workflow_explanation_reason: str,
+) -> dict[str, object]:
+    task_type = str(task_card.get("task_type", "task")).replace("_", " ")
+    next_action = str(task_card.get("recommended_next_action", "prepare_agent_ops_review"))
+    rails = _task_card_rails(task_card)
+    risk_domains = _string_items(task_card.get("risk_domains", []))
+    primitives = _string_items(task_card.get("operation_primitives", []))
+    evidence_boundary = _nested(task_card, "evidence_boundary")
+    not_observed = _string_items(evidence_boundary.get("not_observed", []))
+    secret_policy = _nested(task_card, "secret_policy")
+    gateway_transfer = _nested(task_card, "gateway_transfer")
+    first_safe_action = str(task_card.get("first_safe_action", "")).strip()
+    summary = str(task_card.get("user_facing_summary", "")).strip()
+    not_a_workflow = _string_items(task_card.get("not_a_workflow", []))
+    secret_action = str(secret_policy.get("recommended_action", "")).strip()
+    invariant = str(gateway_transfer.get("invariant", "")).strip().replace("_", " ")
+
+    body_lines = [
+        summary or f"This is a {task_type} task.",
+        f"Not a workflow: {', '.join(_display_items(not_a_workflow[:5]))}." if not_a_workflow else "",
+        f"First safe action: {first_safe_action}" if first_safe_action else "",
+        f"Use workflow rails: {', '.join(rails[:4])}." if rails else "",
+        f"Track primitives: {', '.join(_display_items(primitives[:7]))}." if primitives else "",
+        f"Risks to surface: {', '.join(_display_items(risk_domains[:5]))}." if risk_domains else "",
+        f"Secret policy: {secret_action}." if secret_action else "",
+        f"Gateway invariant: {invariant}." if invariant else "",
+        f"Not observed yet: {', '.join(_display_items(not_observed[:4]))}." if not_observed else "",
+    ]
+    body = " ".join(line for line in body_lines if line)
+    return _chat_response(
+        kind="task_card",
+        headline="I will frame this as a high-level task first.",
+        body=body,
+        phase="task_card_prepared",
+        next_action=next_action,
+        thread_key=thread_key,
+        actions=[
+            _action(next_action, _label_for_action(next_action), "primary"),
+            _action("show_status", "Show status", "secondary"),
+            _action("record_workflow_learning_trace", "Record learning trace", "secondary"),
+        ],
+        claim_boundary=str(task_card.get("claim_boundary", "A prepared task card is not observed execution evidence.")),
+        extra_state={
+            "route_action": decision.get("action", "dispatch"),
+            "confidence": decision.get("confidence", "low"),
+            "selected_workflow": decision.get("selected_skill", ""),
+            "workflow_explanation_reason": workflow_explanation_reason,
+            "task_card": task_card,
+            "task_type": task_card.get("task_type", ""),
+            "route_level": task_card.get("route_level", ""),
+            "workflow_rails": task_card.get("workflow_rails", []),
+            "operation_primitives": primitives,
+            "risk_domains": risk_domains,
+            "evidence_not_observed": not_observed,
+        },
+    )
+
+
+def _task_card_rails(task_card: dict[str, object]) -> list[str]:
+    rails: list[str] = []
+    raw_rails = task_card.get("workflow_rails", [])
+    if not isinstance(raw_rails, list):
+        return rails
+    for rail in raw_rails:
+        if isinstance(rail, dict):
+            skill = str(rail.get("skill", "")).strip()
+            if skill:
+                rails.append(skill)
+    return rails
+
+
+def _string_items(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item)]
+
+
+def _display_items(items: list[str]) -> list[str]:
+    return [item.replace("_", " ") for item in items]
+
+
+def _label_for_action(action_id: str) -> str:
+    for known_action, label in _ACK_PRIMARY_ACTIONS_BY_NEXT_ACTION.values():
+        if known_action == action_id:
+            return label
+    return action_id.replace("_", " ").title()
+
+
+def _open_coding_agent_label(profile: str | None) -> str:
+    if profile == "codex":
+        return "Open in Codex"
+    if profile == "claude-code":
+        return "Open in Claude Code"
+    if profile == "hermes":
+        return "Open Hermes coding"
+    if profile:
+        return f"Open {executor_label(profile)}"
+    return "Open coding agent"
+
+
+def build_chat_response_from_plan(plan_payload: dict[str, object], *, thread_key: str = "") -> dict[str, object]:
+    plan = _nested(plan_payload, "plan")
+    contract = _nested(plan_payload, "wrapper_contract")
+    if plan.get("status") == "blocked":
+        return _chat_response(
+            kind="clarification",
+            headline="I need one answer before I can plan this.",
+            body="The request is not specific enough for a safe plan yet.",
+            phase="clarifying",
+            next_action="ask_clarification",
+            thread_key=thread_key,
+            actions=[_action("answer:clarify", "Answer clarification", "primary"), _action("cancel", "Cancel", "secondary")],
+            claim_boundary="No plan or execution is approved.",
+        )
+    actions = [_action("accept_plan", "Accept plan", "primary"), _action("revise_plan", "Revise plan", "secondary")]
+    coding_delegate = _nested(contract, "coding_delegate")
+    if coding_delegate.get("available"):
+        if coding_delegate.get("executor_choice_required"):
+            actions.append(_action("choose_executor", "Choose coding agent", "secondary"))
+        actions.append(_action("prepare_handoff", "Prepare handoff", "secondary", enabled=False))
+    selected = str(plan.get("recommended_workflow", "plan"))
+    executor_resolution = _nested(coding_delegate, "executor_resolution")
+    selected_executor = coding_delegate.get("selected_executor_profile")
+    executor_choice_required = bool(coding_delegate.get("executor_choice_required", False))
+    next_copy = (
+        "Accept or revise the plan first; choose the executor before handoff if needed."
+        if executor_choice_required
+        else "Accept or revise the plan first; the handoff button stays disabled until acceptance."
+        if coding_delegate.get("available")
+        else "Accept or revise the plan before this moves to the selected workflow."
+    )
+    return _chat_response(
+        kind="plan",
+        headline=f"I routed this to `{display_workflow_name(selected)}` because it needs a safe plan first.",
+        body=f"{next_copy} A draft plan is still only planning evidence.",
+        phase="planning",
+        next_action="accept_or_revise_plan",
+        thread_key=thread_key,
+        actions=actions,
+        claim_boundary="A draft plan is not execution evidence.",
+        extra_state={
+            "selected_workflow": selected,
+            "plan_status": plan.get("status", "draft"),
+            "review_gate": plan.get("review_gate", {}),
+            "coding_delegate_available": bool(coding_delegate.get("available", False)),
+            "executor_choice_required": executor_choice_required,
+            "selected_executor_profile": selected_executor,
+            "work_owner_mode": coding_delegate.get("work_owner_mode", ""),
+            "executor_resolution": executor_resolution,
+            "prepared_handoff_field": coding_delegate.get("prepared_handoff_field", ""),
+            "prepared_handoff_boundary": coding_delegate.get("prepared_handoff_boundary", ""),
+            "evidence_not_observed": [
+                "plan acceptance",
+                "executor/runtime dispatch",
+                "executor result",
+                "verification",
+            ],
+        },
+    )
+
+
+# The four operator-card confirmations. They ship `enabled: False` with no
+# arming path today, and they are named here so the arbitration disables them
+# for the same reason it disables every other confirmation action: they belong
+# to the same family, and a card that leaves one live beside an armed ladder is
+# a second authority question on one intent.
+_OPERATOR_CARD_CONFIRM_ACTION_IDS = (
+    "confirm_browser_action",
+    "confirm_command_execution",
+    "confirm_connector_action",
+    "confirm_file_operation",
+)
+# `send_to_codex` is the codex lane's rendering alias for the
+# `operator_confirmation` ladder's `send_to_executor`; it is a label on the same
+# question, not a ladder of its own, which is why it never appears in
+# `action_gate.LADDER_ACTION_IDS`.
+_LADDER_ACTION_ALIASES = {"send_to_codex": "send_to_executor"}
+# Derived, not retyped. This tuple and `action_gate.LADDER_ACTION_IDS` were two
+# hand-maintained copies of one list and they had already drifted apart —
+# `send_to_codex` was in this one and not in that one — so the gate's map is now
+# the source and the two additions this lane really owns are named beside it.
+_LADDER_ACTION_IDS = tuple(
+    sorted({*LADDER_ACTION_IDS.values(), *_LADDER_ACTION_ALIASES, *_OPERATOR_CARD_CONFIRM_ACTION_IDS})
+)
+_LADDER_ACTION_LABELS = {
+    "choose_executor": "Choose coding agent",
+    "choose_permission_profile": "Choose permission profile",
+    "confirm_risky_action": "Confirm risky action",
+    "send_to_executor": "Open coding agent",
+}
+
+
+_RISKY_ACTION_REFUSED_REASON = (
+    "The operator refused or revoked the approval this risky action needs, so the authority it "
+    "carried stays withheld and this action is not offered."
+)
+
+
+def _apply_refused_risky_action(
+    actions: list[dict[str, object]],
+    next_action: str,
+    gate: dict[str, object],
+) -> tuple[list[dict[str, object]], str]:
+    """Take the refused action off the table when the gate refused a risky class.
+
+    Only on a real refusal: an enforced `deny` verdict. A report-only
+    classification withheld nothing and must not disable anything, and an
+    unarmed ladder with no refusal behind it is the ordinary quiet case.
+    """
+    risk = gate.get("action_risk")
+    if not isinstance(risk, dict):
+        return actions, next_action
+    if risk.get("decision") != "deny" or risk.get("enforcement") != "enforced":
+        return actions, next_action
+    adjusted = [
+        {
+            **entry,
+            "enabled": False,
+            "payload": {
+                **(entry.get("payload") if isinstance(entry.get("payload"), dict) else {}),
+                "disabled_reason": _RISKY_ACTION_REFUSED_REASON,
+            },
+        }
+        if entry.get("id") in _LADDER_ACTION_IDS
+        else entry
+        for entry in actions
+    ]
+    if next_action not in _LADDER_ACTION_IDS:
+        return adjusted, next_action
+    remaining = next(
+        (str(entry.get("id", "")) for entry in adjusted if entry.get("enabled") and entry.get("id")),
+        "",
+    )
+    return adjusted, remaining or next_action
+
+
+def _apply_action_gate_arbitration(
+    actions: list[dict[str, object]],
+    next_action: str,
+    gate: dict[str, object],
+) -> tuple[list[dict[str, object]], str]:
+    """Render the arbitrated ladder; never re-run the arbitration.
+
+    When the gate armed a ladder other than the one this card leads with, the
+    armed action becomes the card's next action and every other authority-ladder
+    action is disabled, so one intent still produces one prompt.
+
+    A refusal arms nothing, and that is not the same as nothing having happened:
+    the operator answered no. Leaving "Open coding agent" on the card as its
+    enabled primary would offer the very action that was refused, so the ladder
+    actions are disabled there too and the card falls back to its first
+    remaining enabled action.
+    """
+    confirmation = gate.get("confirmation")
+    if not isinstance(confirmation, dict):
+        return actions, next_action
+    if not confirmation.get("required"):
+        return _apply_refused_risky_action(actions, next_action, gate)
+    armed = str(confirmation.get("action_id", ""))
+    if not armed or armed == next_action:
+        return actions, next_action
+    adjusted = [
+        {**entry, "enabled": False} if entry.get("id") in _LADDER_ACTION_IDS and entry.get("id") != armed else entry
+        for entry in actions
+    ]
+    if all(entry.get("id") != armed for entry in adjusted):
+        adjusted.insert(0, _action(armed, _LADDER_ACTION_LABELS.get(armed, armed.replace("_", " ")), "primary"))
+    return adjusted, armed
+
+
+def _delegation_copy_locale(delegation_payload: dict[str, object]) -> str:
+    """The locale a denial card should speak: whatever the caller declared, else English.
+
+    Explicitly declared and never sniffed. A delegation payload carries no
+    request text -- the message is attached only under the full context mode,
+    and a denied build has no handoff to attach it to -- so detecting a locale
+    here would mean guessing from whatever fragment happened to survive. English
+    is this repo's documented default for user-facing output and localization is
+    opt-in, so an absent declaration is answered and not inferred.
+    """
+    declared = delegation_payload.get("copy_locale")
+    return str(declared) if declared in SUPPORTED_COPY_LOCALES else "en"
+
+
+def _action_gate_state(delegation_payload: dict[str, object]) -> dict[str, object]:
+    """Render the action-gate verdict onto a card without re-deciding it.
+
+    Card builders read this block; none of them recompute ``dispatchable``,
+    ``choice_required``, or which confirmation ladder is armed. The single
+    decision path is ``coding.action_gate.evaluate_action_gate``, invoked once
+    per delegation build.
+    """
+    gate = _nested(delegation_payload, "action_gate")
+    if not gate:
+        return {}
+    state: dict[str, object] = {"action_gate": deepcopy(gate)}
+    envelope = gate.get("authority_envelope")
+    if isinstance(envelope, dict):
+        state["task_authority_envelope"] = deepcopy(envelope)
+    return state
+
+
+def build_chat_response_from_delegation(delegation_payload: dict[str, object], *, thread_key: str = "") -> dict[str, object]:
+    delegation = _nested(delegation_payload, "delegation")
+    executor_resolution = _nested(delegation_payload, "executor_resolution")
+    action = str(delegation.get("action", "fallback"))
+    gate_state = _action_gate_state(delegation_payload)
+    gate = _nested(delegation_payload, "action_gate")
+    if gate.get("outcome") == "deny":
+        denial = _nested(gate, "denial")
+        rule_id = str(denial.get("rule_id", "")) or "safety_preflight_denied"
+        field = str(denial.get("field", "")) or "message"
+        correction = str(denial.get("correction", ""))
+        # The durable side of the denial, read off the decision block the
+        # delegation build already produced. The existing card is extended
+        # rather than joined by a new one: a second chat card would move
+        # `chat_card_case_count` across ten registration sites to say something
+        # this card is already the right place to say.
+        decision = _nested(delegation_payload, "blocked_work_decision")
+        recovery = str(decision.get("recovery_action", "")) or recovery_action_for(
+            str(decision.get("reason_domain", "")), str(decision.get("reason_code", ""))
+        )
+        recovery_line = recovery_action_copy(recovery, locale=_delegation_copy_locale(delegation_payload))
+        return _chat_response(
+            kind="clarification",
+            headline="I cannot prepare this handoff under the current safety policy.",
+            body=(
+                f"Rule `{rule_id}` blocked this on `{field}`. {correction} "
+                f"{recovery_line} "
+                "No coding agent was chosen, no handoff was prepared, and no confirmation is being asked for."
+            ).replace("  ", " "),
+            phase="clarifying",
+            next_action="route_coding_request",
+            thread_key=thread_key,
+            actions=[_action("show_status", "Show status", "primary"), _action("cancel", "Cancel", "secondary")],
+            claim_boundary="A denied request is not a prepared handoff, dispatch, or execution evidence.",
+            extra_state={
+                "delegation_action": action,
+                "intent": delegation.get("intent", "unknown"),
+                "selected_workflow": delegation.get("recommended_workflow", ""),
+                "work_owner_mode": delegation_payload.get("work_owner_mode", "retained_hermes"),
+                "selected_executor_profile": None,
+                "executor_choice_required": False,
+                "dispatchable": False,
+                "prepared_handoff_boundary": "A denied request is not a prepared handoff.",
+                # `paused`, never a success-shaped state. The nearest such state
+                # a gate can reach is `not_required`, which says no evidence is
+                # owed; a block says work is owed and cannot proceed. Folding
+                # the two would render a refusal as a step that was skipped
+                # because nobody needed it.
+                "work_lifecycle_state": "paused",
+                "work_claim": "not_attempted",
+                "recovery_action": recovery,
+                "recovery_action_copy": recovery_line,
+                **gate_state,
+            },
+        )
+    if action == "delegate" and delegation_payload.get("executor_handoff"):
+        handoff = _nested(delegation_payload, "executor_handoff")
+        executor = str(handoff.get("selected_executor_profile") or handoff.get("executor_target") or "executor")
+        label = executor_label(executor)
+        status_request = _delegation_is_coding_status_request(delegation_payload)
+        actions = []
+        if status_request:
+            actions.append(_action("show_coding_handoff_status", "Show coding status", "primary"))
+        actions.append(
+            _action(
+                "send_to_executor",
+                _open_coding_agent_label(executor),
+                "secondary" if status_request else "primary",
+                payload={"selected_executor_profile": executor},
+            )
+        )
+        if executor == "codex":
+            actions.append(_action("send_to_codex", "Open in Codex", "secondary", payload={"compatibility_alias": True}))
+        if status_request:
+            actions.append(
+                _action(
+                    "attach_executor_session",
+                    f"Attach existing {label} session",
+                    "secondary",
+                    enabled=False,
+                    payload={
+                        "selected_executor_profile": executor,
+                        "disabled_reason": "A wrapper session id is required before OMH can attach observed coding-session evidence.",
+                    },
+                )
+            )
+        _append_owner_preference_actions(actions, delegation_payload)
+        actions.append(_action("show_status", "Show status", "secondary"))
+        next_action = "show_coding_handoff_status" if status_request else "send_to_executor"
+        actions, next_action = _apply_action_gate_arbitration(actions, next_action, gate)
+        return _chat_response(
+            kind="handoff",
+            headline=(
+                f"{label} is selected; session evidence is not attached yet."
+                if status_request
+                else "A coding-agent handoff is ready."
+            ),
+            body=(
+                f"I can open {label} with the prepared handoff or attach an existing {label} session. "
+                "Until wrapper evidence records dispatch, progress, result, or verification, I cannot say what the coding agent has done."
+                if status_request
+                else f"I can open {label} with this prepared handoff, but I will not claim implementation until coding-agent evidence is observed."
+            ),
+            phase="handoff_prepared",
+            next_action=next_action,
+            thread_key=thread_key,
+            actions=actions,
+            claim_boundary="Prepared handoff is not execution evidence.",
+            extra_state={
+                "delegation_action": action,
+                "intent": delegation.get("intent", "unknown"),
+                "selected_workflow": delegation.get("recommended_workflow", ""),
+                "work_owner_mode": delegation_payload.get("work_owner_mode", "external_executor"),
+                "selected_executor_profile": delegation_payload.get("selected_executor_profile", "codex"),
+                "executor_choice_required": False,
+                "dispatch_policy": delegation_payload.get("dispatch_policy", "ask_before_dispatch"),
+                "executor_target": handoff.get("executor_target", "codex"),
+                "handoff_status": handoff.get("status", "prepared_not_observed"),
+                "prepared_handoff_boundary": "Prepared handoff is not execution evidence.",
+                "executor_readiness": delegation_payload.get("executor_readiness", {}),
+                "executor_resolution": executor_resolution,
+                "coding_status_request": status_request,
+                "route_context": delegation_payload.get("route_context", {}),
+                **_executor_local_workflow_state(handoff, executor),
+                **_owner_preference_state(delegation_payload),
+                **gate_state,
+            },
+        )
+    if action == "delegate" and delegation_payload.get("prompt_handoff"):
+        prompt_handoff = _nested(delegation_payload, "prompt_handoff")
+        selected = str(prompt_handoff.get("selected_executor_profile") or "executor")
+        label = executor_label(selected)
+        prompt_body = _prompt_handoff_show_body(
+            label,
+            first_line=f"I prepared a copyable {selected} prompt. This is not dispatch, execution, review, CI, or merge evidence.",
+            prompt_handoff=prompt_handoff,
+            delegation_payload=delegation_payload,
+        )
+        status_request = _delegation_is_coding_status_request(delegation_payload)
+        actions = []
+        if status_request:
+            actions.append(_action("show_coding_handoff_status", "Show coding status", "primary"))
+        actions.extend(
+            [
+                _action(
+                    "show_prompt_handoff",
+                    f"Show {label} prompt",
+                    "secondary" if status_request else "primary",
+                    payload={"selected_executor_profile": selected},
+                ),
+                _action("copy_prompt_handoff", f"Copy {label} prompt", "secondary", payload={"selected_executor_profile": selected}),
+            ]
+        )
+        _append_owner_preference_actions(actions, delegation_payload)
+        if status_request:
+            actions.append(
+                _action(
+                    "attach_executor_session",
+                    f"Attach existing {label} session",
+                    "secondary",
+                    enabled=False,
+                    payload={
+                        "selected_executor_profile": selected,
+                        "disabled_reason": "A wrapper session id is required before OMH can attach observed coding-session evidence.",
+                    },
+                )
+            )
+        actions.append(_action("show_status", "Show status", "secondary"))
+        next_action = "show_coding_handoff_status" if status_request else "show_prompt_handoff"
+        actions, next_action = _apply_action_gate_arbitration(actions, next_action, gate)
+        return _chat_response(
+            kind="handoff",
+            headline=(
+                f"{label} is selected; session evidence is not attached yet."
+                if status_request
+                else "A prompt handoff is ready."
+            ),
+            body=(
+                f"I can show or copy the {label} prompt, then the wrapper can attach an observed {label} session. "
+                "Until dispatch, progress, result, or verification evidence is recorded, I cannot say what the coding agent has done."
+                if status_request
+                else prompt_body
+            ),
+            phase="prompt_handoff_prepared",
+            next_action=next_action,
+            thread_key=thread_key,
+            actions=actions,
+            claim_boundary="Prompt handoff is prepared only; OMH has not dispatched it to an executor.",
+            extra_state={
+                "delegation_action": action,
+                "intent": delegation.get("intent", "unknown"),
+                "selected_workflow": delegation.get("recommended_workflow", ""),
+                "work_owner_mode": "prompt_only_handoff",
+                "selected_executor_profile": selected,
+                "executor_choice_required": False,
+                "dispatch_policy": "prepare_only",
+                "dispatchable": False,
+                "handoff_status": prompt_handoff.get("status", "prepared_not_observed"),
+                "prepared_handoff_boundary": "Prompt handoff is prepared only; OMH has not dispatched it to an executor.",
+                "executor_readiness": delegation_payload.get("executor_readiness", {}),
+                "executor_resolution": executor_resolution,
+                "coding_status_request": status_request,
+                "route_context": delegation_payload.get("route_context", {}),
+                **_executor_local_workflow_state(prompt_handoff, selected),
+                **_owner_preference_state(delegation_payload),
+                **gate_state,
+            },
+        )
+    if action == "delegate" and delegation_payload.get("runtime_handoff"):
+        runtime_handoff = _nested(delegation_payload, "runtime_handoff")
+        selected = str(runtime_handoff.get("selected_executor_profile") or "runtime")
+        runtime_profile = _nested(runtime_handoff, "runtime_profile")
+        runtime_label = str(runtime_profile.get("label") or executor_label(selected))
+        status_request = _delegation_is_coding_status_request(delegation_payload)
+        primary_action = "start_hermes_coding" if selected == "hermes" else "start_runtime"
+        primary_label = "Start Hermes coding" if selected == "hermes" else "Start runtime"
+        extra_actions = (
+            [_action_from_spec(spec) for spec in hermes_coding_team_extra_action_specs(selected_executor_profile=selected)]
+            if selected == "hermes"
+            else []
+        )
+        body = (
+            hermes_coding_team_body()
+            if selected == "hermes"
+            else (
+                f"I prepared a {runtime_label} runtime contract with team/swarm, worker-protocol, and worktree guidance. "
+                "This is not runtime start, implementation, review, CI, or merge evidence."
+            )
+        )
+        runtime_actions = [
+            *([_action("show_coding_handoff_status", "Show coding status", "primary")] if status_request else []),
+            _action(
+                "show_runtime_handoff",
+                "Show runtime",
+                "secondary" if status_request else "primary",
+                payload={"selected_executor_profile": selected},
+            ),
+            *extra_actions,
+            _action(primary_action, primary_label, "primary", enabled=False, payload={"selected_executor_profile": selected}),
+            _action("prepare_worktree", "Prepare worktree", "secondary", enabled=False, payload={"selected_executor_profile": selected}),
+            _action("start_team", "Start team", "secondary", enabled=False, payload={"selected_executor_profile": selected}),
+            _action("start_swarm", "Start swarm", "secondary", enabled=False, payload={"selected_executor_profile": selected}),
+            _action("show_status", "Show status", "secondary"),
+        ]
+        _append_owner_preference_actions(runtime_actions, delegation_payload, before_last=True)
+        runtime_next_action = "show_coding_handoff_status" if status_request else "show_runtime_handoff"
+        runtime_actions, runtime_next_action = _apply_action_gate_arbitration(runtime_actions, runtime_next_action, gate)
+        return _chat_response(
+            kind="handoff",
+            headline="A runtime handoff is ready.",
+            body=body,
+            phase="runtime_handoff_prepared",
+            next_action=runtime_next_action,
+            thread_key=thread_key,
+            actions=runtime_actions,
+            claim_boundary=(
+                hermes_coding_team_claim_boundary()
+                if selected == "hermes"
+                else "Runtime handoff is prepared only; OMH has not started Hermes, OMX, pi-family, OMC, workers, tmux, or worktrees."
+            ),
+            extra_state={
+                "delegation_action": action,
+                "intent": delegation.get("intent", "unknown"),
+                "selected_workflow": delegation.get("recommended_workflow", ""),
+                "work_owner_mode": "runtime_handoff",
+                "selected_executor_profile": selected,
+                "executor_choice_required": False,
+                "runtime_family": runtime_profile.get("runtime_family", ""),
+                "underlying_agent": runtime_profile.get("underlying_agent", ""),
+                "dispatch_policy": "prepare_only",
+                "dispatchable": False,
+                "handoff_status": runtime_handoff.get("status", "prepared_not_observed"),
+                "prepared_handoff_boundary": (
+                    hermes_coding_team_claim_boundary()
+                    if selected == "hermes"
+                    else "Runtime handoff is prepared only; OMH has not started Hermes, OMX, pi-family, OMC, workers, tmux, or worktrees."
+                ),
+                "executor_readiness": delegation_payload.get("executor_readiness", {}),
+                "executor_resolution": executor_resolution,
+                "coding_status_request": status_request,
+                **_executor_local_workflow_state(runtime_handoff, selected),
+                **_owner_preference_state(delegation_payload),
+                **gate_state,
+            },
+        )
+    if action == "delegate" and _nested(delegation_payload, "executor_selection").get("choice_required"):
+        policy_state = _delegation_policy_state(delegation_payload)
+        body = (
+            "Keep this in Hermes, hand it to Claude Code, hand it to Codex or an oh-my runtime path, "
+            "or split it across several agents in parallel before this becomes a prepared coding handoff."
+        )
+        if policy_state:
+            # Coding-shaped work never opens with "keep this in Hermes": the
+            # choice is which coding agent owns it, not whether to delegate.
+            # Hermes is still named first — as orchestrator, not owner — so the
+            # card stays executor-neutral with no vendor presented as default.
+            body = (
+                "Hermes keeps orchestration and status only — choose the coding agent that owns this "
+                "work: Claude Code, Codex, an oh-my runtime path, or split it across several agents "
+                "in parallel. Main coding stays delegated."
+            )
+        owner_preference_state = _owner_preference_state(delegation_payload)
+        reset_reason = str(owner_preference_state.get("owner_preference_reset_reason", ""))
+        if reset_reason:
+            body = f"{body} The learned coding-agent streak was reset: {reset_reason}."
+        choice_actions, choice_next_action = _apply_action_gate_arbitration(
+            [
+                _action("choose_executor", "Choose coding agent", "primary"),
+                _action("prepare_agent_board_card", "Split across agents", "secondary"),
+                _action("show_status", "Show status", "secondary"),
+            ],
+            "choose_executor",
+            gate,
+        )
+        return _chat_response(
+            kind="handoff",
+            headline="Choose the coding agent.",
+            body=body,
+            phase="executor_choice_required",
+            next_action=choice_next_action,
+            thread_key=thread_key,
+            actions=choice_actions,
+            claim_boundary="Coding-agent choice is not dispatch or implementation evidence.",
+            extra_state={
+                "delegation_action": action,
+                "intent": delegation.get("intent", "unknown"),
+                "selected_workflow": delegation.get("recommended_workflow", ""),
+                "work_owner_mode": "external_executor",
+                "selected_executor_profile": None,
+                "executor_choice_required": True,
+                "dispatchable": False,
+                "executor_options": _nested(delegation_payload, "executor_selection").get("options", []),
+                "prepared_handoff_boundary": "Coding-agent choice is not dispatch or implementation evidence.",
+                "executor_readiness": delegation_payload.get("executor_readiness", {}),
+                "executor_choice_context": delegation_payload.get("executor_choice_context", {}),
+                "executor_resolution": executor_resolution,
+                **owner_preference_state,
+                **policy_state,
+                **gate_state,
+            },
+        )
+    if action == "clarify":
+        workflow = str(delegation.get("recommended_workflow", ""))
+        policy_state = _delegation_policy_state(delegation_payload)
+        if workflow in _RETAINED_DELEGATION_SKILLS:
+            return _chat_response(
+                kind="clarification",
+                headline="I need one clarification before starting this Hermes workflow.",
+                body="This stays with Hermes; I will clarify scope and evidence boundaries before preparing the retained brief.",
+                phase="clarifying",
+                next_action="answer_clarification",
+                thread_key=thread_key,
+                actions=[_action("answer:clarify", "Answer clarification", "primary"), _action("cancel", "Cancel", "secondary")],
+                claim_boundary="Retained Hermes guidance is not observed work.",
+                extra_state={
+                    "delegation_action": action,
+                    "intent": delegation.get("intent", "unknown"),
+                    "recommended_workflow": workflow,
+                },
+            )
+        return _chat_response(
+            kind="clarification",
+            headline="I need one clarification before sending this to an executor.",
+            body="The request looks like coding work, but the handoff is not specific enough yet.",
+            phase="clarifying",
+            next_action="answer_clarification",
+            thread_key=thread_key,
+            actions=[_action("answer:clarify", "Answer clarification", "primary"), _action("cancel", "Cancel", "secondary")],
+            claim_boundary="No executor handoff is dispatchable.",
+            extra_state={
+                "delegation_action": action,
+                "intent": delegation.get("intent", "unknown"),
+                **policy_state,
+            },
+        )
+    return _chat_response(
+        kind="clarification",
+        headline="I need to route this before coding delegation.",
+        body="I will ask for the missing outcome before preparing an executor handoff.",
+        phase="clarifying",
+        next_action="route_coding_request",
+        thread_key=thread_key,
+        actions=[_action("answer:clarify", "Answer clarification", "primary"), _action("cancel", "Cancel", "secondary")],
+        claim_boundary="No executor handoff is dispatchable.",
+        extra_state={
+            "delegation_action": action,
+            "intent": delegation.get("intent", "unknown"),
+            **_delegation_policy_state(delegation_payload),
+        },
+    )
+
+
+def _executor_local_workflow_state(handoff: dict[str, object], selected_profile: str) -> dict[str, object]:
+    binding = handoff.get("executor_local_workflow")
+    if not isinstance(binding, dict) or str(binding.get("profile", "")) != selected_profile:
+        return {}
+    if validate_executor_local_workflow(binding):
+        return {}
+    return {"executor_local_workflow": deepcopy(binding)}
+
+
+def _fence_marker_for(text: str) -> str:
+    """Backtick fence for embedding ``text``, owned by ``message_gate``.
+
+    The gate fences its own prompt block with the identical rule, so the two
+    surfaces share one implementation rather than a hand-synced pair."""
+    return fence_marker_for(text)
+
+
+def _prompt_handoff_show_body(
+    label: str,
+    *,
+    first_line: str,
+    prompt_handoff: dict[str, Any],
+    delegation_payload: dict[str, Any],
+) -> str:
+    """The show-prompt chat body: boundary sentence, a one-line header naming
+    the executor (and model when the handoff carries a resolved route), then
+    the composed prompt inside a content-derived fence. A prompt over the
+    summary bound keeps its head plus the documented
+    ``... [truncated, N chars total]`` marker inside the fence
+    (DELEGATE_PROMPT_DISPLAY_RULE)."""
+    prompt_text, already_bounded = _composed_prompt_handoff_text(delegation_payload, prompt_handoff)
+    bounded = prompt_text if already_bounded else bounded_prompt_preview(prompt_text, max_chars=MAX_SUMMARY_CHARS)
+    header = f"Prepared prompt for {label}"
+    model = _handoff_model_label(prompt_handoff)
+    if model:
+        header = f"{header} — {model}"
+    fence = _fence_marker_for(bounded)
+    return "\n".join([first_line, "", f"{header}:", fence, bounded, fence])
+
+
+def _composed_prompt_handoff_text(
+    delegation_payload: dict[str, Any], prompt_handoff: dict[str, Any]
+) -> tuple[str, bool]:
+    """The composed prompt for display, plus whether it is already bounded.
+
+    Preference order: the fully expanded prompt (full message-context mode),
+    the template expanded with the raw message when both are present, the
+    structure-preserving bounded preview (already carrying the truncation
+    marker), and finally the raw template with its ``{message}`` placeholder —
+    OMH deliberately does not persist the raw task, so the placeholder form is
+    what a stored session can show."""
+    full = str(delegation_payload.get("prompt_handoff_prompt", "") or "")
+    if full:
+        return full, False
+    template = str(prompt_handoff.get("prompt_template", "") or "")
+    message = str(delegation_payload.get("message", "") or "")
+    if template and message:
+        return template.replace("{message}", message), False
+    preview = str(delegation_payload.get("prompt_handoff_prompt_preview", "") or "")
+    if preview:
+        return preview, True
+    return template, False
+
+
+def _handoff_model_label(handoff: dict[str, Any]) -> str:
+    route = handoff.get("model_route")
+    if not isinstance(route, dict):
+        return ""
+    model = str(route.get("selected_model") or "").strip()
+    if not model:
+        return ""
+    return model_label_for(model, str(route.get("selected_reasoning_effort") or "").strip())
+
+
+def _delegation_policy_state(delegation_payload: dict[str, Any]) -> dict[str, object]:
+    """Pass the delegation-mandatory policy block through to card state when present."""
+    policy = delegation_payload.get("delegation_policy")
+    if not isinstance(policy, dict) or not policy.get("inline_coding_prohibited"):
+        return {}
+    return {"delegation_policy": dict(policy)}
+
+
+def build_chat_response_from_status(status_payload: dict[str, Any], *, thread_key: str = "") -> dict[str, object]:
+    next_action = str(status_payload.get("next_action", "show_status"))
+    kind, headline, body, claim_boundary = _status_copy(status_payload, next_action)
+    actions = [_action("show_status", "Show status", "secondary")]
+    if next_action == "choose_executor":
+        actions.insert(0, _action("choose_executor", "Choose coding agent", "primary"))
+    if next_action == "dispatch_to_executor":
+        selected = str(_nested(status_payload, "prepared").get("executor_target", "") or _nested(status_payload, "prepared").get("selected_executor_profile", ""))
+        actions.insert(0, _action("send_to_executor", _open_coding_agent_label(selected), "primary"))
+        if str(_nested(status_payload, "prepared").get("executor_target", "")) == "codex":
+            actions.insert(1, _action("send_to_codex", "Open in Codex", "secondary", payload={"compatibility_alias": True}))
+    if next_action == "show_prompt_handoff":
+        selected = str(_nested(status_payload, "prepared").get("selected_executor_profile", "") or "")
+        actions.insert(
+            0,
+            _action(
+                "show_prompt_handoff",
+                "Show prompt",
+                "primary",
+                payload={"selected_executor_profile": selected},
+            ),
+        )
+        actions.insert(
+            1,
+            _action(
+                "copy_prompt_handoff",
+                "Copy prompt",
+                "secondary",
+                payload={"selected_executor_profile": selected},
+            ),
+        )
+    if next_action == "show_runtime_handoff":
+        selected = str(_nested(status_payload, "prepared").get("selected_executor_profile", "") or "")
+        actions.insert(
+            0,
+            _action(
+                "show_runtime_handoff",
+                "Show runtime",
+                "primary",
+                payload={"selected_executor_profile": selected},
+            ),
+        )
+    return _chat_response(
+        kind=kind,
+        headline=headline,
+        body=body,
+        phase=_phase_for_next_action(next_action),
+        next_action=next_action,
+        thread_key=thread_key,
+        actions=actions,
+        claim_boundary=claim_boundary,
+        extra_state={
+            "execution_observed": _nested(status_payload, "execution").get("observed", False),
+            "verification_observed": _nested(status_payload, "verification").get("observed", False),
+            "review_required": _nested(status_payload, "review").get("required", False),
+            "review_status": _nested(status_payload, "review").get("status", "not_observed"),
+            "ci_status": _nested(status_payload, "ci").get("status", "not_observed"),
+            "merge_readiness_status": _nested(status_payload, "merge_readiness").get("status", "not_observed"),
+            "merge_status": _nested(status_payload, "merge").get("status", "not_observed"),
+        },
+        status_card=build_status_card_from_status(status_payload),
+    )
+
+
+def build_chat_response_from_omh_status_roadmap(paths: OmhPaths, *, thread_key: str = "") -> dict[str, object]:
+    probe = _omh_status_probe(paths)
+    roadmap = _nested(probe, "capability_gap_roadmap")
+    summary = _nested(roadmap, "summary")
+    next_actions = _roadmap_next_actions(roadmap, limit=3)
+    setup_gaps = _intish(summary.get("baseline_product_gaps", 0))
+    evidence_gaps = _intish(summary.get("evidence_gaps", 0))
+    optional_unknowns = _intish(summary.get("optional_or_host_unknowns", 0))
+    next_action_sentence = _section_item_without_next_prefix(_roadmap_next_action_sentence(next_actions))
+    body_lines = [
+        "Current status:",
+        f"- OMH setup gaps: {setup_gaps}.",
+        f"- Evidence gaps: {evidence_gaps}.",
+        f"- Optional/host unknowns: {optional_unknowns}.",
+        "",
+        "Next action:",
+        f"- {next_action_sentence}" if next_action_sentence else "- No immediate local action is required.",
+        "",
+        "Boundary: local setup, plugin install, or smoke checks are not proof that Hermes loaded the plugin, ran an executor, reviewed code, passed CI, or merged anything.",
+    ]
+    return _chat_response(
+        kind="status",
+        headline="Here is the current OMH status and next action.",
+        body="\n".join(body_lines),
+        phase="status",
+        next_action="show_status",
+        thread_key=thread_key,
+        actions=[
+            _action("show_status", "Show status", "primary"),
+            _action("show_target_status", "Show target status", "secondary"),
+        ],
+        claim_boundary=str(roadmap.get("claim_boundary") or probe.get("claim_boundary") or _default_overclaim_guard()),
+        extra_state={
+            "status_source": "omh_probe",
+            "probe_summary": {
+                "plugin_distribution_ready": bool(probe.get("plugin_distribution_ready")),
+                "plugin_runtime_active": bool(probe.get("plugin_runtime_active")),
+                "native_integration_claim_ready": bool(probe.get("native_integration_claim_ready")),
+                "team_worker_readiness_ready": bool(probe.get("team_worker_readiness_ready")),
+                "mcp_host_session_observed": bool(probe.get("mcp_host_session_observed")),
+            },
+            "capability_gap_roadmap": roadmap,
+            "roadmap_next_actions": next_actions,
+            "workflow_explanation_reason": "The user asked for OMH status or the next operational action, so the wrapper shows local probe and roadmap evidence instead of drafting a new plan.",
+            "evidence_not_observed": [
+                "Hermes plugin runtime load",
+                "wrapper-visible workflow use",
+                "executor work",
+                "review, CI, or merge",
+            ],
+        },
+    )
+
+
+def _omh_status_probe(paths: OmhPaths) -> dict[str, object]:
+    return _clone_static_dict(
+        _omh_status_probe_cached(
+            str(paths.omh_home),
+            str(paths.hermes_home),
+            _omh_status_probe_fingerprint(paths),
+        )
+    )
+
+
+@lru_cache(maxsize=64)
+def _omh_status_probe_cached(
+    omh_home: str,
+    hermes_home: str,
+    _fingerprint: tuple[tuple[str, int, int, int], ...],
+) -> dict[str, object]:
+    return _omh_status_probe_projection(
+        probe_capabilities(OmhPaths(omh_home=Path(omh_home), hermes_home=Path(hermes_home)), include_roadmap=True)
+    )
+
+
+def _omh_status_probe_projection(probe: dict[str, object]) -> dict[str, object]:
+    roadmap = probe.get("capability_gap_roadmap")
+    return {
+        "claim_boundary": probe.get("claim_boundary"),
+        "plugin_distribution_ready": bool(probe.get("plugin_distribution_ready")),
+        "plugin_runtime_active": bool(probe.get("plugin_runtime_active")),
+        "native_integration_claim_ready": bool(probe.get("native_integration_claim_ready")),
+        "team_worker_readiness_ready": bool(probe.get("team_worker_readiness_ready")),
+        "mcp_host_session_observed": bool(probe.get("mcp_host_session_observed")),
+        "capability_gap_roadmap": roadmap if isinstance(roadmap, dict) else {},
+    }
+
+
+def _omh_status_probe_fingerprint(paths: OmhPaths) -> tuple[tuple[str, int, int, int], ...]:
+    watched = (
+        paths.hermes_config_path,
+        paths.skills_dir / omh_skill_install_path("oh-my-hermes") / "SKILL.md",
+        paths.runtime_state_path,
+        paths.runtime_runs_dir,
+        paths.runtime_wrapper_sessions_dir,
+        paths.runtime_mcp_host_sessions_path,
+        paths.runtime_plugin_host_observations_path,
+        paths.runtime_worktrees_path,
+        paths.executor_readiness_path,
+        paths.target_registry_path,
+        paths.hermes_home / "hooks.yaml",
+        paths.hermes_home / "hooks.json",
+        paths.hermes_home / ".mcp.json",
+        paths.hermes_home / "mcp.json",
+        paths.hermes_plugins_dir,
+        paths.hermes_plugin_dir,
+        paths.hermes_plugin_dir / ".omh-plugin-manifest.json",
+        paths.hermes_plugin_dir / "plugin.yaml",
+        paths.hermes_plugin_dir / "__init__.py",
+        paths.hermes_home / "apps",
+    )
+    run_child_fingerprint = _child_dir_fingerprints(paths.runtime_runs_dir)
+    session_child_fingerprint = _child_dir_fingerprints(paths.runtime_wrapper_sessions_dir)
+    runtime_files = (
+        _glob_fingerprints(
+            paths.runtime_runs_dir,
+            "*/run.json",
+            child_dir_fingerprints=run_child_fingerprint,
+        )
+        + _glob_fingerprints(
+            paths.runtime_runs_dir,
+            "*/wrapper.json",
+            child_dir_fingerprints=run_child_fingerprint,
+        )
+        + _glob_fingerprints(
+            paths.runtime_runs_dir,
+            "*/runtime_observations.jsonl",
+            child_dir_fingerprints=run_child_fingerprint,
+        )
+        + _glob_fingerprints(
+            paths.runtime_wrapper_sessions_dir,
+            "*/session.json",
+            child_dir_fingerprints=session_child_fingerprint,
+        )
+        + _glob_fingerprints(
+            paths.runtime_wrapper_sessions_dir,
+            "*/runtime_observations.jsonl",
+            child_dir_fingerprints=session_child_fingerprint,
+        )
+    )
+    return tuple(_path_fingerprint(path) for path in watched) + runtime_files
+
+
+def _glob_fingerprints(
+    root: Path,
+    pattern: str,
+    *,
+    child_dir_fingerprints: tuple[tuple[str, int, int, int], ...] | None = None,
+    limit: int = 256,
+) -> tuple[tuple[str, int, int, int], ...]:
+    effective_child_dir_fingerprints = (
+        child_dir_fingerprints
+        if child_dir_fingerprints is not None
+        else _child_dir_fingerprints(root, limit=limit)
+    )
+    paths = _glob_fingerprint_paths_cached(
+        str(root),
+        pattern,
+        limit,
+        _path_fingerprint(root),
+        effective_child_dir_fingerprints,
+        _glob_child_target_fingerprints(root, pattern, effective_child_dir_fingerprints),
+    )
+    return tuple(_path_fingerprint(Path(path)) for path in paths)
+
+
+@lru_cache(maxsize=128)
+def _glob_fingerprint_paths_cached(
+    root: str,
+    pattern: str,
+    limit: int,
+    _root_fingerprint: tuple[str, int, int, int],
+    _child_dir_fingerprints: tuple[tuple[str, int, int, int], ...],
+    _child_target_fingerprints: tuple[tuple[str, int, int, int], ...],
+) -> tuple[str, ...]:
+    try:
+        paths = sorted(Path(root).glob(pattern))
+    except OSError:
+        return ()
+    return tuple(str(path) for path in paths[:limit])
+
+
+def _glob_child_target_fingerprints(
+    root: Path,
+    pattern: str,
+    child_dir_fingerprints: tuple[tuple[str, int, int, int], ...] | None,
+) -> tuple[tuple[str, int, int, int], ...]:
+    """Include nested targets in the cache key, including currently-missing ones.
+
+    A child directory's mtime is not reliable on every filesystem after a
+    file is created.  The status probe mostly uses ``*/<fixed filename>``;
+    fingerprinting those target paths makes a newly-created observation
+    invalidate the cached empty glob without removing the cache entirely.
+    """
+    if not pattern.startswith("*/") or child_dir_fingerprints is None:
+        return ()
+    relative = pattern[2:]
+    if not relative or "/" in relative or "*" in relative or "?" in relative:
+        return ()
+    return tuple(
+        _path_fingerprint(Path(directory) / relative)
+        for directory, *_ in child_dir_fingerprints
+    )
+
+
+def _child_dir_fingerprints(root: Path, *, limit: int = 256) -> tuple[tuple[str, int, int, int], ...]:
+    try:
+        children = sorted(path for path in root.iterdir() if path.is_dir())
+    except OSError:
+        return ()
+    return tuple(_dir_entry_fingerprint(path) for path in children[:limit])
+
+
+def _dir_entry_fingerprint(path: Path) -> tuple[str, int, int, int]:
+    try:
+        stat = path.stat()
+        entry_count = sum(1 for _ in path.iterdir())
+    except OSError:
+        return (str(path), 0, 0, 0)
+    # Entry count stands in for st_size: NTFS updates a directory mtime on a
+    # coarse tick, so an entry added within the same tick would otherwise
+    # leave the fingerprint unchanged and serve a stale cached glob.
+    return (str(path), int(stat.st_mtime_ns), entry_count, int(stat.st_mode))
+
+
+def _path_fingerprint(path: Path) -> tuple[str, int, int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(path), 0, 0, 0)
+    return (str(path), int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_mode))
+
+
+def build_chat_response_from_omh_quickstart(
+    paths: OmhPaths,
+    *,
+    source: str = "generic",
+    thread_key: str = "",
+) -> dict[str, object]:
+    card = build_quickstart_card(paths, source=source)
+    local_status = _nested(card, "local_status")
+    doctor = _nested(local_status, "doctor")
+    plugin_bridge = _nested(local_status, "plugin_bridge")
+    wrapper_usage = _nested(local_status, "wrapper_usage")
+    prompts = card.get("chat_prompts", [])
+    first_prompt = ""
+    if isinstance(prompts, list) and prompts and isinstance(prompts[0], dict):
+        first_prompt = str(prompts[0].get("prompt", "")).strip()
+    evidence_gaps = card.get("not_evidence_yet", [])
+    evidence_gap = str(evidence_gaps[0]) if isinstance(evidence_gaps, list) and evidence_gaps else _default_overclaim_guard()
+    roadmap = _nested(card, "capability_gap_roadmap")
+    next_actions = _roadmap_next_actions(roadmap, limit=3)
+    packs = card.get("first_value_packs", [])
+    starters = card.get("natural_language_starters", [])
+    pack_lines: list[str] = []
+    if isinstance(packs, list):
+        for pack in packs[:3]:
+            if not isinstance(pack, dict):
+                continue
+            label = str(pack.get("label", "")).strip()
+            outcome = str(pack.get("outcome", "")).strip()
+            if label and outcome:
+                pack_lines.append(f"- {label}: {outcome}")
+
+    starter_lines: list[str] = []
+    if isinstance(starters, list):
+        for starter in starters[:3]:
+            if not isinstance(starter, dict):
+                continue
+            label = str(starter.get("label", "")).strip()
+            prompt = str(starter.get("prompt", "")).strip()
+            if label and prompt:
+                starter_lines.append(f"- {label}: {prompt}")
+
+    body_lines = [
+        (
+            f"OMH quickstart is {card.get('status', 'unknown')}: "
+            f"{doctor.get('passing', 0)}/{doctor.get('total', 0)} local checks pass."
+        ),
+        "",
+        "Local status:",
+        f"- Plugin bridge: {str(plugin_bridge.get('status', 'unknown')).replace('_', ' ')}.",
+        f"- Hermes plugin use: {'observed' if bool(local_status.get('plugin_runtime_active')) else 'not observed yet'}.",
+        f"- Wrapper usage: {str(wrapper_usage.get('status', 'missing')).replace('_', ' ')}.",
+        "",
+        "Next in Hermes:",
+        "- Say what you want in normal language; OMH will show the selected workflow and next action.",
+        *(["", "Natural-language starters:", *starter_lines] if starter_lines else []),
+        *(["", "Optional explicit workflow prompt:", f"- {first_prompt}"] if first_prompt else []),
+        *(["", "High-value things to try:", *pack_lines] if pack_lines else []),
+        "- Open the workflow picker with ./omh when you want to choose manually.",
+        "- Use Show detailed status only when setup or registration looks wrong.",
+        "",
+        f"Boundary: {evidence_gap}",
+    ]
+    observed_gaps = [str(item) for item in evidence_gaps if str(item)] if isinstance(evidence_gaps, list) else []
+    return _chat_response(
+        kind="quickstart",
+        headline="Here is the OMH first-use path.",
+        body="\n".join(body_lines),
+        phase="status",
+        next_action="show_quickstart",
+        thread_key=thread_key,
+        actions=[
+            _action("show_quickstart", "Show quickstart", "primary"),
+            _action("show_skill_picker", "Open workflow picker", "secondary"),
+            _action("show_status", "Show detailed status", "secondary"),
+        ],
+        claim_boundary=str(card.get("claim_boundary") or _default_overclaim_guard()),
+        extra_state={
+            "status_source": "omh_quickstart",
+            "quickstart_card": card,
+            "capability_gap_roadmap": roadmap,
+            "roadmap_next_actions": next_actions,
+            "workflow_explanation_reason": "The user asked what to do after OMH setup or install, so the wrapper shows the first-use quickstart card instead of asking for shell command approval.",
+            "evidence_not_observed": observed_gaps,
+        },
+    )
+
+
+def build_chat_response_from_omh_context_brief(
+    message: str = "",
+    *,
+    source: str = "generic",
+    thread_key: str = "",
+) -> dict[str, object]:
+    brief = build_context_brief(message, source=source, max_hints=2, include_prompt_context=False)
+    degradation = brief.get("degradation")
+    degradation_note = degradation_chat_note(degradation)
+    lanes = brief.get("lanes", [])
+    lane_summaries: list[str] = []
+    if isinstance(lanes, list):
+        for lane in lanes[:4]:
+            if not isinstance(lane, dict):
+                continue
+            label = str(lane.get("label", "")).strip()
+            use_for = str(lane.get("use_for", "")).strip()
+            if label and use_for:
+                lane_summaries.append(f"{label}: {use_for}")
+    body_lines = [
+        "OMH is the Hermes workflow layer: install once, then ask Hermes in chat instead of memorizing backend commands.",
+        "",
+        "Use it for:",
+        *[f"- {summary}" for summary in lane_summaries[:3]],
+        "",
+        "How to start:",
+        "- Ask what you want in normal language.",
+        "- Open the workflow picker with ./omh when you want to choose manually.",
+        "- Ask what to do next after setup when you want the first-use path.",
+        "",
+        # Empty on the happy path, so a healthy brief renders exactly the lines
+        # it rendered before.
+        *([degradation_note, ""] if degradation_note else []),
+        "Boundary: this context explains routing and workflow choices; it is not execution, delivery, verification, review, CI, or merge evidence.",
+    ]
+    return _chat_response(
+        kind="context_brief",
+        headline="Here is how OMH fits into Hermes.",
+        body="\n".join(body_lines),
+        phase="route",
+        next_action="show_context_brief",
+        thread_key=thread_key,
+        actions=[
+            _action("show_context_brief", "Show OMH overview", "primary"),
+            _action("show_skill_picker", "Open workflow picker", "secondary"),
+            _action("show_quickstart", "Show quickstart", "secondary"),
+        ],
+        claim_boundary=str(brief.get("claim_boundary") or _default_overclaim_guard()),
+        extra_state={
+            "status_source": "omh_context_brief",
+            "context_brief": brief,
+            "workflow_explanation_reason": "The user asked what OMH is or how to use it, so the wrapper explains the Hermes-facing mental model before opening the full picker.",
+            "evidence_not_observed": [
+                "workflow selection",
+                "plan acceptance",
+                "executor dispatch",
+                "generation, delivery, verification, review, CI, or merge",
+            ],
+        },
+    )
+
+
+def build_status_card_from_status(status_payload: dict[str, Any]) -> dict[str, object]:
+    next_action = str(status_payload.get("next_action", "show_status"))
+    kind, headline, body, claim_boundary = _status_copy(status_payload, next_action)
+    card: dict[str, object] = {
+        "schema_version": STATUS_CARD_SCHEMA_VERSION,
+        "run_id": str(status_payload.get("run_id", "")),
+        "kind": kind,
+        "severity": _status_card_severity(next_action),
+        "headline": headline,
+        "summary": body,
+        "next_action": next_action,
+        "primary_action": "send_to_executor" if next_action == "dispatch_to_executor" else "show_status",
+        "steps": _status_card_steps(status_payload, next_action),
+        "claim_boundary": claim_boundary,
+    }
+    harness_progress = status_payload.get("harness_progress")
+    if isinstance(harness_progress, dict) and harness_progress:
+        card["harness_progress"] = harness_progress
+    progress_events, omitted_progress_events = _status_progress_events(status_payload)
+    if progress_events:
+        card["progress_reporting"] = {
+            "schema_version": "omh_progress_reporting/v1",
+            "mode": "event_triggered",
+            "timed_polling_required": False,
+            "human_update_policy": "one_or_two_sentence_summary_only",
+        }
+        card["progress_events"] = progress_events
+        card["latest_progress_event"] = progress_events[-1]
+        card["omitted_progress_event_count"] = omitted_progress_events
+    return card
+
+
+def _status_progress_events(status_payload: dict[str, Any]) -> tuple[list[dict[str, object]], int]:
+    events = status_payload.get("progress_events")
+    if isinstance(events, list):
+        return compact_progress_events(events)
+    latest = status_payload.get("latest_progress_event")
+    if isinstance(latest, dict) and latest:
+        return compact_progress_events([latest])
+    return [], 0
+
+
+def _status_copy(status_payload: dict[str, Any], next_action: str) -> tuple[str, str, str, str]:
+    fallback = (
+        "status",
+        "I have a conservative status update.",
+        str(status_payload.get("safe_summary", "")),
+        "Only observed evidence can support completion claims.",
+    )
+    kind, headline, body, claim_boundary = _STATUS_COPY.get(next_action, fallback)
+    if next_action == "wait_for_executor_evidence":
+        label = _status_executor_label(status_payload)
+        suffix = _status_executor_suffix(status_payload)
+        return (
+            kind,
+            f"The coding handoff{suffix} was dispatched.",
+            f"I am waiting for {label + ' ' if label else ''}executor evidence before reporting completion.",
+            claim_boundary,
+        )
+    if next_action == "dispatch_to_executor":
+        suffix = _status_executor_suffix(status_payload)
+        return (
+            kind,
+            f"The coding handoff{suffix} is ready.",
+            "I have prepared the coding handoff, but executor/runtime dispatch is not observed yet.",
+            claim_boundary,
+        )
+    if next_action in {"show_prompt_handoff", "show_runtime_handoff"}:
+        suffix = _status_executor_suffix(status_payload)
+        return kind, f"{headline}{suffix}", body, claim_boundary
+    if next_action in {"report_merge_ready", "report_merged"}:
+        return _merge_status_copy(status_payload, next_action, kind, headline, claim_boundary)
+    return kind, headline, body, claim_boundary
+
+
+def _merge_status_copy(
+    status_payload: dict[str, Any],
+    next_action: str,
+    kind: str,
+    headline: str,
+    claim_boundary: str,
+) -> tuple[str, str, str, str]:
+    """AC2 for the two rungs that assert something happened outside this machine.
+
+    The static copy for these actions asserted CI and merge success outright,
+    while `safe_summary` for the same run already carried the citations. A
+    sentence here now either names the receipt and the acting surface behind the
+    success it asserts, or does not assert it. CI and merge are external
+    effects; merge readiness is a local decision, so its own headline stands.
+    """
+    ci = _receipt_citation_clause("CI", _status_gate_receipt(status_payload, "ci"))
+    merge = _receipt_citation_clause("Merge", _status_gate_receipt(status_payload, "merge"))
+    if next_action == "report_merged" and not merge:
+        return (
+            kind,
+            "The runtime ledger records a merge that nothing observed.",
+            "No external effect receipt names the surface that merged this, so I am not reporting it as merged.",
+            "A merge with no receipt naming the acting surface is not merge evidence.",
+        )
+    gates = ["Execution", "verification", "review"]
+    citations: list[str] = []
+    if ci:
+        gates.append("CI")
+        citations.append(ci)
+    if next_action == "report_merged":
+        gates.append("merge")
+        citations.append(merge)
+    else:
+        gates.append("merge-readiness")
+    sentences = [f"{_english_series(gates)} evidence are observed."]
+    if citations:
+        sentences.append(f"Cited by {'; '.join(citations)}.")
+    if not ci:
+        sentences.append(
+            "No external effect receipt names the surface that ran CI, so CI is not reported as passed."
+        )
+    return kind, headline, " ".join(sentences), claim_boundary
+
+
+def _status_gate_receipt(status_payload: dict[str, Any], gate: str) -> dict[str, Any]:
+    receipt = _nested(status_payload, gate).get("receipt")
+    return receipt if isinstance(receipt, dict) else {}
+
+
+def _receipt_citation_clause(label: str, receipt: dict[str, Any]) -> str:
+    """``CI receipt receipt-… via runtime_ci_record``, or "" when nothing observed it.
+
+    Only a `succeeded` receipt that names both itself and an acting surface can
+    back a success sentence; every other receipt state describes an effect that
+    did not succeed, or one nobody could name.
+    """
+    if str(receipt.get("observed_result", "")) != "succeeded":
+        return ""
+    receipt_id = str(receipt.get("receipt_id", ""))
+    acting_surface = str(receipt.get("acting_surface", ""))
+    if not receipt_id or not acting_surface:
+        return ""
+    return f"{label} receipt {receipt_id} via {acting_surface}"
+
+
+def _english_series(items: list[str]) -> str:
+    if len(items) < 3:
+        return " and ".join(items)
+    return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+
+def _status_executor_suffix(status_payload: dict[str, Any]) -> str:
+    """`` (Codex)`` or, when the handoff carries a resolved model route,
+    `` (Codex — gpt-5.6-sol xhigh)`` — the status-board single-field label
+    convention (`model_label_for`); empty when nothing is known."""
+    display = " — ".join(
+        part
+        for part in (_status_executor_label(status_payload), _status_model_label(status_payload))
+        if part
+    )
+    return f" ({display})" if display else ""
+
+
+def _status_executor_label(status_payload: dict[str, Any]) -> str:
+    for value in (
+        _nested(status_payload, "prepared").get("executor_target", ""),
+        _nested(status_payload, "prepared").get("selected_executor_profile", ""),
+        _nested(status_payload, "executor_session_status").get("selected_executor_profile", ""),
+        status_payload.get("selected_executor_profile", ""),
+    ):
+        profile = str(value or "").strip()
+        if profile:
+            return executor_label(profile)
+    return ""
+
+
+def _status_model_label(status_payload: dict[str, Any]) -> str:
+    for container in (
+        _nested(status_payload, "prepared"),
+        _nested(status_payload, "executor_session_status"),
+        status_payload,
+    ):
+        route = container.get("model_route")
+        if not isinstance(route, dict):
+            continue
+        model = str(route.get("selected_model") or "").strip()
+        if model:
+            return model_label_for(model, str(route.get("selected_reasoning_effort") or "").strip())
+    return ""
+
+
+def _base_interaction(
+    message: str,
+    *,
+    source: str,
+    source_metadata: dict[str, str],
+    mode: str,
+    include_message: bool,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": CHAT_INTERACTION_SCHEMA_VERSION,
+        "source": source,
+        "source_metadata": source_metadata,
+        "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "message_length": len(message),
+        "thread_key": _thread_key(source, source_metadata, message=message),
+        "mode": mode,
+        "next_action": "unknown",
+        "redaction_policy": "stdout_includes_message" if include_message else "metadata_only",
+        "overclaim_guard": _default_overclaim_guard(),
+    }
+    if include_message:
+        payload["message"] = message
+    return payload
+
+
+def build_goal_quality_coaching_card(message: str, *, locale: str | None = None) -> dict[str, object] | None:
+    """Build a plain-language coaching card for a goal-classified chat message that
+    has no stated success/acceptance criteria, or return None when coaching does
+    not apply.
+
+    Classification reuses `workflows.goal_quality_coaching.is_goal_classified_message`
+    (itself built on the same loopability classifier OMH's /loop routing uses) and
+    criteria detection reuses `workflows.goal_ledger.goal_message_states_acceptance_criteria`
+    (the same criteria validation goal ledgers rely on). Neither is re-implemented here.
+    """
+    if not is_goal_classified_message(message):
+        return None
+    if goal_message_states_acceptance_criteria(message):
+        return None
+    copy = chat_copy("goal_quality_coaching", locale=locale or detect_copy_locale(message))
+    return {
+        "schema_version": GOAL_QUALITY_COACHING_CARD_SCHEMA_VERSION,
+        "kind": "goal_quality_coaching",
+        "headline": copy.headline,
+        "body": copy.body,
+        "next_action": "state_goal_success_criteria",
+        "claim_boundary": (
+            "This is coaching copy about stating success criteria; it is not a goal ledger, "
+            "completion gate, or execution evidence."
+        ),
+    }
+
+
+def _chat_response_with_goal_quality_coaching(
+    response: dict[str, object], card: dict[str, object]
+) -> dict[str, object]:
+    updated = dict(response)
+    state = dict(_nested(updated, "state"))
+    state["goal_quality_coaching_card"] = card
+    updated["state"] = state
+    body = str(updated.get("body", ""))
+    coaching_body = str(card.get("body", ""))
+    if coaching_body and coaching_body not in body:
+        updated["body"] = f"{body} {coaching_body}".strip()
+    raw_actions = updated.get("actions", [])
+    actions = [action for action in raw_actions if isinstance(action, dict)] if isinstance(raw_actions, list) else []
+    action_ids = {str(action.get("id", "")) for action in actions}
+    if "state_goal_success_criteria" not in action_ids:
+        actions.append(_action("state_goal_success_criteria", "State success criteria", "secondary"))
+    updated["actions"] = actions
+    return updated
+
+
+MEMORY_CONSOLIDATION_NOTICE_SCHEMA_VERSION = "omh_memory_consolidation_notice/v1"
+
+
+# Which routed cards already ask for what the notice is about to ask for.
+# Keyed by the notice's own `next_action`, because the two namespaces never
+# intersect: the notice emits `ask_hermes_to_consolidate_memory`, the card emits
+# `prepare_memory_sync`. Comparing them directly would be a permanent no-op that
+# still looks like a fix.
+#
+# Keyed on `next_action` rather than on the selected skill deliberately. A skill
+# rename would silently re-arm the loop with nothing failing, while these ids are
+# contract identifiers already pinned by the chat-card and common-request
+# coverage fixtures.
+_CONSOLIDATION_REMEDY_ACTIONS: dict[str, frozenset[str]] = {
+    "ask_hermes_to_consolidate_memory": frozenset({"prepare_memory_sync"}),
+}
+
+
+def _with_memory_consolidation_notice(
+    payload: dict[str, object], paths: OmhPaths, message: str = ""
+) -> dict[str, object]:
+    """Carry a pending consolidation brief into the chat card, on every surface.
+
+    The scheduler's decision used to reach an operator only through
+    `omh doctor` -- a command. Someone talking to Hermes from Slack or Telegram
+    never runs commands, so for them the brief did not exist. This is the same
+    fact, delivered where the conversation already is.
+
+    Additive on purpose: the routed card keeps its kind, headline, and actions,
+    and the notice is one body sentence plus structured state. It carries no
+    filesystem paths -- messenger copy leaks them to shared channels -- and the
+    body is appended before the render profile is recomputed, so each
+    messenger's own constraints shape it exactly like the rest of the card.
+
+    ``read_latest_consolidation`` normalizes every field it returns, so
+    ``reasons`` is always a list of strings here and a malformed brief on disk
+    degrades to "nothing pending" instead of failing the turn. The sentence is
+    rendered in the card's own language -- the body copy was already localized,
+    and an English suffix on a Korean card reads as a glitch.
+    """
+    brief = read_latest_consolidation(paths.omh_home, paths.hermes_home)
+    if not brief or not brief.get("due"):
+        return payload
+    reasons = list(brief.get("reasons", []))
+    if not reasons:
+        return payload
+    response = payload.get("chat_response")
+    if not isinstance(response, dict):
+        return payload
+    payload = dict(payload)
+    # The remedy depends on what the brief actually found: expired records have
+    # an OMH-local fix an operator can run; everything else needs the model.
+    record_expiry = brief.get("record_expiry", {}) if isinstance(brief.get("record_expiry"), dict) else {}
+    next_action = (
+        "run_omh_memory_retire"
+        if int(record_expiry.get("expired", 0) or 0) > 0
+        else "ask_hermes_to_consolidate_memory"
+    )
+    routed_next_action = str(_nested(_nested(payload, "chat_response"), "state").get("next_action", ""))
+    already_asked = routed_next_action in _CONSOLIDATION_REMEDY_ACTIONS.get(next_action, frozenset())
+    payload["memory_consolidation_notice"] = {
+        "schema_version": MEMORY_CONSOLIDATION_NOTICE_SCHEMA_VERSION,
+        "due": True,
+        "trigger": str(brief.get("trigger", "")),
+        "reasons": reasons,
+        "raised_at": str(brief.get("raised_at", "")),
+        "next_action": next_action,
+        "call_to_action_suppressed": already_asked,
+        "redaction_policy": "metadata_only",
+        "claim_boundary": (
+            "A consolidation notice is prepared context. It is not evidence that memory was "
+            "consolidated, that Hermes read the brief, or that any entry changed."
+        ),
+    }
+    updated = dict(response)
+    state = dict(_nested(updated, "state"))
+    state["memory_consolidation"] = {"due": True, "next_action": next_action}
+    updated["state"] = state
+    body = str(updated.get("body", ""))
+    # The locale comes from the user's message through the same detector the
+    # card copy used, not from the rendered card text. Re-deriving from the
+    # card was exact for CJK scripts but lossy for Latin ones: the detector's
+    # Latin-script hints are user-question phrases ("quiero", "peux-tu"), which
+    # declarative card copy does not contain, so es/fr/de cards read as English
+    # and got an English suffix -- the exact glitch this line exists to avoid.
+    notice_line = consolidation_notice_line(
+        detect_copy_locale(message or f"{updated.get('headline', '')} {body}"),
+        reasons,
+        suppress_call_to_action=already_asked,
+    )
+    if notice_line not in body:
+        updated["body"] = f"{body} {notice_line}".strip()
+    payload["chat_response"] = _chat_response_with_render_profile(
+        updated,
+        source=str(payload.get("source", "generic")),
+        source_metadata=_nested(payload, "source_metadata"),
+        platform_envelope=_nested(payload, "platform") or None,
+    )
+    return payload
+
+
+def enhance_chat_interaction_with_routing_observation(
+    payload: dict[str, object],
+    routing_observation: Mapping[str, object],
+) -> dict[str, object]:
+    """Add one canonical routing payload and its fenced user projection.
+
+    Discord, Slack, hosted wrappers, and Desktop all receive the same unfenced
+    bytes from ``routing_observation``; this adapter adds fences only at the
+    message boundary and then reuses the existing platform renderer.
+    """
+    observation = dict(routing_observation)
+    errors = validate_routing_observation(observation)
+    if errors:
+        raise ValueError("invalid chat routing observation: " + "; ".join(errors))
+    updated = dict(payload)
+    updated["routing_observation"] = observation
+    response = updated.get("chat_response")
+    if not isinstance(response, dict):
+        return updated
+    response = dict(response)
+    body = str(response.get("body", "") or "").rstrip()
+    code_text = render_routing_code_block_text(observation)
+    fenced = f"```text\n{code_text}\n```"
+    response["body"] = f"{body}\n\n{fenced}" if body else fenced
+    response["routing_observation"] = observation
+    response["routing_code_block_text"] = code_text
+    updated["chat_response"] = _chat_response_with_render_profile(
+        response,
+        source=str(updated.get("source", "generic")),
+        source_metadata=_nested(updated, "source_metadata"),
+        platform_envelope=_nested(updated, "platform") or None,
+    )
+    return updated
+
+
+def _finish_interaction(payload: dict[str, object], target_notice: dict[str, object] | None) -> dict[str, object]:
+    if target_notice:
+        payload["target_notice"] = target_notice
+        topology = target_notice.get("topology")
+        if isinstance(topology, dict):
+            payload["target_topology"] = topology
+    response = payload.get("chat_response")
+    if isinstance(response, dict):
+        response = _chat_response_with_route_explanation(response, _nested(payload, "route"))
+        # A retired-engine alias route (#954 stage 5) shows exactly one line on
+        # the status card -- the capability reason -- while the full
+        # machine-readable selection stays on `route.alias_resolution` (Q5).
+        alias_resolution = _nested(payload, "route").get("alias_resolution")
+        if isinstance(alias_resolution, dict) and alias_resolution.get("capability_reason"):
+            state = response.get("state")
+            if isinstance(state, dict):
+                state["capability_reason"] = str(alias_resolution["capability_reason"])
+        if target_notice:
+            response = _chat_response_with_target_notice(
+                response, target_notice, source=str(payload.get("source", "generic"))
+            )
+        goal_quality_coaching_card = payload.get("goal_quality_coaching_card")
+        if isinstance(goal_quality_coaching_card, dict):
+            response = _chat_response_with_goal_quality_coaching(response, goal_quality_coaching_card)
+        agentic_playbook = payload.get("agentic_playbook")
+        if isinstance(agentic_playbook, dict):
+            response = chat_response_with_agentic_playbook(response, agentic_playbook)
+        # Last, so the gate header sits above the final body every other
+        # transform has already contributed to, and immediately before the
+        # render profile is resolved so the shape gate chunks and dialects the
+        # header along with everything else.
+        response = _chat_response_with_message_gate(response, payload)
+        payload["chat_response"] = _chat_response_with_render_profile(
+            response,
+            source=str(payload.get("source", "generic")),
+            source_metadata=_nested(payload, "source_metadata"),
+            platform_envelope=_nested(payload, "platform") or None,
+        )
+    return payload
+
+
+# The gate attaches to coding-shaped responses only. `handoff` is the kind every
+# coding delegation lands on, so it qualifies on its own -- a handoff with no
+# resolved model is exactly the case the missing-model warning exists for.
+#
+# The harness alone does NOT qualify. `coding-handling` is the harness of the
+# `oh-my-hermes` router skill itself, so "what can OMH do?" resolves to it and
+# would have gained a header reading `model — unknown` on a capability
+# question, plus a spurious warning. Requiring a resolved executor alongside
+# the harness keeps the gate on replies about work someone is actually running.
+_MESSAGE_GATE_KINDS: Final[frozenset[str]] = frozenset({"handoff"})
+_MESSAGE_GATE_HARNESS: Final[str] = "coding-handling"
+
+
+def _chat_response_with_message_gate(
+    response: dict[str, object], payload: dict[str, object]
+) -> dict[str, object]:
+    """Attach the provenance gate and render its lines above the body.
+
+    Everything the gate prints is already computed elsewhere in this payload --
+    ``usage_trace`` resolved the workflow and evidence state, ``_status_model_label``
+    resolved the route, and ``_base_interaction`` hashed the message. Before this
+    function existed all of it was dropped at the render boundary and the
+    messenger got prose.
+    """
+    trace = _nested(response, "usage_trace")
+    state = _nested(response, "state")
+    executor = str(trace.get("selected_executor_profile", "")) or _status_executor_label(state)
+    kind = str(response.get("kind", ""))
+    coding_harness = str(trace.get("selected_harness", "")) == _MESSAGE_GATE_HARNESS
+    delegation_payload = _nested(payload, "delegation")
+    # `kind == "handoff"` is not sufficient on its own. `build_chat_response_from_route`
+    # emits that kind for the `ultraprocess` coding-STATUS route, which prepares
+    # no delegation and resolves no executor -- "show the coding agent status"
+    # was getting a header reading `model — unknown` plus a spurious warning,
+    # the same false positive the harness clause was tightened to remove.
+    if not ((kind in _MESSAGE_GATE_KINDS and (executor or delegation_payload)) or (coding_harness and executor)):
+        return response
+    gate = build_message_gate(
+        skill=str(trace.get("selected_workflow", "") or trace.get("label", "")),
+        executor=executor,
+        model_label=_status_model_label(state),
+        # The wire value is unreadable in a chat bubble, and `usage_trace`
+        # already carries the `next_action` that names the stage the evidence
+        # value alone cannot -- `observed_partial` is equally true of a test run
+        # and a review. The value itself is untouched and still ships in
+        # `usage_trace.evidence_state` for anything that parses it.
+        status=status_label(
+            str(trace.get("evidence_state", "")),
+            next_action=str(trace.get("next_action", "")),
+        ),
+        # Bounded to the same summary ceiling the show-prompt surface uses.
+        #
+        # This `if` is defence in depth, not the redaction mechanism. The
+        # guarantee is structural and upstream: with `include_message` unset,
+        # `_base_interaction` never puts the raw message into this payload at
+        # all -- a marker string planted in the message appears at zero paths
+        # in the serialized result. So the row is absent because there was
+        # nothing to render, and the guard only keeps that true if a future
+        # change starts carrying the message for some other reason.
+        task=bounded_prompt_preview(str(payload.get("message", "") or ""), max_chars=MAX_SUMMARY_CHARS)
+        if payload.get("message")
+        else "",
+        prompt_sha256=str(payload.get("message_sha256", "")),
+        prompt_chars=payload.get("message_length"),
+        composed_prompt=_message_gate_composed_prompt(delegation_payload),
+    )
+    updated = dict(response)
+    # Only the payload. The header is NOT prepended to `body` here: that would
+    # bake an ingress-source-derived render profile into the canonical
+    # `chat_response.body` and into `body_blocks`, which
+    # `docs/HERMES_AGENT_INTEGRATION_RUNBOOK.md` promises stay dialect-neutral.
+    # `messenger_rendering_contract` prepends it at the point it resolves the
+    # profile, so the rich body gets the aligned card, the fallback body gets
+    # bullets, and a wrapper relaying onto a different surface can still choose.
+    updated["message_gate"] = gate
+    return updated
+
+
+def _message_gate_composed_prompt(delegation_payload: dict[str, Any]) -> str:
+    """The composed Hermes order behind this handoff, or "" when none exists.
+
+    Reuses ``_composed_prompt_handoff_text`` rather than reading
+    ``prompt_template`` directly so the gate inherits its redaction posture: the
+    template keeps its literal ``{message}`` placeholder unless the wrapper
+    opted into carrying the raw task.
+    """
+    # `build_coding_delegation_payload` emits exactly one of these three, as
+    # mutually exclusive branches. Reading only `executor_handoff` meant a
+    # Hermes-runtime or prompt-only delegation showed no composed order at all
+    # while the header still carried a PROMPT digest -- no block, and no signal
+    # that a block was missing.
+    for key in ("executor_handoff", "runtime_handoff", "prompt_handoff"):
+        handoff = _nested(delegation_payload, key)
+        if handoff.get("prompt_template"):
+            prompt_text, _ = _composed_prompt_handoff_text(delegation_payload, handoff)
+            return prompt_text
+    return ""
+
+
+def _chat_response_with_route_explanation(
+    response: dict[str, object], route_payload: dict[str, object]
+) -> dict[str, object]:
+    route_explanation = _nested(route_payload, "route_explanation")
+    if not route_explanation:
+        return response
+    updated = dict(response)
+    state = dict(_nested(updated, "state"))
+    workflow_explanation = dict(_nested(state, "workflow_explanation"))
+    if not workflow_explanation:
+        return response
+
+    existing_reason = str(workflow_explanation.get("why_this_workflow") or "").strip()
+    route_reason = str(route_explanation.get("why_this_workflow") or "").strip()
+    if route_reason:
+        if existing_reason and existing_reason not in route_reason:
+            reason = f"{route_reason} {existing_reason}"
+        else:
+            reason = route_reason
+        workflow_explanation["why_this_workflow"] = reason
+        state["workflow_explanation_reason"] = reason
+    for source_key, target_key in (
+        ("selected_workflow", "route_selected_workflow"),
+        ("action", "route_action"),
+        ("next_action", "route_next_action"),
+        ("recommended_reply", "route_recommended_reply"),
+        ("primary_action_label", "route_primary_action_label"),
+        ("primary_action_hint", "route_primary_action_hint"),
+    ):
+        value = route_explanation.get(source_key)
+        if value:
+            workflow_explanation[target_key] = value
+    state["workflow_explanation"] = workflow_explanation
+    updated["state"] = state
+    return _usage_trace_naming_the_routed_workflow(updated, route_explanation)
+
+
+def _usage_trace_naming_the_routed_workflow(
+    response: dict[str, object], route_explanation: dict[str, object]
+) -> dict[str, object]:
+    """Make the visible prefix name the workflow the router chose.
+
+    A workflow can be dispatched and still answer with the card it starts
+    with: `ultrawork` on a request that names no target keeps its plan card by
+    design (`_route_response_mode`). The response state then says `plan`, and
+    the prefix -- the first line, and the whole of a notification preview --
+    said `plan` too, so a user who typed `ulw-work` saw no trace of the
+    workflow they named. The card is right; dropping the name is not.
+
+    Only on `dispatch`, and only the two display fields: `state` keeps its own
+    `selected_workflow` because that is what the response actually rendered,
+    and a consumer reading it must keep getting the answer it has always got.
+    """
+    routed = str(route_explanation.get("selected_workflow") or "").strip()
+    if not routed or str(route_explanation.get("action") or "") != "dispatch":
+        return response
+    trace = response.get("usage_trace")
+    if not isinstance(trace, dict) or str(trace.get("label") or "") == routed:
+        return response
+    updated = dict(response)
+    updated_trace = dict(trace)
+    updated_trace["label"] = routed
+    updated_trace["visible_prefix"] = f"[omh] {routed}"
+    updated_trace["selected_workflow"] = routed
+    updated["usage_trace"] = updated_trace
+    return updated
+
+
+def _chat_response_with_target_notice(
+    response: dict[str, object], target_notice: dict[str, object], *, source: str = ""
+) -> dict[str, object]:
+    updated = dict(response)
+    state = dict(_nested(updated, "state"))
+    topology = target_notice.get("topology")
+    if isinstance(topology, dict):
+        state["target_topology"] = topology
+    state["target_notice"] = {
+        "action": target_notice.get("action", ""),
+        "persistence": target_notice.get("persistence", ""),
+        "transition": topology.get("transition", "") if isinstance(topology, dict) else "",
+    }
+    updated["state"] = state
+    body = str(updated.get("body", ""))
+    notice_body = str(target_notice.get("body", ""))
+    if notice_body and notice_body not in body:
+        updated["body"] = f"{body} {notice_body}".strip()
+    raw_actions = updated.get("actions", [])
+    actions = [action for action in raw_actions if isinstance(action, dict)] if isinstance(raw_actions, list) else []
+    action_ids = {str(action.get("id", "")) for action in actions if isinstance(action, dict)}
+    if "show_target_status" not in action_ids:
+        actions.append(_action("show_target_status", "Show target status", "secondary"))
+    if target_notice.get("action") == "ask_to_apply_target_change" and "apply_target_change" not in action_ids:
+        action_payload: dict[str, object] = {"target_id": str(target_notice.get("target_id", ""))}
+        apply_payload = target_notice.get("apply_payload")
+        if isinstance(apply_payload, dict):
+            action_payload["target_observation"] = apply_payload
+        actions.append(
+            _action(
+                "apply_target_change",
+                "Apply target setup",
+                "secondary",
+                payload=action_payload,
+            )
+        )
+    updated["actions"] = actions
+    updated["claim_boundary"] = f"{updated.get('claim_boundary', '')} {target_notice.get('claim_boundary', '')}".strip()
+    trace = updated.get("usage_trace")
+    visible_prefix = str(trace.get("visible_prefix", "")) if isinstance(trace, dict) else ""
+    if visible_prefix:
+        updated["messenger_rendering"] = messenger_rendering_contract(
+            visible_prefix=visible_prefix,
+            first_line=str(updated.get("headline", "")),
+            body=str(updated.get("body", "")),
+            claim_boundary=str(updated.get("claim_boundary", "")),
+            source=source,
+        )
+    return updated
+
+
+def _chat_response_with_render_profile(
+    response: dict[str, object],
+    *,
+    source: str,
+    source_metadata: dict[str, object],
+    platform_envelope: dict[str, object] | None = None,
+) -> dict[str, object]:
+    updated = dict(response)
+    trace = updated.get("usage_trace")
+    visible_prefix = str(trace.get("visible_prefix", "")) if isinstance(trace, dict) else ""
+    if visible_prefix:
+        updated["messenger_rendering"] = messenger_rendering_contract(
+            visible_prefix=visible_prefix,
+            first_line=str(updated.get("headline", "")),
+            body=str(updated.get("body", "")),
+            claim_boundary=str(updated.get("claim_boundary", "")),
+            render_profile=render_profile_for_source(source, source_metadata),
+            source=source,
+            follow_up_texts=_message_gate_follow_ups(updated),
+            message_gate=_nested(updated, "message_gate") or None,
+            platform_envelope=platform_envelope,
+            response_actions=updated.get("actions", []),
+            attachments=updated.get("attachments", []),
+        )
+    return updated
+
+
+def _message_gate_follow_ups(response: dict[str, object]) -> tuple[str, ...]:
+    """The gate's prompt block, as the one follow-up message an adapter posts.
+
+    It is a separate message rather than more body because it answers a
+    different question -- what was actually ordered, not what state the work is
+    in -- and because a fenced block appended to a status body is what pushes a
+    Discord message past its ceiling and gets cut at an arbitrary point.
+    """
+    block = str(_nested(response, "message_gate").get("prompt_block", "") or "")
+    return (block,) if block else ()
+
+
+def _resolve_mode(mode: str, route: dict[str, object], *, message: str = "") -> str:
+    if mode != "auto":
+        return mode
+    if _is_command_preview_invocation(message):
+        return "route"
+    if _is_skill_catalog_question(message):
+        return "route"
+    action = str(route.get("action", "fallback"))
+    if action != "dispatch":
+        return _ROUTE_TO_MODE.get(action, "clarify")
+    if isinstance(route.get("learning_candidate_card"), dict):
+        return "route"
+    if isinstance(route.get("task_card"), dict):
+        return "route"
+    selected = str(route.get("selected_skill", ""))
+    if selected == "cancel":
+        return "route"
+    if selected == _ROUTER_SKILL and _is_skill_picker_invocation(message):
+        return "route"
+    if selected in _CLARIFICATION_SKILLS:
+        return "clarify"
+    if _route_is_explicit_hermes_coding_team_request(route, message):
+        return "route"
+    # Coding-status questions that land on the folded delivery engine render
+    # the status card, not a plan: the delivery-boundary capability absorbed
+    # `ultraprocess`'s session-status surface (#954 stage 5).
+    if selected == "ultrawork" and _route_is_coding_status_request(route):
+        return "route"
+    # Delivery-shaped requests on the folded engine keep the coding-owner
+    # flow `ultraprocess`'s retained-delegation route used to provide, while
+    # ordinary ultrawork lane planning keeps its plan card.
+    if selected == "ultrawork" and _route_is_delivery_capability_request(route):
+        return "route"
+    if selected in _DIRECT_WORKFLOW_SKILLS:
+        return "route"
+    return _ROUTE_TO_MODE.get(action, "plan")
+
+
+def _selected_recommendation_policy(decision: dict[str, object], selected: str) -> dict[str, object]:
+    recommendations = decision.get("recommendations", [])
+    if not isinstance(recommendations, list):
+        return {}
+    for item in recommendations:
+        if isinstance(item, dict) and str(item.get("skill", "")) == selected:
+            return {
+                "next_action": item.get("next_action", ""),
+                "evidence_boundary": item.get("evidence_boundary", ""),
+                "wrapper_guidance": item.get("wrapper_guidance", ""),
+            }
+    return {}
+
+
+def _is_missed_route_feedback(message: str) -> bool:
+    return is_missed_route_feedback(message)
+
+
+def _workflow_explanation_reason_for_route(
+    decision: dict[str, object],
+    policy: dict[str, object],
+    selected: str,
+) -> str:
+    guidance = str(policy.get("wrapper_guidance") or "").strip()
+    if guidance:
+        return (
+            f"Selected `{display_workflow_name(selected)}` because this request matches that workflow's triggers. {guidance}"
+        )
+    reason = str(decision.get("reason") or "").strip()
+    if reason and reason != "Matched trigger metadata for this task.":
+        return reason
+    return ""
+
+
+def _is_loop_timer_answer(decision: dict[str, object]) -> bool:
+    """Whether the router answered a loop on a timer as Hermes' own (`/loop 5m ask omh for status`).
+
+    The request is that loop, whatever its prompt asks about OMH, so the
+    router skill here is not a question for the catalog picker or the intro,
+    quickstart, or status card.
+    """
+    return str(decision.get("reason_code", "")) in LOOP_TIMER_ANSWER_REASON_CODES
+
+
+def _is_generic_skill_catalog_route(message: str, decision: dict[str, object]) -> bool:
+    if _is_skill_picker_invocation(message) or _is_command_preview_invocation(message):
+        return False
+    # A turn Hermes wrote for its own session command is answered as the host
+    # instructs; its template text is never a question about OMH's catalog.
+    # Nor is a stop or a question after a skill the person invoked
+    # ("/omh-plan stop"): it is about that skill, and the router answers it.
+    if host_command_turn(message) or _is_loop_timer_answer(decision) or invoked_skill_stops_or_asks(message):
+        return False
+    if _contains_cue_phrase(message, ("omh-docs",)) and not _is_omh_docs_question(message):
+        return False
+    if not _is_skill_catalog_question(message):
+        return False
+    return str(decision.get("selected_skill", "")) == _ROUTER_SKILL
+
+
+def _route_recommendation_next_action(decision: dict[str, object]) -> str:
+    recommendations = decision.get("recommendations")
+    if not isinstance(recommendations, list) or not recommendations:
+        return ""
+    first = recommendations[0]
+    if not isinstance(first, dict):
+        return ""
+    return str(first.get("next_action", ""))
+
+
+def _route_without_reason_code(route_payload: dict[str, object]) -> dict[str, object]:
+    """A copy of the route for a builder that replaces its reason with its own.
+
+    The code named the reason being replaced, so it goes from the route and
+    from the compact `route_decision` beside it; a wrapper may read either.
+    """
+    updated = dict(route_payload)
+    updated.pop("reason_code", None)
+    route_decision = updated.get("route_decision")
+    if isinstance(route_decision, dict) and "reason_code" in route_decision:
+        updated["route_decision"] = {key: value for key, value in route_decision.items() if key != "reason_code"}
+    return updated
+
+
+def _catalog_question_route_payload(route_payload: dict[str, object]) -> dict[str, object]:
+    updated = _route_without_reason_code(route_payload)
+    harness = primary_harness_for_skill(_ROUTER_SKILL)
+    updated.update(
+        {
+            "action": "dispatch",
+            "ambiguous": False,
+            "candidate_harness": harness,
+            "candidate_skill": _ROUTER_SKILL,
+            "confidence": "high",
+            "reason": "Catalog question; show the OMH workflow picker instead of asking for shell command approval.",
+            "recommendations": [
+                {
+                    "confidence": "high",
+                    "evidence_boundary": "Skill picker routing is not plan acceptance, dispatch, execution, review, CI, or verification evidence.",
+                    "matched": ["catalog_question"],
+                    "next_action": "choose_skill",
+                    "reasoning_demand": _reasoning_demand_for_skill(_ROUTER_SKILL),
+                    "score": max(10, _intish(updated.get("score", 0))),
+                    "skill": _ROUTER_SKILL,
+                    "wrapper_guidance": "Render the OMH workflow picker in chat; do not ask the user to approve `omh list` for catalog discovery.",
+                }
+            ],
+            "routing_instruction": "Show the OMH workflow picker for this catalog question.",
+            "routing_prompt_template": "Show the OMH workflow picker for this catalog question.\n\nUser message:\n{message}",
+            "score": max(10, _intish(updated.get("score", 0))),
+            "selected_harness": harness,
+            "selected_skill": _ROUTER_SKILL,
+            "threshold": "high",
+        }
+    )
+    updated["route_explanation"] = route_explanation_payload(updated)
+    return updated
+
+
+def _omh_status_route_payload(route_payload: dict[str, object]) -> dict[str, object]:
+    updated = _route_without_reason_code(route_payload)
+    harness = primary_harness_for_skill(_ROUTER_SKILL)
+    updated.update(
+        {
+            "action": "dispatch",
+            "ambiguous": False,
+            "candidate_harness": harness,
+            "candidate_skill": _ROUTER_SKILL,
+            "confidence": "high",
+            "reason": "OMH status or next-action question; show probe-backed status instead of drafting a plan.",
+            "recommendations": [
+                {
+                    "confidence": "high",
+                    "evidence_boundary": "Status and roadmap output is local probe evidence only; it is not host plugin load, executor work, review, CI, or merge evidence.",
+                    "matched": ["omh_status_question"],
+                    "next_action": "show_status",
+                    "reasoning_demand": _reasoning_demand_for_skill(_ROUTER_SKILL),
+                    "score": max(10, _intish(updated.get("score", 0))),
+                    "skill": _ROUTER_SKILL,
+                    "wrapper_guidance": "Render the OMH status and capability roadmap in chat; do not ask for shell approval just to answer status.",
+                }
+            ],
+            "routing_instruction": "Show OMH status and next actions from the local probe roadmap.",
+            "routing_prompt_template": "Show OMH status and next actions from the local probe roadmap.\n\nUser message:\n{message}",
+            "score": max(10, _intish(updated.get("score", 0))),
+            "selected_harness": harness,
+            "selected_skill": _ROUTER_SKILL,
+            "threshold": "high",
+        }
+    )
+    updated["route_explanation"] = route_explanation_payload(updated)
+    return updated
+
+
+def _omh_quickstart_route_payload(route_payload: dict[str, object]) -> dict[str, object]:
+    updated = _route_without_reason_code(route_payload)
+    harness = primary_harness_for_skill(_ROUTER_SKILL)
+    updated.update(
+        {
+            "action": "dispatch",
+            "ambiguous": False,
+            "candidate_harness": harness,
+            "candidate_skill": _ROUTER_SKILL,
+            "confidence": "high",
+            "reason": "OMH first-use or post-setup question; show the quickstart card instead of drafting a plan.",
+            "recommendations": [
+                {
+                    "confidence": "high",
+                    "evidence_boundary": "Quickstart output is local setup and wrapper guidance only; it is not host plugin load, executor work, review, CI, or merge evidence.",
+                    "matched": ["omh_quickstart_question"],
+                    "next_action": "show_quickstart",
+                    "reasoning_demand": _reasoning_demand_for_skill(_ROUTER_SKILL),
+                    "score": max(10, _intish(updated.get("score", 0))),
+                    "skill": _ROUTER_SKILL,
+                    "wrapper_guidance": "Render the OMH quickstart card in chat; do not ask for shell approval just to answer first-use setup guidance.",
+                }
+            ],
+            "routing_instruction": "Show the OMH quickstart card and first-use Hermes prompts.",
+            "routing_prompt_template": "Show the OMH quickstart card and first-use Hermes prompts.\n\nUser message:\n{message}",
+            "score": max(10, _intish(updated.get("score", 0))),
+            "selected_harness": harness,
+            "selected_skill": _ROUTER_SKILL,
+            "threshold": "high",
+        }
+    )
+    updated["route_explanation"] = route_explanation_payload(updated)
+    return updated
+
+
+def _omh_intro_route_payload(route_payload: dict[str, object]) -> dict[str, object]:
+    updated = _route_without_reason_code(route_payload)
+    harness = primary_harness_for_skill(_ROUTER_SKILL)
+    updated.update(
+        {
+            "action": "dispatch",
+            "ambiguous": False,
+            "candidate_harness": harness,
+            "candidate_skill": _ROUTER_SKILL,
+            "confidence": "high",
+            "reason": "OMH intro or usage question; show the compact Hermes-facing mental model before the full picker.",
+            "recommendations": [
+                {
+                    "confidence": "high",
+                    "evidence_boundary": "Context brief output is routing/help context only; it is not workflow execution, delivery, verification, review, CI, or merge evidence.",
+                    "matched": ["omh_intro_question"],
+                    "next_action": "show_context_brief",
+                    "reasoning_demand": _reasoning_demand_for_skill(_ROUTER_SKILL),
+                    "score": max(10, _intish(updated.get("score", 0))),
+                    "skill": _ROUTER_SKILL,
+                    "wrapper_guidance": "Render the OMH context brief first, then offer the workflow picker or quickstart card.",
+                }
+            ],
+            "routing_instruction": "Show the OMH context brief and offer the workflow picker as the next action.",
+            "routing_prompt_template": "Show the OMH context brief and offer the workflow picker as the next action.\n\nUser message:\n{message}",
+            "score": max(10, _intish(updated.get("score", 0))),
+            "selected_harness": harness,
+            "selected_skill": _ROUTER_SKILL,
+            "threshold": "high",
+        }
+    )
+    updated["route_explanation"] = route_explanation_payload(updated)
+    return updated
+
+
+def _roadmap_next_actions(roadmap: dict[str, Any], *, limit: int) -> list[dict[str, object]]:
+    actions = roadmap.get("next_actions", [])
+    if not isinstance(actions, list):
+        return []
+    compact: list[dict[str, object]] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        item = {
+            "id": str(action.get("id", "")),
+            "kind": str(action.get("kind", "")),
+            "label": str(action.get("label", "")),
+            "why": str(action.get("why", "")),
+            "boundary": str(action.get("boundary", "")),
+            "capabilities": _as_string_list(action.get("capabilities", [])),
+        }
+        command = str(action.get("command", "")).strip()
+        operator_instruction = str(action.get("operator_instruction", "")).strip()
+        if command:
+            item["command"] = command
+        if operator_instruction:
+            item["operator_instruction"] = operator_instruction
+        compact.append(item)
+        if len(compact) >= limit:
+            break
+    return compact
+
+
+def _roadmap_next_action_sentence(actions: list[dict[str, object]]) -> str:
+    if not actions:
+        return "Next: no blocking OMH setup action is currently required."
+    first = actions[0]
+    label = str(first.get("label", "Check OMH status")).strip() or "Check OMH status"
+    kind = str(first.get("kind", "")).strip()
+    command = str(first.get("command", "")).strip()
+    operator_instruction = str(first.get("operator_instruction", "")).strip()
+    why = str(first.get("why", "")).strip()
+    if command and kind == "product_gap" and "<" not in command:
+        return f"Next: {label} with `{command}`."
+    if operator_instruction:
+        return f"Next: {label}: {operator_instruction}"
+    if why:
+        return f"Next: {label}. {why}"
+    return f"Next: {label}."
+
+
+def _section_item_without_next_prefix(value: str) -> str:
+    text = value.strip()
+    if text.lower().startswith("next:"):
+        return text.split(":", 1)[1].strip()
+    return text
+
+
+def _intish(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _is_skill_picker_invocation(message: str) -> bool:
+    parts = message.strip().split(maxsplit=1)
+    if not parts:
+        return False
+    first = parts[0].strip(":,").lower()
+    for prefix in ("./", "/", "$", "@"):
+        if first.startswith(prefix):
+            first = first[len(prefix) :].strip(":,")
+            break
+    if first not in _SKILL_PICKER_TOKENS:
+        return False
+    rest = parts[1].strip().lower() if len(parts) > 1 else ""
+    return rest in _SKILL_PICKER_HELP_TOKENS
+
+
+@lru_cache(maxsize=4096)
+def _is_command_preview_invocation(message: str) -> bool:
+    token = _first_token(message).lower()
+    if not token:
+        return False
+    if len(message.strip().split(maxsplit=1)) > 1:
+        return False
+    for prefix in _COMMAND_PREVIEW_PREFIXES:
+        if not token.startswith(prefix):
+            continue
+        typed = token[len(prefix) :].strip(":,")
+        return typed != _COMMAND_PREVIEW_ALIAS and _COMMAND_PREVIEW_ALIAS.startswith(typed)
+    return False
+
+
+def _command_preview_response(decision: dict[str, object], *, thread_key: str = "", message: str = "") -> dict[str, object]:
+    preview = _command_preview_state(message, source=str(decision.get("source", "generic")))
+    suggestions = _as_dict_list(preview.get("suggestions", []))
+    insert_text = str(suggestions[0].get("insert_text", "./omh")) if suggestions else "./omh"
+    return _chat_response(
+        kind="command_preview",
+        headline="Open OMH.",
+        body="Complete or choose `omh` to open the OMH workflow picker. The preview shows one top-level entry instead of every installed workflow.",
+        phase="command_preview",
+        next_action="show_command_preview",
+        thread_key=thread_key,
+        actions=[
+            _action(
+                "show_command_preview",
+                "Show omh",
+                "primary",
+                payload={
+                    "schema_version": COMMAND_PREVIEW_SCHEMA_VERSION,
+                    "suggestions": suggestions,
+                },
+            ),
+            _action(
+                "show_skill_picker",
+                "Open picker",
+                "secondary",
+                payload={
+                    "insert_text": insert_text,
+                    "opens_schema": SKILL_PICKER_SCHEMA_VERSION,
+                },
+            ),
+        ],
+        claim_boundary="Command preview is autocomplete guidance only; it is not routing, plan acceptance, dispatch, execution, review, CI, or verification evidence.",
+        extra_state={
+            "route_action": decision.get("action", "fallback"),
+            "confidence": decision.get("confidence", "low"),
+            "selected_workflow": _ROUTER_SKILL,
+            "command_preview": preview,
+        },
+    )
+
+
+def _command_preview_state(message: str, *, source: str) -> dict[str, object]:
+    token = _first_token(message)
+    prefix = _command_preview_prefix(token)
+    default_insert_text = "/omh" if source in {"slack", "telegram"} else "./omh"
+    insert_text = f"{prefix}{_COMMAND_PREVIEW_ALIAS}" if prefix else default_insert_text
+    return {
+        "schema_version": COMMAND_PREVIEW_SCHEMA_VERSION,
+        "trigger": token,
+        "source": source,
+        "selection_mode": "single_top_level_command",
+        "suggestions": [
+            {
+                "id": _COMMAND_PREVIEW_ALIAS,
+                "label": _COMMAND_PREVIEW_ALIAS,
+                "insert_text": insert_text,
+                "description": "Open the OMH workflow picker.",
+                "opens_schema": SKILL_PICKER_SCHEMA_VERSION,
+                "action_id": "show_skill_picker",
+            }
+        ],
+        "top_level_aliases_only": True,
+        "hide_installed_workflows_until_picker_opens": True,
+        "rendering_hints": {
+            "discord": "When the user types `./`, show only `omh`; selecting it inserts `./omh` and opens the picker.",
+            "slack": "When the user types `/`, show only `omh`; selecting it inserts `/omh` and opens the picker.",
+            "telegram": "When the user sends `/` or `/om`, show the `omh` bot command or an Open omh inline button.",
+            "hermes_tui": "Render one preview row: `omh` opens the OMH workflow picker.",
+        },
+        "claim_boundary": "This preview records no workflow selection; it only helps the wrapper render autocomplete.",
+    }
+
+
+def _command_preview_prefix(token: str) -> str:
+    for prefix in _COMMAND_PREVIEW_PREFIXES:
+        if token.lower().startswith(prefix):
+            return prefix
+    return ""
+
+
+def _skill_picker_response(decision: dict[str, object], *, thread_key: str = "", message: str = "") -> dict[str, object]:
+    picker = _skill_picker_state(message, source=str(decision.get("source", "generic")))
+    catalog_question = _is_skill_catalog_question(message) and not _is_skill_picker_invocation(message)
+    copy_locale = detect_copy_locale(message)
+    primer = _context_primer_state()
+    extra_state = {
+        "route_action": decision.get("action", "dispatch"),
+        "confidence": decision.get("confidence", "low"),
+        "selected_workflow": _ROUTER_SKILL,
+        "catalog_question": catalog_question,
+        "context_primer": primer,
+        "skill_picker": picker,
+        "direct_invocation_aliases": ["./omh", "/omh", "./skills", "/skills"],
+    }
+    if catalog_question:
+        extra_state["capability_summary"] = _catalog_capability_summary()
+    return _chat_response(
+        kind="skill_picker",
+        headline=skill_picker_headline(catalog_question=catalog_question, locale=copy_locale),
+        body=_skill_picker_body(catalog_question=catalog_question, copy_locale=copy_locale),
+        phase="skill_selection",
+        next_action="choose_skill",
+        thread_key=thread_key,
+        actions=[
+            _action(
+                "choose_skill",
+                "Choose workflow",
+                "primary",
+                payload={
+                    "schema_version": SKILL_PICKER_SCHEMA_VERSION,
+                    "selection_mode": "single_select",
+                    "options": picker["options"],
+                    "featured_options": picker["featured_options"],
+                    "capability_families": picker["capability_families"],
+                    "groups": picker["groups"],
+                },
+            ),
+            _action("search_skills", "Search workflows", "secondary", payload={"input_schema": {"query": "string"}}),
+            _action("show_status", "Show status", "secondary"),
+        ],
+        claim_boundary="Choosing a skill is routing intent only; it is not plan acceptance, dispatch, execution, review, CI, or verification evidence.",
+        extra_state=extra_state,
+    )
+
+
+def display_workflow_name(name: str) -> str:
+    """Return the `omh-` display label a chat body should show for a workflow.
+
+    The single canonical/display rule still lives in `omh_skill_display_name()`;
+    this only restricts it to real catalog names. Wrapper copy also carries
+    capability phrases that are not installable skills -- `capability_family_cards()`
+    lists "executor selection" and "coding runtime handoff" beside real workflows --
+    and those must stay unprefixed.
+    """
+    canonical = name.strip()
+    if canonical not in _installable_skill_names():
+        return canonical
+    return omh_skill_display_name(canonical)
+
+
+@lru_cache(maxsize=1)
+def _installable_skill_names() -> frozenset[str]:
+    return frozenset(definition.name for definition in installable_skill_definitions())
+
+
+@lru_cache(maxsize=None)
+def _reasoning_demand_for_skill(skill: str) -> str:
+    return next(
+        (
+            definition.reasoning_demand
+            for definition in installable_skill_definitions()
+            if definition.name == skill
+        ),
+        "standard",
+    )
+
+
+def _skill_picker_body(*, catalog_question: bool, copy_locale: str = "en") -> str:
+    return localized_skill_picker_body(
+        catalog_question=catalog_question,
+        locale=copy_locale,
+        family_lines=_skill_picker_family_body_lines(),
+    )
+
+
+def _skill_picker_family_body_lines() -> list[str]:
+    return list(_skill_picker_family_body_lines_cached())
+
+
+@lru_cache(maxsize=1)
+def _skill_picker_family_body_lines_cached() -> tuple[str, ...]:
+    lines = []
+    for family in capability_family_cards():
+        # `primary_workflows` stays canonical in the family cards and in picker
+        # state; only this chat line switches to the `omh-` display label so the
+        # body matches the host's own `Reading skill omh-<name>` status line.
+        workflows = [display_workflow_name(name) for name in _as_string_list(family.get("primary_workflows", []))[:4]]
+        workflow_text = ", ".join(workflows)
+        executor_choices = _as_string_list(family.get("executor_choices", []))[:3]
+        if executor_choices:
+            workflow_text = f"{workflow_text}; executors: {', '.join(executor_choices)}"
+        lines.append(f"- {family.get('label', '')}: {workflow_text}.")
+    return tuple(lines)
+
+
+def _skill_picker_state(message: str, *, source: str) -> dict[str, object]:
+    state = _clone_static_dict(_skill_picker_static_state_cached())
+    state["trigger"] = _first_token(message)
+    state["source"] = source
+    return state
+
+
+@lru_cache(maxsize=1)
+def _skill_picker_static_state_cached() -> dict[str, object]:
+    installed = {definition.name: definition for definition in installable_skill_definitions()}
+    options = []
+    for skill_id, label, description, direct_invocation in _SKILL_PICKER_ENTRIES:
+        definition = installed.get(skill_id)
+        if definition is None:
+            continue
+        options.append(
+            {
+                "id": skill_id,
+                "label": label,
+                "description": description,
+                "direct_invocation": direct_invocation,
+                "harness": primary_harness_for_skill(skill_id),
+                "action_id": "choose_skill",
+                "payload": {
+                    "skill": skill_id,
+                    "direct_invocation": direct_invocation,
+                    "preserve_original_message": True,
+                },
+            }
+        )
+    featured_options = [
+        _compact_picker_option(option)
+        for option in options
+        if option["id"] == _ROUTER_SKILL
+    ]
+    groups = _skill_picker_groups(options)
+    family_cards = _skill_picker_family_cards(options)
+    return {
+        "schema_version": SKILL_PICKER_SCHEMA_VERSION,
+        "trigger": "",
+        "source": "",
+        "selection_mode": "single_select",
+        "options": options,
+        "featured_options": featured_options,
+        "capability_families": family_cards,
+        "groups": groups,
+        "rendering_hints": {
+            "discord": "Render Route for me first, then grouped sections; keep the full options list only as a compatibility fallback.",
+            "slack": "Render Route for me first, then grouped sections or a grouped static select in the current thread.",
+            "hermes_tui": "Render grouped sections with short direct invocations; keep real skill names unchanged.",
+        },
+        "recommended_rendering": "Show the featured Route for me option first, then capability families. Use groups/options as compatibility fallback.",
+        "claim_boundary": "This picker records routing intent only; selected workflows still need their own plan, handoff, or observed evidence.",
+    }
+
+
+def _skill_picker_family_cards(options: list[dict[str, object]]) -> list[dict[str, object]]:
+    option_ids = {str(option["id"]) for option in options}
+    cards = []
+    for family in capability_family_cards(option_ids):
+        workflows = [
+            workflow
+            for workflow in _as_string_list(family.get("primary_workflows", []))
+            if workflow in option_ids or workflow in {"request-to-handoff", "executor selection", "coding runtime handoff"}
+        ]
+        if not workflows:
+            continue
+        card = _compact_family_card(family)
+        card["primary_workflows"] = workflows
+        cards.append(card)
+    return cards
+
+
+def _compact_family_cards(families: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [_compact_family_card(family) for family in families]
+
+
+def _compact_family_card(family: dict[str, object]) -> dict[str, object]:
+    card = {
+        "id": str(family.get("id", "")),
+        "label": str(family.get("label", "")),
+        "primary_workflows": _as_string_list(family.get("primary_workflows", []))[:8],
+    }
+    executor_choices = _as_string_list(family.get("executor_choices", []))
+    if executor_choices:
+        card["executor_choices"] = executor_choices
+    return card
+
+
+def _skill_picker_groups(options: list[dict[str, object]]) -> list[dict[str, object]]:
+    by_id = {str(option["id"]): option for option in options}
+    groups = []
+    for group in _CONTEXT_PRIMER_GROUPS:
+        group_options = [
+            _compact_group_picker_option(by_id[workflow_id])
+            for workflow_id in group["workflows"]
+            if workflow_id in by_id and workflow_id != _ROUTER_SKILL
+        ]
+        if not group_options:
+            continue
+        groups.append(
+            {
+                "id": group["id"],
+                "label": group["label"],
+                "use_when": group["use_when"],
+                "option_ids": [str(option["id"]) for option in group_options],
+                "options": group_options,
+                "action_id": "choose_skill",
+            }
+        )
+    return groups
+
+
+def _compact_picker_option(option: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": str(option.get("id", "")),
+        "label": str(option.get("label", "")),
+        "description": str(option.get("description", "")),
+        "direct_invocation": str(option.get("direct_invocation", "")),
+        "harness": str(option.get("harness", "")),
+        "action_id": str(option.get("action_id", "choose_skill")),
+    }
+
+
+def _compact_group_picker_option(option: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": str(option.get("id", "")),
+        "label": str(option.get("label", "")),
+        "action_id": str(option.get("action_id", "choose_skill")),
+    }
+
+
+def _context_primer_state() -> dict[str, object]:
+    return _clone_static_dict(_context_primer_state_cached())
+
+
+@lru_cache(maxsize=1)
+def _context_primer_state_cached() -> dict[str, object]:
+    installed = {definition.name for definition in installable_skill_definitions()}
+    groups = []
+    for group in _CONTEXT_PRIMER_GROUPS:
+        workflows = tuple(workflow for workflow in group["workflows"] if workflow in installed)
+        if not workflows:
+            continue
+        groups.append(
+            {
+                "id": group["id"],
+                "label": group["label"],
+                "workflows": workflows,
+                "use_when": group["use_when"],
+            }
+        )
+    return {
+        "schema_version": CONTEXT_PRIMER_SCHEMA_VERSION,
+        "summary": (
+            "OMH is a Hermes workflow layer. It helps Hermes route natural-language work into skills, plans, "
+            "deliverables, coding handoffs, loops, and status updates without treating prepared guidance as observed work."
+        ),
+        "capability_families": _compact_family_cards(capability_family_cards(installed)),
+        "workflow_groups": groups,
+        "workflow_context_cards": workflow_context_cards(),
+        "routing_rule": "Use Route for me when the user did not choose a workflow; use explicit workflow names when the user did.",
+        "evidence_rule": "Prepared plans, prompts, cards, or handoffs are not execution, file generation, delivery, review, CI, merge, or verification evidence.",
+        "inventory_rule": "Render the picker for common choices and use search_skills for the full installed catalog.",
+    }
+
+
+def _catalog_capability_summary() -> dict[str, object]:
+    return _clone_static_dict(_catalog_capability_summary_cached())
+
+
+@lru_cache(maxsize=1)
+def _catalog_capability_summary_cached() -> dict[str, object]:
+    from ..capabilities.registry import capability_summary
+
+    summary = capability_summary()
+    compact_lanes = []
+    for lane in _as_dict_list(summary.get("lanes", [])):
+        compact_lanes.append(
+            {
+                "id": lane.get("id", ""),
+                "label": lane.get("label", ""),
+                "owner_role": lane.get("owner_role", ""),
+                "use_for": lane.get("use_for", ""),
+                "primary_skills": _as_string_list(lane.get("primary_skills", [])),
+                "representative_playbooks": [
+                    {
+                        "id": playbook.get("id", ""),
+                        "summary": playbook.get("summary", ""),
+                        "owner_role": playbook.get("owner_role", ""),
+                        "first_stage": playbook.get("first_stage", {}),
+                    }
+                    for playbook in _as_dict_list(lane.get("representative_playbooks", []))[:3]
+                ],
+                "wrapper_actions": _as_string_list(lane.get("wrapper_actions", []))[:6],
+                "examples": _as_string_list(lane.get("examples", []))[:3],
+            }
+        )
+    return {
+        "schema_version": summary.get("schema_version", "omh_capability_summary/v1"),
+        "purpose": summary.get("purpose", ""),
+        "capability_families": _compact_family_cards(_as_dict_list(summary.get("capability_families", []))),
+        "lanes": compact_lanes,
+        "workflow_context_cards": _as_dict_list(summary.get("workflow_context_cards", [])),
+        "direct_response_guidance": _as_string_list(summary.get("direct_response_guidance", [])),
+        "evidence_boundary": _as_string_list(summary.get("evidence_boundary", [])),
+    }
+
+
+def _as_dict_list(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _clone_static_dict(value: dict[str, object]) -> dict[str, object]:
+    cloned = _clone_static_payload(value)
+    return cloned if type(cloned) is dict else {}
+
+
+def _clone_static_payload(value: object) -> object:
+    value_type = type(value)
+    if value_type is dict:
+        return {key: _clone_static_payload(item) for key, item in value.items()}
+    if value_type is list:
+        return [_clone_static_payload(item) for item in value]
+    if value_type is tuple:
+        return tuple(_clone_static_payload(item) for item in value)
+    return value
+
+
+def _as_string_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, tuple):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
+def _first_token(message: str) -> str:
+    return message.strip().split(maxsplit=1)[0] if message.strip() else ""
+
+
+def _public_plan_payload(plan_payload: dict[str, object], *, include_message: bool) -> dict[str, object]:
+    payload = dict(plan_payload)
+    plan = dict(_nested(payload, "plan"))
+    if not include_message and plan.get("task_statement"):
+        plan["task_statement"] = "{message}"
+    payload["plan"] = plan
+    if not include_message:
+        payload.pop("message", None)
+    return payload
+
+
+def _source_metadata(event_or_message: dict[str, Any] | str, explicit: dict[str, str] | None) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    if isinstance(event_or_message, dict):
+        metadata.update(extract_source_metadata(event_or_message))
+    metadata.update({str(key): str(value) for key, value in (explicit or {}).items() if str(value)})
+    return compact_source_metadata(metadata)
+
+
+def _thread_key(source: str, metadata: dict[str, str], *, message: str = "", run_id: str = "") -> str:
+    channel = metadata.get("channel_ref") or "channel"
+    event = metadata.get("source_event_id") or run_id
+    if not event:
+        event = hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
+    target_scope = _target_scope_key(metadata)
+    if target_scope:
+        return f"{source}:{channel}:{target_scope}:{event}"
+    return f"{source}:{channel}:{event}"
+
+
+def _platform_thread_key(
+    source: str,
+    envelope: Mapping[str, Any],
+    metadata: dict[str, str],
+    *,
+    legacy_thread_key: str,
+) -> str:
+    """Thread key for a platform-enveloped interaction.
+
+    With a conversation identity the key is
+    ``source:pf-{platform_id}:{conversation_ref}[:{thread_ref}][:{target_scope}]``
+    -- stable across events in one conversation, with no source_event_id or
+    message hash, so two events resume one session while the same refs on two
+    platforms never collide. Without ``conversation_ref`` there is no durable
+    conversation identity, so the already-computed legacy key is returned
+    unchanged -- caller passes the key ``_base_interaction`` derived from the
+    real message, whose event substitute is the message hash, not a hash of
+    an empty string.
+    """
+    identity = envelope.get("identity", {})
+    conversation_ref = identity.get("conversation_ref") if isinstance(identity, Mapping) else None
+    if not conversation_ref:
+        return legacy_thread_key
+    # The platform+conversation+thread segment comes from the envelope
+    # module's own scope helper, so this key and any other consumer of the
+    # envelope derive the same identity string from one implementation.
+    key = f"{source}:pf-{platform_thread_key_scope(envelope)}"
+    target_scope = _target_scope_key(metadata)
+    if target_scope:
+        key = f"{key}:{target_scope}"
+    return key
+
+
+def _source_from_thread_key(thread_key: str) -> str:
+    """Recover the ``source`` a ``_thread_key`` was built from.
+
+    Mirrors ``sessions._source_from_thread_key``: ``_thread_key`` always
+    prefixes with ``f"{source}:..."``, so this is the one place a chat
+    response builder that only has ``thread_key`` in scope can still resolve
+    a per-platform messenger ceiling without every caller threading `source`
+    through separately.
+    """
+    if ":" not in thread_key:
+        return "generic"
+    return thread_key.split(":", 1)[0] or "generic"
+
+
+def _target_scope_key(metadata: dict[str, str]) -> str:
+    parts = [
+        metadata.get("hermes_home", ""),
+        metadata.get("agent_ref", ""),
+        metadata.get("target_ref", ""),
+        metadata.get("runtime_ref", ""),
+    ]
+    if not any(parts):
+        return ""
+    basis = "|".join(parts)
+    return f"target-{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _chat_response(
+    *,
+    kind: str,
+    headline: str,
+    body: str,
+    phase: str,
+    next_action: str,
+    thread_key: str,
+    actions: list[dict[str, object]],
+    claim_boundary: str,
+    extra_state: dict[str, object] | None = None,
+    status_card: dict[str, object] | None = None,
+) -> dict[str, object]:
+    state: dict[str, object] = {"phase": phase, "next_action": next_action}
+    if thread_key:
+        state["thread_key"] = thread_key
+    state.update(extra_state or {})
+    if "workflow_explanation" not in state:
+        state["workflow_explanation"] = workflow_explanation_payload(
+            kind=kind,
+            phase=phase,
+            next_action=next_action,
+            state=state,
+            claim_boundary=claim_boundary,
+        )
+    usage_trace = usage_trace_payload(kind=kind, phase=phase, next_action=next_action, state=state)
+    headline_with_prefix = headline_with_usage_prefix(headline, str(usage_trace["visible_prefix"]))
+    response: dict[str, object] = {
+        "schema_version": CHAT_RESPONSE_SCHEMA_VERSION,
+        "kind": kind,
+        "visibility": "thread",
+        "headline": headline_with_prefix,
+        "plain_headline": headline,
+        "body": body,
+        "state": state,
+        "usage_trace": usage_trace,
+        "messenger_rendering": messenger_rendering_contract(
+            visible_prefix=str(usage_trace["visible_prefix"]),
+            first_line=headline_with_prefix,
+            body=body,
+            claim_boundary=claim_boundary,
+            source=_source_from_thread_key(thread_key),
+        ),
+        "actions": actions,
+        "claim_boundary": claim_boundary,
+    }
+    if status_card:
+        response["status_card"] = status_card
+    return response
+
+
+def workflow_explanation_payload(
+    *,
+    kind: str,
+    phase: str,
+    next_action: str,
+    state: dict[str, object],
+    claim_boundary: str,
+) -> dict[str, object]:
+    workflow = _usage_workflow(state)
+    # The catalog key and the name a reader can invoke are not the same string
+    # for the ULW family: the catalog keeps `ralplan`/`ultrawork`/`ultraqa`
+    # because triggers and capability maps are built from them, while the
+    # installed skills answer to `ulw-plan`/`ulw-work`/`ulw-qa`. Emitting the
+    # catalog key hands the user a name nothing responds to (#1249), which
+    # `public_workflow_identifier` exists to prevent -- and which every field
+    # below used to reach around. `primary_harness_for_skill` still takes the
+    # catalog key, because that lookup is keyed on it.
+    public_workflow = public_workflow_identifier(workflow) if workflow else ""
+    label = public_workflow or _usage_label(state, kind=kind, phase=phase, next_action=next_action)
+    harness = primary_harness_for_skill(workflow) if workflow else ""
+    # Some action tokens embed the skill they belong to
+    # (`prepare_ultraperf_loop`), so spelling one out puts the catalog key back
+    # into a sentence every other field here just had it taken out of.
+    next_action_label = with_public_skill_names(next_action.replace("_", " "))
+    not_evidence_yet = _workflow_explanation_not_evidence(state, claim_boundary=claim_boundary)
+    payload: dict[str, object] = {
+        "schema_version": WORKFLOW_EXPLANATION_SCHEMA_VERSION,
+        "selected_workflow": public_workflow,
+        "label": label,
+        "selected_harness": harness,
+        "why_this_workflow": _workflow_explanation_reason(state, workflow=public_workflow, label=label),
+        "next_action": next_action,
+        "next_action_label": next_action_label,
+        "recommended_reply": _workflow_recommended_reply(public_workflow, label, next_action_label, not_evidence_yet),
+        "primary_action_label": _workflow_primary_action_label(public_workflow, label),
+        "primary_action_hint": _workflow_primary_action_hint(public_workflow, label, next_action_label, not_evidence_yet),
+        "not_evidence_yet": not_evidence_yet,
+        "claim_boundary": claim_boundary,
+        "rendering_hint": "Show this as a compact why/next/not-evidence card in chat surfaces.",
+    }
+    context_card = workflow_context_card_for_workflow(workflow)
+    if context_card:
+        payload["workflow_context_card"] = context_card
+        payload["workflow_context_id"] = context_card["id"]
+    return payload
+
+
+def _workflow_explanation_reason(state: dict[str, object], *, workflow: str, label: str) -> str:
+    explanation_reason = str(state.get("workflow_explanation_reason") or "").strip()
+    if explanation_reason:
+        return explanation_reason
+    reason = str(state.get("routing_reason") or "").strip()
+    if reason:
+        return reason
+    if workflow:
+        return f"Selected `{display_workflow_name(workflow)}` from the message, workflow metadata, and guardrail policy."
+    return f"Using the `{label}` response state for this step."
+
+
+# `label` is a response-state word such as "status", "handoff", or "quickstart",
+# not a catalog name, so only the `workflow` branch takes the display label.
+def _display_workflow_or_label(workflow: str, label: str) -> str:
+    return display_workflow_name(workflow) if workflow else label
+
+
+def _workflow_recommended_reply(workflow: str, label: str, next_action_label: str, not_evidence_yet: list[str]) -> str:
+    name = _display_workflow_or_label(workflow, label)
+    suffix = not_evidence_reply_suffix(not_evidence_yet, fallback=" This is guidance, not execution evidence.")
+    return f"I will use `{name}` and start with {next_action_label}.{suffix}"
+
+
+def _workflow_primary_action_label(workflow: str, label: str) -> str:
+    return f"Open {_display_workflow_or_label(workflow, label)}"
+
+
+def _workflow_primary_action_hint(
+    workflow: str,
+    label: str,
+    next_action_label: str,
+    not_evidence_yet: list[str],
+) -> str:
+    name = _display_workflow_or_label(workflow, label)
+    suffix = not_evidence_action_suffix(not_evidence_yet)
+    return f"Route to `{name}` and run `{next_action_label}`{suffix}."
+
+
+def _workflow_explanation_not_evidence(state: dict[str, object], *, claim_boundary: str) -> list[str]:
+    explicit = state.get("evidence_not_observed")
+    if isinstance(explicit, list) and explicit:
+        return [str(item) for item in explicit if str(item)]
+    text = claim_boundary.lower()
+    if "file inspection" in text:
+        items = ["file inspection"]
+        if "execution" in text:
+            items.append("execution")
+        return items
+    items: list[str] = []
+    for marker, label in (
+        ("plan acceptance", "plan acceptance"),
+        ("dispatch", "executor/runtime dispatch"),
+        ("execution", "execution"),
+        ("implementation", "implementation"),
+        ("image", "image generation"),
+        ("file", "file generation/export"),
+        ("delivery", "delivery"),
+        ("review", "review"),
+        ("ci", "CI"),
+        ("merge", "merge"),
+        ("verification", "verification"),
+    ):
+        if marker in text and label not in items:
+            items.append(label)
+    if items:
+        return items
+    if "prepared" in text:
+        return ["execution", "verification", "delivery"]
+    return ["completion claim without observed evidence"]
+
+
+def usage_trace_payload(*, kind: str, phase: str, next_action: str, state: dict[str, object]) -> dict[str, object]:
+    workflow = _usage_workflow(state)
+    harness = primary_harness_for_skill(workflow) if workflow else ""
+    # `visible_prefix` is the most-read string OMH emits -- it leads every chat
+    # reply -- so it carries the invocable name, not the catalog key.
+    label = public_workflow_identifier(workflow) if workflow else _usage_label(
+        state, kind=kind, phase=phase, next_action=next_action
+    )
+    trace: dict[str, object] = {
+        "schema_version": USAGE_TRACE_SCHEMA_VERSION,
+        "brand": "omh",
+        "visibility": "visible_prefix",
+        "visible_prefix": f"[omh] {label}",
+        "label": label,
+        "selected_workflow": public_workflow_identifier(workflow) if workflow else workflow,
+        "selected_harness": harness,
+        "phase": phase,
+        "next_action": next_action,
+        "evidence_state": _usage_evidence_state(state, phase=phase, next_action=next_action),
+        "claim_boundary": "This trace is a routing/status marker, not execution evidence.",
+    }
+    executor = str(state.get("selected_executor_profile") or state.get("executor_target") or "")
+    if executor:
+        trace["selected_executor_profile"] = executor
+    runtime_family = str(state.get("runtime_family") or "")
+    if runtime_family:
+        trace["runtime_family"] = runtime_family
+    context_card = workflow_context_card_for_workflow(workflow)
+    if context_card:
+        trace["workflow_context_id"] = context_card["id"]
+    return trace
+
+
+def _usage_workflow(state: dict[str, object]) -> str:
+    for key in ("selected_workflow", "recommended_workflow"):
+        value = str(state.get(key, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _usage_label(state: dict[str, object], *, kind: str, phase: str, next_action: str) -> str:
+    executor = str(state.get("selected_executor_profile") or state.get("executor_target") or "").strip()
+    if executor:
+        return f"{executor}-handoff"
+    if kind == "plan":
+        return "plan"
+    if kind == "clarification":
+        return "clarification"
+    if kind == "quickstart":
+        return "quickstart"
+    if kind == "context_brief":
+        return "context"
+    if kind in {"status", "blocker"}:
+        return "status"
+    if kind == "handoff":
+        return "handoff"
+    if kind == "command_preview":
+        return "command-preview"
+    if kind == "skill_picker":
+        return _ROUTER_SKILL
+    return phase or next_action or kind or "workflow"
+
+
+def _usage_evidence_state(state: dict[str, object], *, phase: str, next_action: str) -> str:
+    if next_action in {"wait_for_executor_evidence", "record_review_evidence", "record_verification_evidence", "record_ci_evidence", "record_merge_readiness"}:
+        return "observed_partial"
+    if next_action.startswith("surface_") and next_action.endswith("_blocker"):
+        return "observed_partial"
+    if next_action in {"report_completion_with_evidence", "report_merge_ready", "report_merged"}:
+        return "observed_reportable"
+    if phase.endswith("prepared") or "handoff" in phase or next_action in {"dispatch_to_workflow", "present_plan", "accept_or_revise_plan"}:
+        return "prepared_not_observed"
+    if bool(state.get("execution_observed", False)) or bool(state.get("verification_observed", False)):
+        return "observed_partial"
+    return "routing_not_execution"
+
+
+def headline_with_usage_prefix(headline: str, visible_prefix: str) -> str:
+    if headline.startswith("[omh] "):
+        return headline
+    return f"{visible_prefix} - {headline}"
+
+
+def messenger_rendering_contract(
+    *,
+    visible_prefix: str,
+    first_line: str,
+    body: str,
+    claim_boundary: str,
+    render_profile: str = RENDER_PROFILE_LIMITED_MARKDOWN,
+    source: str = "",
+    follow_up_texts: object = (),
+    message_gate: dict[str, object] | None = None,
+    platform_envelope: Mapping[str, Any] | None = None,
+    response_actions: object = (),
+    attachments: object = (),
+) -> dict[str, object]:
+    """The platform-shaping rendering payload for one chat/session response.
+
+    Dialect boundary: ``body_blocks`` (and ``fallback_body_blocks``) stay
+    canonical, dialect-neutral Markdown, while ``body_text`` and
+    ``chunked_body_texts`` may be platform-dialected (mrkdwn on a resolved
+    ``slack`` source). ``transforms_applied`` describes the TEXT fields only;
+    an adapter that consumes blocks applies its own dialect.
+    """
+    resolved_profile = _normalize_render_profile(
+        str(platform_envelope["render_profile"])
+        if platform_envelope is not None
+        else render_profile
+    )
+    # The gate header is rendered per profile, here, so the rich body carries the
+    # aligned card and every fallback carries bullets. Prepending it upstream
+    # would have put one profile's shaping into the canonical body and blocks.
+    safe_body_text, safe_transforms = _messenger_safe_body(
+        _gate_prefixed_body(body, message_gate, RENDER_PROFILE_LIMITED_MARKDOWN)
+    )
+    if resolved_profile == RENDER_PROFILE_RICH_MARKDOWN:
+        body_text = _gate_prefixed_body(body, message_gate, RENDER_PROFILE_RICH_MARKDOWN)
+        body_format = "rich_markdown"
+        preferred_blocks = [
+            "short_paragraph",
+            "bulleted_list",
+            "numbered_list",
+            "markdown_table",
+            "code_block",
+            "status_lines",
+        ]
+        avoid_blocks = ["large_unbroken_block"]
+        table_policy = "preserve_markdown_tables_when_supported"
+        transforms: list[str] = []
+    else:
+        body_text = safe_body_text
+        body_format = "messenger_safe_markdown"
+        # `code_block` is preferred on the limited profile too: Discord, Slack,
+        # and Telegram all render triple-backtick fences, and a fence is the
+        # only way column alignment survives a messenger. Tables still do not.
+        preferred_blocks = [
+            "short_paragraph",
+            "bulleted_list",
+            "numbered_list",
+            "code_block",
+            "status_lines",
+        ]
+        avoid_blocks = ["markdown_table", "wide_table", "large_unbroken_block"]
+        table_policy = "narrow_tables_to_aligned_block_else_bullets"
+        transforms = safe_transforms
+    # Blocks come from the pre-dialect text so `code_block.language` survives;
+    # the emitted body_text then loses fence language tags on every limited
+    # profile (Slack/Telegram print them as literal text) and, for a resolved
+    # slack source, converts headings/bold/links to mrkdwn outside fences —
+    # the same replace-in-place shape the table-to-bullets transform uses.
+    body_blocks = _render_body_blocks(body_text, render_profile=resolved_profile)
+    fallback_body_blocks = _messenger_body_blocks(safe_body_text)
+    fallback_body_text, fallback_strip_transforms = _strip_fence_language_tags(safe_body_text)
+    fallback_transforms = sorted({*safe_transforms, *fallback_strip_transforms})
+    if resolved_profile == RENDER_PROFILE_LIMITED_MARKDOWN:
+        body_text, strip_transforms = _strip_fence_language_tags(body_text)
+        transforms = [*transforms, *strip_transforms]
+        if source == "slack":
+            body_text, slack_transforms = _slack_dialect_body(body_text)
+            transforms = [*transforms, *slack_transforms]
+        transforms = sorted(set(transforms))
+    chunking = (
+        _platform_envelope_chunking_hint(platform_envelope)
+        if platform_envelope is not None
+        else _messenger_chunking_hint(source)
+    )
+    rendering: dict[str, object] = {
+        "schema_version": MESSENGER_RENDERING_SCHEMA_VERSION,
+        "render_profile": resolved_profile,
+        "visible_prefix": visible_prefix,
+        "first_line": first_line,
+        "body_format": body_format,
+        "body_text": body_text,
+        "body_blocks": body_blocks,
+        "fallback_body_format": "messenger_safe_markdown",
+        "fallback_body_text": fallback_body_text,
+        "fallback_body_blocks": fallback_body_blocks,
+        "preferred_blocks": preferred_blocks,
+        "avoid_blocks": avoid_blocks,
+        "chunking": chunking,
+        # Deterministic chunks for the RESOLVED platform so adapters stop
+        # guessing where to split: paragraph boundaries first, then lines,
+        # hard split last, fences closed/reopened across chunk boundaries.
+        # One element means the body fits a single message. Chat/session
+        # renderings only: the route-hint rendering
+        # (messenger_route_hint_rendering/v1) deliberately omits this key
+        # because hint bodies are single-screen.
+        "chunked_body_texts": _chunk_body_text(body_text, int(chunking["max_recommended_chars"])),
+        # Whole messages to post AFTER the body, in order, each already sized
+        # for one message. Distinct from `chunked_body_texts`, which is one body
+        # cut to fit: concatenating these would not reproduce `body_text`, and a
+        # follow-up is a separate thing to say rather than the rest of this one.
+        # Empty on every response that has nothing to add.
+        "follow_up_texts": _follow_up_texts(follow_up_texts, int(chunking["max_recommended_chars"])),
+        "transforms_applied": transforms,
+        "fallback_transforms_applied": fallback_transforms,
+        "prefix_policy": {
+            "default": "once_per_response_first_line",
+            "repeat_when": "adapter_splits_response_across_separate_messages_or_chunks",
+            "do_not_repeat": "every_paragraph_or_every_line",
+        },
+        # Declared, not enforced: nothing on this path rewrites body_text to
+        # fit these numbers (that would be a saturation/density transform,
+        # which is a separate feature). This exists because the chat path had
+        # no markdown-density or saturation control at all -- context_budget
+        # protects the supervising agent's context window, not a human
+        # reader's chat bubble. An adapter or future transform can read this
+        # as guidance for what a human reader tolerates.
+        "density_policy": {
+            "max_heading_levels": 2,
+            "max_bullets": 12,
+            "avoid": ["nested_bullets", "bold_inside_bullets", "tables_on_limited_profiles"],
+        },
+        "platform_hints": {
+            "discord": "Start the first message with the visible prefix, prefer bullets or numbered lists over tables, and repeat the prefix only if the adapter splits a long response into separate messages.",
+            "slack": "Start the response with the visible prefix, prefer blocks or bullets over wide Markdown tables, and keep claim boundaries visible.",
+            "telegram": (
+                "Start the response with the visible prefix, keep sections short, avoid table layouts, and "
+                "post body_text as plain text WITHOUT parse_mode; if you opt into MarkdownV2 you must escape "
+                "every reserved character yourself."
+            ),
+            "hermes": "Render body_text as rich Markdown when the Hermes surface supports it; use fallback_body_text when relaying to a narrow chat adapter.",
+            "generic": "Use body_text for the declared render_profile; use fallback_body_text if the actual surface cannot render Markdown tables.",
+        },
+        "table_policy": table_policy,
+        "body_preview": _short_text(body_text, limit=180),
+        "claim_boundary": claim_boundary,
+    }
+    if isinstance(message_gate, dict) and message_gate:
+        rendering["omh_message_gate"] = deepcopy(message_gate)
+    if platform_envelope is not None:
+        rendering["platform_id"] = str(platform_envelope["platform_id"])
+        rendering["format_family"] = str(platform_envelope["format_family"])
+        rendering["capabilities"] = deepcopy(platform_envelope["capabilities"])
+        rendering["adapter_payload"] = _messenger_adapter_payload(
+            platform_envelope,
+            response_actions=response_actions,
+            attachments=attachments,
+        )
+    return rendering
+
+
+def _platform_envelope_chunking_hint(
+    platform_envelope: Mapping[str, Any],
+) -> dict[str, object]:
+    limits = platform_envelope["limits"]
+    return {
+        "max_recommended_chars": int(limits["max_recommended_chars"]),
+        "hard_limit_chars": int(limits["hard_limit_chars"]),
+        "limit_provenance": str(platform_envelope["limit_provenance"]),
+        "split_on": ["headings", "bullets", "paragraphs"],
+    }
+
+
+def _messenger_adapter_payload(
+    platform_envelope: Mapping[str, Any],
+    *,
+    response_actions: object,
+    attachments: object,
+) -> dict[str, object]:
+    capabilities = platform_envelope["capabilities"]
+    media = capabilities["media"]
+    reply = capabilities["reply"]
+    reactions = capabilities["reactions"]
+    actions = capabilities["actions"]
+    identity = platform_envelope.get("identity", {})
+    reply_contract: dict[str, object] = {
+        "reply_support": reply.get("quotes") is True,
+        "threads_support": reply.get("threads") is True,
+    }
+    thread_ref = identity.get("thread_ref")
+    if thread_ref:
+        reply_contract["thread_ref"] = str(thread_ref)
+    return {
+        "schema_version": MESSENGER_ADAPTER_PAYLOAD_SCHEMA_VERSION,
+        "platform_id": str(platform_envelope["platform_id"]),
+        "transport_source": str(platform_envelope["transport_source"]),
+        "media": {
+            "attachments": list(deepcopy(attachments))
+            if isinstance(attachments, (list, tuple))
+            else [],
+            "image_support": media.get("images") is True,
+            "audio_support": media.get("voice") is True,
+            "video_support": media.get("video") is True,
+            "document_support": media.get("files") is True,
+            "caption_support": media.get("captions") is True,
+        },
+        "reply": reply_contract,
+        "reactions": {
+            "items": [],
+            "native_support": reactions.get("native") is True,
+            "custom_support": reactions.get("custom_emoji") is True,
+        },
+        "actions": {
+            "response_actions": list(deepcopy(response_actions))
+            if isinstance(response_actions, (list, tuple))
+            else [],
+            "button_support": actions.get("buttons") is True,
+            "form_support": actions.get("forms") is True,
+        },
+        "delivery": {
+            "state": "prepared_not_delivered",
+            "observed": False,
+            "adapter_owned_responsibilities": [
+                "auth",
+                "network",
+                "encryption",
+                "media_transfer",
+                "posting",
+                "delivery",
+            ],
+        },
+        "claim_boundary": MESSENGER_ADAPTER_CLAIM_BOUNDARY,
+    }
+
+
+def build_wrapper_delivery_obligation(
+    *,
+    origin_thread_key: str,
+    trigger: str,
+    evidence_refs: object = None,
+    claim_boundary: str = "",
+) -> dict[str, object]:
+    """Build a prepared-not-delivered push/delivery obligation contract.
+
+    OMH has no live proactive/push path today: this contract only records that a
+    "tell me in the thread when it is done" obligation has been *prepared*, never
+    that OMH delivered a message. The obligation is pinned at
+    ``prepared_not_delivered`` and carries a
+    ``not_delivered_until_wrapper_observed`` marker, so no field can imply OMH
+    sent anything until a wrapper observes and records an actual delivery in a
+    future gated follow-up. The shape is executor-neutral (codex, claude-code,
+    and hermes produce an identical payload) and surface-neutral (valid for
+    discord, slack, and telegram origins).
+
+    Concept-aligned with the upstream v0.19.0 delivery-obligation ledger, but
+    named for OMH locally; no upstream wire field names are mirrored.
+    """
+    if trigger not in DELIVERY_OBLIGATION_TRIGGERS:
+        raise ValueError(f"unsupported delivery obligation trigger: {trigger!r}")
+    refs = _delivery_obligation_evidence_refs(evidence_refs)
+    boundary = claim_boundary.strip() or _default_delivery_obligation_claim_boundary()
+    return {
+        "schema_version": DELIVERY_OBLIGATION_SCHEMA_VERSION,
+        "origin_thread_key": str(origin_thread_key),
+        "trigger": trigger,
+        "obligation_state": DELIVERY_OBLIGATION_STATE,
+        "not_delivered_until_wrapper_observed": True,
+        "evidence_policy": "metadata_only",
+        "evidence_refs": refs,
+        "observed_evidence": _delivery_obligation_observed_evidence(trigger),
+        "not_evidence": [
+            "delivered message",
+            "thread reply sent",
+            "user notified",
+            "wrapper-observed delivery",
+        ],
+        "claim_boundary": boundary,
+    }
+
+
+def _delivery_obligation_evidence_refs(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    refs: list[str] = []
+    for item in value:
+        ref = _short_text(str(item).strip(), limit=180)
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def _delivery_obligation_observed_evidence(trigger: str) -> list[str]:
+    if trigger == "handoff_ci_pass":
+        return ["handoff CI pass observed (metadata ref)"]
+    return ["loop iteration completion observed (metadata ref)"]
+
+
+def _default_delivery_obligation_claim_boundary() -> str:
+    return (
+        "A delivery obligation is prepared, not delivered: OMH has not sent any "
+        "message and delivery stays unobserved until a wrapper records an actual "
+        "delivery in the origin thread."
+    )
+
+
+def render_profile_for_source(source: str, source_metadata: dict[str, object] | None = None) -> str:
+    """Resolve the render profile an adapter should use for ``source``.
+
+    An adapter that sets ``render_profile`` at all has told us the surface is
+    narrow enough to care. If the value it sent is not a known profile (a typo,
+    a renamed profile, a future value), falling back to the source default would
+    hand rich Markdown to exactly the adapter that asked to be treated
+    carefully. Explicit-but-unknown therefore coerces down to
+    ``limited_markdown``, matching ``_normalize_render_profile``. Only absent or
+    empty metadata keeps the per-source default.
+    """
+    metadata = source_metadata or {}
+    explicit = str(metadata.get("render_profile", "")).strip()
+    if explicit:
+        return _normalize_render_profile(explicit)
+    if source in _LIMITED_MARKDOWN_SOURCES:
+        return RENDER_PROFILE_LIMITED_MARKDOWN
+    return RENDER_PROFILE_RICH_MARKDOWN
+
+
+def _normalize_render_profile(render_profile: str) -> str:
+    if render_profile in RENDER_PROFILES:
+        return render_profile
+    return RENDER_PROFILE_LIMITED_MARKDOWN
+
+
+# Real per-platform message ceilings, not one global advisory number. Each
+# `hard_limit_chars` sits below that platform's actual delivery cap so an
+# adapter has an enforceable stop, not just advice. `max_recommended_chars`
+# sits a flat 200 characters below `hard_limit_chars` on every platform --
+# room for the visible prefix OMH puts on the first line plus a chunk marker
+# an adapter may add when it splits a long response, neither of which grows
+# with the platform's own cap.
+_MESSENGER_CHAR_CEILINGS: dict[str, dict[str, int]] = {
+    # Discord's server-enforced per-message cap is 2000 characters; 1900
+    # keeps 100 characters of headroom below that hard API limit.
+    "discord": {"max_recommended_chars": 1700, "hard_limit_chars": 1900},
+    # Slack renders a single message/block reliably up to roughly 3000
+    # characters before mrkdwn text objects start truncating; 2900 stays
+    # under that.
+    "slack": {"max_recommended_chars": 2700, "hard_limit_chars": 2900},
+    # Telegram's server-enforced per-message cap is 4096 characters; 3900
+    # keeps headroom below that hard API limit.
+    "telegram": {"max_recommended_chars": 3700, "hard_limit_chars": 3900},
+}
+# Generic/Hermes surfaces -- and any source not in the map above -- have no
+# platform-enforced cap. 1800 is OMH's own long-standing advisory ceiling,
+# now paired with a hard_limit_chars floor so an unknown source still gets an
+# enforceable number instead of only advice.
+_MESSENGER_GENERIC_CEILING: dict[str, int] = {"max_recommended_chars": 1600, "hard_limit_chars": 1800}
+
+
+def _gate_prefixed_body(body: str, message_gate: dict[str, object] | None, render_profile: str) -> str:
+    """``body`` with the message gate's lines above it, or ``body`` unchanged."""
+    if not isinstance(message_gate, dict) or not message_gate:
+        return body
+    return message_gate_body(message_gate, render_profile=render_profile, body=body)
+
+
+def _follow_up_texts(value: object, limit: int) -> list[str]:
+    """Bound each follow-up to the platform ceiling the body already respects.
+
+    A follow-up over the ceiling is truncated with a visible marker rather than
+    chunked: these carry one self-contained block each (today, the message
+    gate's fenced prompt), and splitting a fence across two messages produces
+    an unclosed fence on the first one.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    texts: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        texts.append(text if len(text) <= limit else _bounded_follow_up(text, limit))
+    return texts
+
+
+def _bounded_follow_up(text: str, limit: int) -> str:
+    """Truncate to ``limit`` INCLUDING the marker, and close any fence left open.
+
+    ``bounded_prompt_preview`` slices to ``max_chars`` and then APPENDS the
+    marker, so passing the ceiling straight through returned ~35 characters over
+    it and cut mid-fence -- both of the things this function exists to prevent.
+    The marker length is knowable up front because it carries ``len(text)``.
+    """
+    marker_room = len(f"... [truncated, {len(text)} chars total]")
+    closing = _unclosed_fence_marker(bounded_prompt_preview(text, max_chars=max(1, limit - marker_room)))
+    tail = f"\n{closing}" if closing else ""
+    head = bounded_prompt_preview(text, max_chars=max(1, limit - marker_room - len(tail)))
+    return f"{head}{tail}"
+
+
+def _unclosed_fence_marker(text: str) -> str:
+    """The marker needed to close ``text``'s dangling fence, or "" when balanced."""
+    state = _FenceState()
+    for line in text.splitlines():
+        state.toggles(line)
+    return state.marker
+
+
+def _messenger_chunking_hint(source: str = "") -> dict[str, object]:
+    """Return the advisory chunking hint for ``source``'s messenger platform.
+
+    OMH advises, adapters split. Ceilings are per-platform: Discord, Slack,
+    and Telegram each enforce a different hard per-message character cap, so
+    one global number under-warns on generous platforms and over-warns on
+    tight ones. An unknown, empty, or unmapped source falls back to the
+    generic Hermes ceiling. A fresh dict per call so a caller embedding it
+    in a payload cannot mutate the hint for every other caller.
+    """
+    ceiling = _MESSENGER_CHAR_CEILINGS.get(source, _MESSENGER_GENERIC_CEILING)
+    return {
+        "max_recommended_chars": ceiling["max_recommended_chars"],
+        "hard_limit_chars": ceiling["hard_limit_chars"],
+        "split_on": ["headings", "bullets", "paragraphs"],
+    }
+
+
+def _chunk_body_text(body_text: str, limit: int) -> list[str]:
+    """Deterministic adapter-ready chunks for a body over the soft ceiling.
+
+    Split preference order: blank-line paragraph boundaries, then line
+    boundaries, then a hard character split as the last resort. A fenced
+    block that must span chunks is closed at the chunk end and reopened
+    (same marker and run length, no language tag) at the next chunk start,
+    so no chunk ever carries an unbalanced fence. Every chunk fits within
+    ``limit``.
+    """
+    if limit <= 0 or len(body_text) <= limit:
+        return [body_text]
+    chunks: list[str] = []
+    current = ""
+    for segment_lines, fence_marker in _body_segments(body_text):
+        segment = "\n".join(segment_lines)
+        candidate = f"{current}\n\n{segment}" if current else segment
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(segment) <= limit:
+            current = segment
+            continue
+        if fence_marker:
+            chunks.extend(_split_fenced_segment(segment_lines, fence_marker, limit))
+        else:
+            chunks.extend(_split_prose_segment(segment_lines, limit))
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _body_segments(body_text: str) -> list[tuple[list[str], str]]:
+    """Paragraphs and fenced blocks of ``body_text``, in order.
+
+    Each segment is ``(lines, fence_marker)``: the marker is empty for prose
+    paragraphs and the opening marker run for fenced blocks, which is what a
+    chunk split needs to close and reopen the fence.
+    """
+    segments: list[tuple[list[str], str]] = []
+    current: list[str] = []
+    tracker = _FenceState()
+    fence_marker = ""
+    for line in body_text.splitlines():
+        if fence_marker:
+            closed = tracker.toggles(line)
+            current.append(line)
+            if closed:
+                segments.append((current, fence_marker))
+                current = []
+                fence_marker = ""
+            continue
+        if tracker.toggles(line):
+            if current:
+                segments.append((current, ""))
+            current = [line]
+            fence_marker = tracker.marker
+            continue
+        if not line.strip():
+            if current:
+                segments.append((current, ""))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        segments.append((current, fence_marker))
+    return segments
+
+
+def _split_prose_segment(lines: list[str], limit: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        for piece in _hard_split(line, limit) if len(line) > limit else [line]:
+            candidate = f"{current}\n{piece}" if current else piece
+            if len(candidate) <= limit:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+            current = piece
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _split_fenced_segment(lines: list[str], marker: str, limit: int) -> list[str]:
+    """Split one oversize fenced block without ever leaving a fence unbalanced.
+
+    Every emitted chunk closes with the bare marker, and every continuation
+    chunk reopens with the bare marker (no language tag). An unterminated
+    source fence is closed too: balance beats byte-fidelity here.
+    """
+    opening = lines[0]
+    interior = list(lines[1:])
+    if interior and _fence_closes(interior[-1], marker):
+        interior = interior[:-1]
+    close_cost = len(marker) + 1  # "\n" plus the closing fence line
+    content_budget = max(1, limit - 2 * close_cost)
+    chunks: list[str] = []
+    current = opening
+    for line in interior:
+        for piece in _hard_split(line, content_budget) if len(line) > content_budget else [line]:
+            candidate = f"{current}\n{piece}"
+            if len(candidate) + close_cost <= limit:
+                current = candidate
+                continue
+            chunks.append(f"{current}\n{marker}")
+            current = f"{marker}\n{piece}"
+    chunks.append(f"{current}\n{marker}")
+    return chunks
+
+
+def _hard_split(text: str, size: int) -> list[str]:
+    step = max(1, size)
+    return [text[start : start + step] for start in range(0, len(text), step)] or [""]
+
+
+def _render_body_blocks(body: str, *, render_profile: str) -> list[dict[str, object]]:
+    if render_profile == RENDER_PROFILE_RICH_MARKDOWN:
+        return _rich_markdown_body_blocks(body)
+    return _messenger_body_blocks(body)
+
+
+def _messenger_safe_body(body: str) -> tuple[str, list[str]]:
+    safe_body, transforms = _messenger_safe_body_cached(body)
+    return safe_body, list(transforms)
+
+
+@lru_cache(maxsize=4096)
+def _messenger_safe_body_cached(body: str) -> tuple[str, tuple[str, ...]]:
+    lines = body.splitlines()
+    if not lines:
+        return body, ()
+    output: list[str] = []
+    transforms: list[str] = []
+    index = 0
+    tracker = _FenceState()
+    while index < len(lines):
+        if tracker.toggles(lines[index]) or tracker.in_fence:
+            output.append(lines[index])
+            index += 1
+            continue
+        if not _is_markdown_table_start(lines, index):
+            output.append(lines[index])
+            index += 1
+            continue
+        block: list[str] = []
+        while index < len(lines) and _is_markdown_table_line(lines[index]):
+            block.append(lines[index])
+            index += 1
+        # Narrow list-shaped tables keep their columns inside a fence; anything
+        # wider or shorter becomes bullets. A table that is neither -- malformed
+        # rows, one column -- passes through untouched, as before.
+        converted = _markdown_table_to_aligned_block(block)
+        transform = "markdown_table_to_aligned_block"
+        if not converted:
+            converted = _markdown_table_to_bullets(block)
+            transform = "markdown_table_to_bullets"
+        if not converted:
+            output.extend(block)
+            continue
+        if output and output[-1].strip():
+            output.append("")
+        output.extend(converted)
+        transforms.append(transform)
+    return "\n".join(output), tuple(sorted(set(transforms)))
+
+
+def _fence_open(line: str) -> tuple[str, str]:
+    """Return ``(marker, info)`` when ``line`` can open a fenced code block.
+
+    CommonMark shape: three or more of the same marker character (backtick or
+    tilde), optionally followed by an info string. A backtick fence cannot
+    carry a backtick in its info string, so ````` a ` b``
+    is content, not a fence. The returned marker keeps its run length
+    (````````), which is what a closing line must match.
+    """
+    stripped = line.strip()
+    for character in ("`", "~"):
+        if stripped.startswith(character * 3):
+            length = len(stripped) - len(stripped.lstrip(character))
+            info = stripped[length:].strip()
+            if character == "`" and "`" in info:
+                return "", ""
+            return character * length, info
+    return "", ""
+
+
+def _fence_closes(line: str, open_marker: str) -> bool:
+    """True when ``line`` closes a fence opened by ``open_marker``: the same
+    marker character only, run length at least the opening length, and no
+    info string."""
+    stripped = line.strip()
+    character = open_marker[0]
+    return len(stripped) >= len(open_marker) and stripped == character * len(stripped)
+
+
+class _FenceState:
+    """CommonMark-style fence pairing for the messenger body parsers.
+
+    An opening fence records its marker character and run length; only a line
+    of the SAME character with a run at least that long (and no info string)
+    closes it. Interior shorter or other-marker fence lines are plain fence
+    content, so a body whose fenced block quotes another fence survives as one
+    code block instead of toggling on every fence-looking line.
+    """
+
+    def __init__(self) -> None:
+        self.marker = ""
+        self.info = ""
+
+    @property
+    def in_fence(self) -> bool:
+        return bool(self.marker)
+
+    def toggles(self, line: str) -> bool:
+        """Advance the state for ``line``; True when it opens or closes a fence."""
+        if self.marker:
+            if _fence_closes(line, self.marker):
+                self.marker = ""
+                self.info = ""
+                return True
+            return False
+        marker, info = _fence_open(line)
+        if marker:
+            self.marker = marker
+            self.info = info
+            return True
+        return False
+
+
+def _strip_fence_language_tags(body: str) -> tuple[str, list[str]]:
+    """Drop fence info strings (```` ```python ```` -> ```` ``` ````) from a
+    limited-profile body.
+
+    Discord is the only major messenger that renders the language tag; Slack
+    and Telegram print it as literal text on the fence line. `body_blocks`
+    already carries the language separately per code block, so nothing is
+    lost for adapters that can highlight.
+    """
+    tracker = _FenceState()
+    output: list[str] = []
+    stripped_any = False
+    for line in body.splitlines():
+        was_in_fence = tracker.in_fence
+        if tracker.toggles(line) and not was_in_fence and tracker.info:
+            prefix = line[: len(line) - len(line.lstrip())]
+            output.append(prefix + tracker.marker)
+            stripped_any = True
+            continue
+        output.append(line)
+    if not stripped_any:
+        return body, []
+    return "\n".join(output), ["fence_language_tags_stripped"]
+
+
+_SLACK_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+_SLACK_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+# The URL group allows one level of balanced parens so a Wikipedia-style link
+# ("...Rust_(programming_language)") converts losslessly instead of truncating
+# at the first ")". Deeper nesting or whitespace leaves the link untouched.
+_SLACK_LINK_RE = re.compile(r"\[([^\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)")
+# An inline-code span: a backtick run closed by an equally long run, so
+# double-backtick spans hold too. Span content stays byte-identical.
+_SLACK_INLINE_CODE_RE = re.compile(r"(`+).+?\1")
+
+
+def _slack_dialect_body(body: str) -> tuple[str, list[str]]:
+    """Convert Markdown to Slack mrkdwn OUTSIDE fences, line by line.
+
+    Slack renders `# Heading` and `**bold**` as literal characters and links
+    only as `<url|text>`, so the resolved-slack body converts headings to
+    `*bold*` lines, `**b**` to `*b*`, and `[x](y)` to `<y|x>`. Fenced code is
+    left byte-identical (fence pairing reuses the CommonMark tracker), and so
+    are inline-code spans on prose lines.
+    """
+    tracker = _FenceState()
+    output: list[str] = []
+    changed = False
+    for line in body.splitlines():
+        was_in_fence = tracker.in_fence
+        if tracker.toggles(line) or was_in_fence:
+            output.append(line)
+            continue
+        converted = _slack_dialect_line(line)
+        changed = changed or converted != line
+        output.append(converted)
+    if not changed:
+        return body, []
+    return "\n".join(output), ["slack_dialect_markdown"]
+
+
+def _slack_dialect_line(line: str) -> str:
+    """One prose line to mrkdwn. Inline-code spans keep their bytes: the
+    bold/link conversions apply only to the prose between them, so
+    ``**kwargs`` inside backticks is never halved to ``*kwargs``."""
+    prefix = line[: len(line) - len(line.lstrip())]
+    text = line.strip()
+    heading = _SLACK_HEADING_RE.match(text)
+    if heading:
+        text = f"*{heading.group(2).strip()}*"
+    pieces: list[str] = []
+    cursor = 0
+    for match in _SLACK_INLINE_CODE_RE.finditer(text):
+        pieces.append(_slack_dialect_prose(text[cursor : match.start()]))
+        pieces.append(match.group(0))
+        cursor = match.end()
+    pieces.append(_slack_dialect_prose(text[cursor:]))
+    return prefix + "".join(pieces)
+
+
+def _slack_dialect_prose(segment: str) -> str:
+    segment = _SLACK_BOLD_RE.sub(r"*\1*", segment)
+    return _SLACK_LINK_RE.sub(r"<\2|\1>", segment)
+
+
+def _is_markdown_table_start(lines: list[str], index: int) -> bool:
+    if index + 1 >= len(lines):
+        return False
+    return _is_markdown_table_line(lines[index]) and _is_markdown_separator_line(lines[index + 1])
+
+
+def _is_markdown_table_line(line: str) -> bool:
+    stripped = line.strip()
+    return "|" in stripped and len(_split_markdown_table_row(stripped)) >= 2
+
+
+def _is_markdown_separator_line(line: str) -> bool:
+    cells = _split_markdown_table_row(line)
+    if not cells:
+        return False
+    for cell in cells:
+        marker = cell.replace(":", "").replace("-", "").strip()
+        if marker:
+            return False
+        if cell.count("-") < 3:
+            return False
+    return True
+
+
+# A table that survives a messenger as a monospace block rather than as
+# bullets. All three limits exist because the failure modes differ:
+#
+# - Columns: at four or more, the aligned width stops fitting a phone and the
+#   row wraps, which is worse than bullets because a wrapped monospace row no
+#   longer lines up with the one above it.
+# - Rows: a single data row has nothing to align WITH, and a fence around one
+#   row costs more vertical space than it saves.
+# - Width: the real constraint. It is measured on the rendered block rather
+#   than guessed from the column count, because three short columns fit where
+#   two long ones do not.
+#
+# Above any of them, bullets stay the answer -- they wrap without lying about
+# alignment. This is the only shape that keeps column alignment on Slack and
+# Telegram, which drop markdown tables outright.
+_ALIGNED_TABLE_MAX_COLUMNS: Final[int] = 3
+_ALIGNED_TABLE_MIN_ROWS: Final[int] = 2
+_ALIGNED_TABLE_MAX_WIDTH: Final[int] = 56
+
+
+def _markdown_table_to_aligned_block(lines: list[str]) -> list[str]:
+    """A narrow list-shaped table as a fenced, aligned block, or ``[]``.
+
+    Returning ``[]`` hands the table to ``_markdown_table_to_bullets``. Both are
+    lossless about the cells; they differ in whether the reader gets columns.
+    """
+    rows = _markdown_table_rows(lines)
+    if not rows:
+        return []
+    headers, body_rows = rows[0], rows[1:]
+    if not (2 <= len(headers) <= _ALIGNED_TABLE_MAX_COLUMNS) or len(body_rows) < _ALIGNED_TABLE_MIN_ROWS:
+        return []
+    if any(len(row) != len(headers) for row in body_rows):
+        return []
+    # Display cells, not characters: `len("이슈")` is 2 and the string occupies
+    # four columns, so padding by length is how a Korean or Japanese table comes
+    # out ragged inside the very fence that exists to keep it straight.
+    widths = [max(display_width(cell) for cell in column) for column in zip(headers, *body_rows)]
+    if sum(widths) + 2 * (len(widths) - 1) > _ALIGNED_TABLE_MAX_WIDTH:
+        return []
+    rendered = [
+        "  ".join(pad_to_width(cell, width) for cell, width in zip(row, widths)).rstrip()
+        for row in (headers, *body_rows)
+    ]
+    return ["```", *rendered, "```"]
+
+
+def _markdown_table_rows(lines: list[str]) -> list[list[str]]:
+    """Header and body cells of a markdown table, or ``[]`` when it is not one."""
+    if len(lines) < 3 or not _is_markdown_separator_line(lines[1]):
+        return []
+    headers = _split_markdown_table_row(lines[0])
+    if not headers or not any(header.strip() for header in headers):
+        return []
+    rows = [[header.strip() for header in headers]]
+    for row in lines[2:]:
+        if _is_markdown_separator_line(row):
+            continue
+        cells = _split_markdown_table_row(row)
+        if not any(cells):
+            continue
+        rows.append([cell.strip() for cell in cells])
+    return rows if len(rows) > 1 else []
+
+
+def _markdown_table_to_bullets(lines: list[str]) -> list[str]:
+    if len(lines) < 3 or not _is_markdown_separator_line(lines[1]):
+        return []
+    headers = _split_markdown_table_row(lines[0])
+    if not headers:
+        return []
+    bullets: list[str] = []
+    for row in lines[2:]:
+        if _is_markdown_separator_line(row):
+            continue
+        cells = _split_markdown_table_row(row)
+        if not any(cells):
+            continue
+        while len(cells) < len(headers):
+            cells.append("")
+        first = cells[0].strip()
+        details = [
+            f"{header}: {cell}"
+            for header, cell in zip(headers[1:], cells[1:])
+            if header.strip() and cell.strip()
+        ]
+        if first and details:
+            bullets.append(f"- {first}: {'; '.join(details)}")
+        elif first:
+            bullets.append(f"- {headers[0]}: {first}")
+        elif details:
+            bullets.append(f"- {'; '.join(details)}")
+    return bullets
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    cells: list[str] = []
+    current: list[str] = []
+    code_tick_length = 0
+    index = 0
+    while index < len(stripped):
+        character = stripped[index]
+        if character == "`" and not _is_escaped(stripped, index):
+            run_end = index
+            while run_end < len(stripped) and stripped[run_end] == "`":
+                run_end += 1
+            run_length = run_end - index
+            if code_tick_length == 0:
+                code_tick_length = run_length
+            elif code_tick_length == run_length:
+                code_tick_length = 0
+            current.append(stripped[index:run_end])
+            index = run_end
+            continue
+        if character == "|" and code_tick_length == 0 and not _is_escaped(stripped, index):
+            cells.append(_normalize_table_cell("".join(current)))
+            current = []
+            index += 1
+            continue
+        current.append(character)
+        index += 1
+    cells.append(_normalize_table_cell("".join(current)))
+    if cells and not cells[0]:
+        cells = cells[1:]
+    if cells and not cells[-1]:
+        cells = cells[:-1]
+    return cells
+
+
+def _is_escaped(value: str, index: int) -> bool:
+    slash_count = 0
+    cursor = index - 1
+    while cursor >= 0 and value[cursor] == "\\":
+        slash_count += 1
+        cursor -= 1
+    return slash_count % 2 == 1
+
+
+def _normalize_table_cell(value: str) -> str:
+    return _unescape_table_pipes(value.strip())
+
+
+def _unescape_table_pipes(value: str) -> str:
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] == "\\" and index + 1 < len(value) and value[index + 1] == "|":
+            output.append("|")
+            index += 2
+            continue
+        output.append(value[index])
+        index += 1
+    return "".join(output)
+
+
+def _messenger_body_blocks(body: str) -> list[dict[str, object]]:
+    blocks: list[dict[str, object]] = []
+    for block_type, text, language in _messenger_body_blocks_cached(body):
+        block: dict[str, object] = {"type": block_type, "text": text}
+        if block_type == "code_block":
+            block["language"] = language
+        blocks.append(block)
+    return blocks
+
+
+@lru_cache(maxsize=4096)
+def _messenger_body_blocks_cached(body: str) -> tuple[tuple[str, str, str], ...]:
+    """Split a body into blocks, keeping fenced code intact.
+
+    Fences get their own block with newlines and leading whitespace PRESERVED.
+    Every other block type joins its lines with a space, which is correct for
+    prose and destructive for anything column-aligned: before this, a fenced
+    status table collapsed into one run-on paragraph on both render profiles,
+    so every adapter that consumes `body_blocks` lost the alignment.
+    """
+    blocks: list[tuple[str, str, str]] = []
+    current: list[str] = []
+    fence: list[str] = []
+    language = ""
+    tracker = _FenceState()
+
+    def flush_paragraph() -> None:
+        nonlocal current
+        if current:
+            blocks.append(("paragraph", " ".join(current), ""))
+            current = []
+
+    for line in body.splitlines():
+        stripped = line.strip()
+        if tracker.in_fence:
+            if tracker.toggles(line):
+                blocks.append(("code_block", "\n".join(fence), language))
+                fence = []
+                language = ""
+            else:
+                fence.append(line)
+            continue
+        if tracker.toggles(line):
+            flush_paragraph()
+            language = tracker.info
+            continue
+        if not stripped:
+            flush_paragraph()
+            continue
+        if stripped.startswith(("- ", "* ")):
+            flush_paragraph()
+            blocks.append(("bullet", stripped[2:].strip(), ""))
+            continue
+        numbered_text = _numbered_list_text(stripped)
+        if numbered_text:
+            flush_paragraph()
+            blocks.append(("numbered", numbered_text, ""))
+            continue
+        current.append(stripped)
+    if tracker.in_fence and fence:
+        # An unterminated fence still keeps its shape; dropping back to prose
+        # would silently reflow the very content the fence was protecting.
+        blocks.append(("code_block", "\n".join(fence), language))
+    flush_paragraph()
+    return tuple(blocks)
+
+
+def _rich_markdown_body_blocks(body: str) -> list[dict[str, object]]:
+    lines = body.splitlines()
+    if not lines:
+        return []
+    blocks: list[dict[str, object]] = []
+    paragraph: list[str] = []
+    index = 0
+    tracker = _FenceState()
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if tracker.in_fence:
+            # Raw inside a fence: `stripped` would drop the leading whitespace
+            # that column alignment is made of, and a blank line belongs to the
+            # code. Interior shorter/other-marker fence lines are content too.
+            paragraph.append(stripped if tracker.toggles(line) else line)
+            index += 1
+            continue
+        if tracker.toggles(line):
+            paragraph.append(stripped)
+            index += 1
+            continue
+        if _is_markdown_table_start(lines, index):
+            if paragraph:
+                blocks.extend(_messenger_body_blocks("\n".join(paragraph)))
+                paragraph = []
+            table_lines: list[str] = []
+            while index < len(lines) and _is_markdown_table_line(lines[index]):
+                table_lines.append(lines[index])
+                index += 1
+            block = _markdown_table_block(table_lines)
+            if block:
+                blocks.append(block)
+            else:
+                paragraph.extend(table_lines)
+            continue
+        if not stripped:
+            if paragraph:
+                blocks.extend(_messenger_body_blocks("\n".join(paragraph)))
+                paragraph = []
+            index += 1
+            continue
+        paragraph.append(stripped)
+        index += 1
+    if paragraph:
+        blocks.extend(_messenger_body_blocks("\n".join(paragraph)))
+    return blocks
+
+
+def _markdown_table_block(lines: list[str]) -> dict[str, object]:
+    if len(lines) < 2 or not _is_markdown_separator_line(lines[1]):
+        return {}
+    headers = _split_markdown_table_row(lines[0])
+    rows = [
+        _split_markdown_table_row(row)
+        for row in lines[2:]
+        if not _is_markdown_separator_line(row) and any(_split_markdown_table_row(row))
+    ]
+    return {
+        "type": "markdown_table",
+        "markdown": "\n".join(lines),
+        "headers": headers,
+        "rows": rows,
+    }
+
+
+def _numbered_list_text(stripped: str) -> str:
+    marker = ""
+    for index, character in enumerate(stripped):
+        if character.isdigit():
+            continue
+        if character in {".", ")"} and index > 0:
+            marker = stripped[: index + 1]
+        break
+    if not marker:
+        return ""
+    if len(stripped) <= len(marker) or not stripped[len(marker)].isspace():
+        return ""
+    rest = stripped[len(marker) :].strip()
+    return rest
+
+
+@lru_cache(maxsize=4096)
+def _short_text(value: str, *, limit: int) -> str:
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _action(action_id: str, label: str, style: str, *, enabled: bool = True, payload: dict[str, object] | None = None) -> dict[str, object]:
+    if action_id not in VISIBLE_ACTIONS and not action_id.startswith("answer:"):
+        raise ValueError(f"unsupported chat response action: {action_id}")
+    return {"id": action_id, "label": label, "style": style, "enabled": enabled, "payload": payload or {}}
+
+
+def _action_from_spec(spec: dict[str, object]) -> dict[str, object]:
+    payload_value = spec.get("payload")
+    payload = {str(key): value for key, value in payload_value.items()} if isinstance(payload_value, dict) else None
+    return _action(
+        str(spec.get("id", "")),
+        str(spec.get("label", "")),
+        str(spec.get("style", "")),
+        enabled=bool(spec.get("enabled", True)),
+        payload=payload,
+    )
+
+
+def _phase_for_next_action(next_action: str) -> str:
+    return {
+        "prepare_coding_delegation": "preparing",
+        "choose_executor": "executor_choice_required",
+        "dispatch_to_executor": "handoff_prepared",
+        "show_prompt_handoff": "prompt_handoff_prepared",
+        "show_runtime_handoff": "runtime_handoff_prepared",
+        "wait_for_executor_evidence": "dispatched",
+        "surface_executor_blocker": "blocked",
+        "surface_executor_cancellation": "cancelled",
+        "surface_review_blocker": "blocked",
+        "surface_ci_blocker": "blocked",
+        "surface_merge_blocker": "blocked",
+        "record_review_evidence": "awaiting_review",
+        "record_ci_evidence": "awaiting_ci",
+        "record_merge_readiness": "awaiting_merge_readiness",
+        "record_verification_evidence": "awaiting_verification",
+        "report_completion_with_evidence": "reportable",
+        "report_merge_ready": "merge_ready",
+        "report_merged": "merged",
+    }.get(next_action, "status")
+
+
+def _status_card_severity(next_action: str) -> str:
+    if next_action == "surface_executor_cancellation":
+        return "cancelled"
+    if next_action.startswith("surface_"):
+        return "blocked"
+    if next_action in {"report_merge_ready", "report_merged", "report_completion_with_evidence"}:
+        return "success"
+    if next_action in {"dispatch_to_executor", "record_review_evidence", "record_ci_evidence", "record_merge_readiness"}:
+        return "attention"
+    return "neutral"
+
+
+def _status_card_steps(status_payload: dict[str, Any], next_action: str) -> list[dict[str, object]]:
+    review = _nested(status_payload, "review")
+    ci = _nested(status_payload, "ci")
+    merge = _nested(status_payload, "merge")
+    merge_readiness = _nested(status_payload, "merge_readiness")
+    steps = [
+        _status_card_step("handoff", "Handoff", _handoff_step_state(status_payload, next_action), "Prepared executor handoff."),
+        _status_card_step("execution", "Execution", _observed_step_state(_nested(status_payload, "execution")), "Observed executor result."),
+        _status_card_step("verification", "Verification", _verification_step_state(_nested(status_payload, "verification")), "Observed verification evidence."),
+        _status_card_step("review", "Review", _gate_step_state(review, required=bool(review.get("required", False))), "Review evidence when required."),
+        _status_card_step("ci", "CI", _gate_step_state(ci, required=bool(ci) or str(review.get("status", "")) == "passed"), "CI evidence before merge readiness."),
+        _status_card_step(
+            "merge_ready",
+            "Merge Ready",
+            _merge_ready_step_state(merge_readiness, next_action),
+            "Explicit merge-readiness evidence.",
+        ),
+        _status_card_step("merged", "Merged", _merged_step_state(merge), "Observed merge evidence."),
+    ]
+    return steps
+
+
+def _status_card_step(step_id: str, label: str, state: str, detail: str) -> dict[str, object]:
+    return {"id": step_id, "label": label, "state": state, "detail": detail}
+
+
+def _handoff_step_state(status_payload: dict[str, Any], next_action: str) -> str:
+    if next_action in {"prepare_coding_delegation", "clarify_coding_request", "route_coding_request"}:
+        return "pending"
+    if next_action == "dispatch_to_executor":
+        return "ready"
+    if _nested(status_payload, "prepared").get("handoff_available", False):
+        return "complete"
+    return "pending"
+
+
+# The step states a status card can show. `blocked`, `failed`, and `cancelled`
+# are three different things and used to be one: every `_*_step_state` function
+# below mapped `{"blocked", "failed"}` onto `"blocked"`, so no step could ever
+# report a failure and the card said "something is in the way" where the truth
+# was "this ran and did not work". They are separated here because #808 AC2
+# requires blocked, failed, cancelled, and completed to stay apart wherever they
+# are shown, and a card is where they are shown.
+#
+# `not_required` is in this tuple and is the one success-shaped state a step can
+# reach without evidence. A blocked step must never fold into it: `not_required`
+# says no evidence is owed, and `blocked` says evidence is owed and cannot be
+# produced yet. `_terminal_step_state` exists so that distinction is made in one
+# place rather than five.
+STATUS_CARD_STEP_STATES = ("pending", "ready", "complete", "blocked", "failed", "cancelled", "not_required")
+
+# Which card state one recorded status means, for the statuses that are not
+# progress. Anything absent from this table is progress, not an ending.
+_TERMINAL_STEP_STATES = {
+    "blocked": "blocked",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
+
+
+def _terminal_step_state(status: str) -> str:
+    """The card state for a status that ended the step, or empty when it did not.
+
+    One table, read by every step builder, so a status cannot mean `failed` on
+    the execution row and `blocked` on the verification row.
+    """
+    return _TERMINAL_STEP_STATES.get(str(status), "")
+
+
+def _observed_step_state(value: dict[str, Any]) -> str:
+    status = str(value.get("status", "not_observed"))
+    terminal = _terminal_step_state(status)
+    if terminal:
+        return terminal
+    if bool(value.get("observed", False)) and status == "completed":
+        return "complete"
+    return "pending"
+
+
+def _verification_step_state(value: dict[str, Any]) -> str:
+    status = str(value.get("status", ""))
+    terminal = _terminal_step_state(status)
+    if terminal:
+        return terminal
+    return "complete" if bool(value.get("observed", False)) else "pending"
+
+
+def _gate_step_state(value: dict[str, Any], *, required: bool) -> str:
+    status = str(value.get("status", "not_observed"))
+    if not required and status in {"not_required", "not_observed"}:
+        return "not_required"
+    if status == "passed":
+        return "complete"
+    terminal = _terminal_step_state(status)
+    if terminal:
+        return terminal
+    return "pending"
+
+
+def _merge_ready_step_state(value: dict[str, Any], next_action: str) -> str:
+    status = str(value.get("status", "not_observed"))
+    if next_action == "report_merge_ready" or status == "ready":
+        return "complete"
+    terminal = _terminal_step_state(status)
+    if terminal:
+        return terminal
+    return "pending"
+
+
+def _merged_step_state(value: dict[str, Any]) -> str:
+    status = str(value.get("status", "not_observed"))
+    if status == "merged":
+        return "complete"
+    terminal = _terminal_step_state(status)
+    if terminal:
+        return terminal
+    return "pending"
+
+
+def _default_overclaim_guard() -> list[str]:
+    return [
+        "Prepared handoff is not execution evidence.",
+        "Review, verification, CI, and merge status require separate observed evidence.",
+        "Hermes orchestrates; selected coding executors perform main coding work.",
+    ]
+
+
+def _nested(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    return value if isinstance(value, dict) else {}

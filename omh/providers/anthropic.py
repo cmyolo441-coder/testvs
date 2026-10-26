@@ -90,7 +90,13 @@ class AnthropicProvider(Provider):
         return self.config.available()
 
     def _url(self) -> str:
-        base = (self.config.base_url or "https://api.anthropic.com").rstrip("/")
+        base = self.config.base_url
+        if not base:
+            raise ProviderError(
+                f"{self.name} has no base_url; add it to config.toml",
+                retryable=False,
+            )
+        base = base.rstrip("/")
         if base.endswith("/messages"):
             return base
         if base.endswith("/v1"):

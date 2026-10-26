@@ -3,11 +3,11 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-build/
-dist/
+/build/
+/dist/
 .env
-.omh.json
-.omh/
+/.omh.toml
+/.omh/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/

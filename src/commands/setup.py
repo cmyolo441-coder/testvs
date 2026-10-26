@@ -1,0 +1,6817 @@
+from __future__ import annotations
+
+import argparse
+from collections.abc import Callable, Iterable
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any, NamedTuple, cast
+import unicodedata
+
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - Windows compatibility guard.
+    termios = None
+    tty = None
+
+from ..coding.executors import canonical_executor_profile
+from ..version import __version__
+from ..command_path import COMMAND_PATH_MISSING_NEXT_ACTION, inspect_omh_command_path
+from ..capabilities.registry import capability_summary
+from ..capabilities.skills import skill_capabilities
+from ..coding.executor_auth_signals import auth_signal_for_profile
+from ..coding.executors import EXTERNAL_CLI_PROFILES
+from ..coding.pi_family_interop import RUNTIME_SHORT_NAME
+from ..coding.fanout_dispatch import (
+    DISPATCH_MODEL_PREFERENCE_SCHEMA_VERSION,
+    dispatch_model_preferences_path,
+)
+from ..coding.hermes_model_config import (
+    apply_hermes_model_config,
+    inspect_hermes_model_config,
+    preview_hermes_model_config,
+)
+from ..coding.model_discovery import discover_local_models
+from ..coding.model_recommendations import resolve_model_recommendation
+from ..config_adapter import (
+    ConfigChange,
+    childless_containers,
+    display_read_refusal,
+    display_skin_selection,
+    ensure_plugin_enabled,
+    ensure_plugin_omh_home,
+    external_dir_registered,
+    external_dirs,
+    maybe_set_memory_provider,
+    memory_provider_selection,
+    plugin_omh_home_setting,
+    read_config,
+    remove_external_dir,
+    update_config,
+)
+from ..install.compression_defaults import ensure_compression_defaults
+from ..install.lifecycle_safety import command_runtime_owned, primary_hermes_home, store_removal_plan
+from ..install.config_reversal import (
+    DISPLAY_KEYS,
+    DISPLAY_RELEASED_FIELD,
+    DISPLAY_SKIN_KEY,
+    MANAGED_CONFIG_WRITES_STATE_KEY,
+    _plain_scalar,
+    config_names_key,
+    drop_emptied_containers,
+    PLUGIN_OMH_HOME_KEY,
+    load_managed_config_writes,
+    managed_config_writes,
+    reclaim_plugin_omh_home,
+    release_managed_display,
+    reverse_managed_config,
+)
+from ..install.skill_registration import (
+    ambiguous_registration_message,
+    external_dir_key,
+    hermes_profile_dirs,
+    managed_skill_dir_candidates,
+    migrate_managed_registration,
+    registered_managed_entries,
+    registration_home_label,
+)
+from ..doctor import DEFAULT_DOCTOR_NEXT_ACTION, doctor_ok, recommended_next_action, run_doctor
+from ..maintenance.build_identity import probe_build_identity
+from ..maintenance.doctor import run_doctor_advisories
+from ..maintenance.hermes_gateway import gateway_restart_hints
+from ..executors import CODING_EXECUTOR_TARGETS
+from ..hashutil import sha256_file
+from ..installer import (
+    SKILL_PROFILE_RECONCILE_COMMAND,
+    OmhError,
+    install_skill_pack,
+    reconcile_skill_profile,
+    skill_profile_report,
+    uninstall_profile_plugin,
+    uninstall_skill_pack,
+)
+from ..local_store import atomic_write_text
+from ..install.installer import DEFAULT_SKILL_PROFILE, LEDGER_COPY_PARTIAL_KEY, PRUNE_SKIP_REASONS, SKILL_PROFILES
+from ..manifest import read_manifest
+from .update_change_note import record_update_change_note, update_change_note_lines
+from ..menubar_app import is_managed_menubar_install, setup_menubar_app, uninstall_menubar_app
+from ..mcp.host_config import install_mcp_host_config
+from ..mcp_bridge import MCP_HOST_CONFIG_RECIPE_HOSTS
+from ..paths import (
+    OmhPaths,
+    managed_command_venv_dir,
+    managed_current_workflow_pack_dir,
+    configured_omh_home,
+)
+from ..plugin_bundle.omh.metadata import MEMORY_PROVIDER_NAME
+from ..plugin_bundle.omh.provider_detection import (
+    LINKED_SOURCE_CONFIG,
+    LINKED_SOURCE_ENV,
+    LINKED_SOURCE_LOGIN,
+    detect_linked_providers,
+    env_key_names,
+    env_row_is_covered,
+)
+from ..plugin_pack import PLUGIN_NAME, PluginPackError, install_plugin_bundle
+from ..install.plugin_pack import HERMES_PLUGIN_UPDATE_COMMAND, PluginContentProtectedError
+from ..probe import probe_capabilities
+from ..release import (
+    COMMIT_SHA_RE,
+    RELEASE_ASSET_ROOT,
+    RELEASE_CHANNELS,
+    RELEASE_WHEEL_VERSION_RE,
+    ReleaseSelection,
+    package_url_for,
+    release_artifact_note,
+    release_from_direct_url,
+)
+from ..skin_pack import (
+    SkinInstallError,
+    available_skins,
+    default_theme,
+    read_theme_choice,
+    theme_for_skin_name,
+    theme_store_path,
+    uninstall_skin,
+    write_theme_choice,
+)
+from ..tui_widget_pack import TuiWidgetInstallError, uninstall_tui_widget
+from ..routing.chat import recommend_route_summary
+from ..routing.recommend import recommend_skills
+from ..routing.route_plan import build_workflow_route_plan, compact_workflow_route_plan
+from ..runtime.artifacts import read_state_result, update_state
+from ..setup_profiles import (
+    PROJECT_MEMORY_MODES,
+    build_setup_profile,
+    write_setup_profile,
+)
+from ..snippet import WORKSPACE_SNIPPET
+from ..system.stdin_probe import stdin_is_tty
+from ..targets import record_target_observation
+from ..team_profiles import (
+    TeamProfileError,
+    inspect_operating_model,
+    inspect_team_profile_pack,
+    install_team_profile_pack,
+    list_team_profile_packs,
+    operating_model_ids,
+)
+from .common import _action_label, _paths, _print_json, _wants_json
+from .language import LANGUAGE_CODES, language_from_env, normalize_language, tr
+from .profile_isolation import add_doctor_profile_isolation_argument
+from .model_setup_flow import (
+    ModelSetupFlowDependencies,
+    model_activation_result,
+)
+from .model_setup_inputs import validate_model_setup_args
+from .model_setup_rendering import (
+    print_model_activation_summary,
+    print_model_preview_review,
+)
+
+POSIX_INSTALLER_COMMAND = "curl -fsSL https://raw.githubusercontent.com/rlaope/oh-my-hermes/main/install.sh | sh"
+WINDOWS_INSTALLER_COMMAND = "irm https://raw.githubusercontent.com/rlaope/oh-my-hermes/main/install.ps1 | iex"
+COMMAND_PACKAGE_MANAGER_ENV = "OMH_COMMAND_PACKAGE_MANAGER"
+COMMAND_PACKAGE_ROOT_ENV = "OMH_COMMAND_PACKAGE_ROOT"
+COMMAND_PACKAGE_RUNTIME_ENV = "OMH_COMMAND_PACKAGE_RUNTIME"
+COMMAND_PACKAGE_ENTRYPOINT_ENV = "OMH_COMMAND_PACKAGE_ENTRYPOINT"
+COMMAND_PACKAGE_UPDATE_COMMANDS = {
+    "npm": "npm update -g oh-my-hermes",
+    "bun": "bun update -g --latest oh-my-hermes",
+    "homebrew": "brew upgrade rlaope/tap/omh",
+}
+COMMAND_PACKAGE_UPDATE_ARGUMENTS = {
+    "npm": ("update", "-g", "oh-my-hermes"),
+    "bun": ("update", "-g", "--latest", "oh-my-hermes"),
+    "homebrew": ("upgrade", "rlaope/tap/omh"),
+}
+COMMAND_PACKAGE_EXECUTABLES = {
+    "npm": "npm",
+    "bun": "bun",
+    "homebrew": "brew",
+}
+
+
+def installer_command() -> str:
+    """The installer one-liner for the host this command is running on.
+
+    A Windows user told to run `curl ... | sh` has been handed something their
+    shell cannot execute, which reads as "OMH does not support this platform"
+    rather than "wrong line was printed".
+    """
+    return WINDOWS_INSTALLER_COMMAND if os.name == "nt" else POSIX_INSTALLER_COMMAND
+
+
+def _command_package_update_guidance() -> tuple[str, str]:
+    explicit = os.environ.get(COMMAND_PACKAGE_MANAGER_ENV, "").strip().lower()
+    if explicit in COMMAND_PACKAGE_UPDATE_COMMANDS:
+        return explicit, COMMAND_PACKAGE_UPDATE_COMMANDS[explicit]
+    if _homebrew_prefix_root() is not None:
+        return "homebrew", COMMAND_PACKAGE_UPDATE_COMMANDS["homebrew"]
+    direct = _direct_url_update_guidance()
+    if direct is not None:
+        return direct
+    return "installer", installer_command()
+
+
+def _direct_url_update_guidance() -> tuple[str, str] | None:
+    """Name the real owner of a PEP 610 direct-URL install.
+
+    An agent handed only the repository link often installs the command with
+    `pip install git+...`, `pip install <clone>`, or `uv tool install`. Those
+    installs carry no manager provenance state, and the generic curl fallback
+    would create a second, conflicting install next to the one that already
+    owns the command. The dist-info `direct_url.json` records the actual
+    origin, so the update instruction points there instead. The curl
+    installer's own managed venv also leaves a `direct_url.json`, naming the
+    release archive it fetched, which is neither shape below, so it falls
+    through to the installer fallback as before.
+    """
+    from urllib.parse import urlsplit
+    from urllib.request import url2pathname
+
+    data = _installed_direct_url()
+    if data is None:
+        return None
+    url = str(data.get("url", "") or "")
+    prefix_parts = tuple(part.casefold() for part in Path(sys.prefix).parts)
+    if "uv" in prefix_parts and "tools" in prefix_parts:
+        return "uv-tool", _uv_tool_update_instruction(data, url)
+    if isinstance(data.get("vcs_info"), dict) and url and not url.startswith("file:"):
+        return "pip", f'{sys.executable} -m pip install --upgrade "git+{url}"'
+    dir_info = data.get("dir_info")
+    if isinstance(dir_info, dict) and url.startswith("file://"):
+        if dir_info.get("editable"):
+            # An editable install is a development checkout; its command
+            # updates through `git pull` alone and keeps the long-standing
+            # installer fallback wording rather than a pip reinstall.
+            return None
+        # url2pathname handles Windows drive letters (`file:///C:/...`),
+        # which a bare unquote of the URL path would leave unusable.
+        checkout = Path(url2pathname(urlsplit(url).path))
+        if checkout.is_dir():
+            return "pip", (
+                f"git -C {checkout} pull && "
+                f"{sys.executable} -m pip install --upgrade {checkout}"
+            )
+    return None
+
+
+def _uv_tool_update_instruction(data: dict[str, object], url: str) -> str:
+    """The command that moves a `uv tool install` to a newer OMH.
+
+    `uv tool upgrade` re-resolves the requirement the tool was installed
+    with, so a commit, a release tag, or an archive URL resolves to itself:
+    on uv 0.12.5, a tool installed from `git+...@<sha>` or from the release
+    wheel URL answered "Nothing to upgrade". Those installs are moved by
+    reinstalling at the new pin; a branch or unpinned git install keeps the
+    upgrade command.
+    """
+    vcs = data.get("vcs_info")
+    if isinstance(vcs, dict):
+        revision = str(vcs.get("requested_revision") or "")
+        tag = revision.startswith("v") and RELEASE_WHEEL_VERSION_RE.fullmatch(revision[1:])
+        if COMMIT_SHA_RE.fullmatch(revision) or tag:
+            return f'uv tool install --force "git+{url}@<new-ref>"'
+        return "uv tool upgrade oh-my-hermes"
+    if isinstance(data.get("archive_info"), dict) and url:
+        release = release_from_direct_url(data)
+        if release is not None and release.artifact_kind == "release-wheel":
+            return f'uv tool install --force "{RELEASE_ASSET_ROOT}/v<version>/oh_my_hermes-<version>-py3-none-any.whl"'
+        return 'uv tool install --force "<new package URL>"'
+    return "uv tool upgrade oh-my-hermes"
+
+
+def _installed_direct_url() -> dict[str, object] | None:
+    """The installed distribution's PEP 610 `direct_url.json`, or None."""
+    import importlib.metadata
+
+    try:
+        raw = importlib.metadata.distribution("oh-my-hermes").read_text("direct_url.json")
+    except (importlib.metadata.PackageNotFoundError, OSError):
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _requested_release(args: argparse.Namespace) -> ReleaseSelection:
+    """The release this install/update records: what was asked for, else what is installed.
+
+    `--channel` used to default to `preview`, so a plain `omh setup` after the
+    documented stable install recorded the `main` archive while the release
+    wheel was installed, and the installer's pinned version or commit was
+    lost (install.sh passes them only under `OMH_RUN_SETUP=1`). With no
+    `--channel`, `--version`, or `--package-url`, the installed package's PEP
+    610 record names the artifact. A package-manager install (npm, Bun,
+    Homebrew) leaves none that names a channel -- npm ships stable and beta
+    from the same wheel -- so it records the package version and no channel.
+    Any other recorded URL (a fork, a local wheel or clone) is recorded as
+    the package URL with no channel. Only an install that records nothing,
+    or an editable development checkout, keeps the `preview` default.
+    """
+    if args.channel is not None or args.version or args.package_url:
+        return package_url_for(args.channel or "preview", args.version or "", args.package_url or "")
+    record = _installed_direct_url() or {}
+    installed = release_from_direct_url(record)
+    if installed is not None:
+        return installed
+    if _command_package_update_guidance()[0] in COMMAND_PACKAGE_UPDATE_COMMANDS:
+        return ReleaseSelection("", __version__, "", "", "package-manager")
+    url = str(record.get("url") or "")
+    dir_info = record.get("dir_info")
+    if url and not (isinstance(dir_info, dict) and dir_info.get("editable")):
+        return ReleaseSelection("", "", url, "custom-url", "custom-url")
+    return package_url_for("preview")
+
+
+def _homebrew_prefix_root() -> Path | None:
+    prefix = Path(sys.prefix)
+    folded_parts = tuple(part.casefold() for part in prefix.parts)
+    for index, part in enumerate(folded_parts):
+        if part == "cellar" and folded_parts[index + 1 : index + 2] == ("omh",):
+            return Path(*prefix.parts[:index])
+    return None
+
+
+COMMAND_PACKAGE_STATUS_SCHEMA_VERSION = "command_package_status/v1"
+RELEASE_UPDATE_SCHEMA_VERSION = "release_update_status/v1"
+SETUP_OPERATOR_SUMMARY_SCHEMA_VERSION = "setup_operator_summary/v1"
+DOCTOR_SUMMARY_SCHEMA_VERSION = "doctor_summary/v1"
+MCP_SETUP_SCHEMA_VERSION = "omh_mcp_setup/v1"
+SELF_UPDATE_REENTRY_ENV = "OMH_UPDATE_COMMAND_PACKAGE_REENTERED"
+# Set by the self-update on the re-entry that restores the known-good
+# generation after a refused candidate; the human summary then says
+# "rollback", never "update complete".
+SELF_UPDATE_ROLLBACK_ENV = "OMH_UPDATE_ROLLBACK_RESTORE"
+SELF_UPDATE_SKIP_ENV = "OMH_SKIP_COMMAND_PACKAGE_UPDATE"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def cmd_install(args: argparse.Namespace, *, result: dict[str, object] | None = None, emit: bool = True) -> int:
+    if getattr(args, "target", "hermes") == "agents":
+        return _cmd_install_agents(args)
+    if getattr(args, "agents_scope", None) or getattr(args, "status", False) or getattr(args, "host", None):
+        raise OmhError("install --host, --scope and --status require --target agents; Hermes scope goes before install")
+    language = _resolve_language(args)
+    if not emit:
+        payload = _install_result(args)
+        if result is not None:
+            result.update(payload)
+        return 0
+    if _wants_json(args):
+        payload = _install_result(args)
+        _print_json(payload)
+    else:
+        operation = _install_operation(args)
+        progress = _HumanProgress(enabled=True, use_color=_use_color())
+        progress.header(f"OMH {operation}", tr(language, "install_subtitle"))
+        progress.step(1, 1, tr(language, "step_install_skills"))
+        payload = _install_result(args)
+        skills = payload.get("skills", [])
+        progress.done(tr(language, "done_skills_ready", count=len(skills) if isinstance(skills, list) else 0))
+        _print_install_summary(payload, command=operation, language=language)
+    return 0
+
+
+def _cmd_install_agents(args: argparse.Namespace) -> int:
+    from ..install.agent_skills_projection import agent_skills_status, agent_skills_targets, install_agent_skills
+
+    if args.host and not args.agents_scope:
+        args.agents_scope = "repo"
+    if not args.agents_scope:
+        raise OmhError("install --target agents requires --scope repo|user")
+    if (args.from_skills_dir or args.source or args.version or args.package_url
+            or args.source_ref or args.full or args.core or args.channel not in (None, "preview")):
+        raise OmhError("Agent Skills installs generate the complete portable catalog; Hermes source/profile/release options do not apply")
+    try:
+        target, mirror = agent_skills_targets(args.agents_scope, host=args.host)
+        payload = (
+            agent_skills_status(target, mirror=mirror)
+            if args.status or args.dry_run else install_agent_skills(target, mirror=mirror)
+        )
+    except (OSError, ValueError) as exc:
+        raise OmhError(f"Agent Skills projection failed: {exc}") from exc
+    payload["scope"] = args.agents_scope
+    payload["dry_run"] = args.dry_run
+    if args.host:
+        from ..install.agent_skills_projection import agent_skill_files
+        from ..skills.host_adapters import host_adapter_manifest
+
+        payload["host_adapter"] = host_adapter_manifest(args.host, agent_skill_files())
+    if args.json:
+        _print_json(payload)
+    else:
+        print(f"Agent Skills projection: {payload['projection']}")
+        print(f"Drift: {str(payload['drift']).replace('_', '-')}")
+        for directory in payload["target_dirs"]:
+            print(f"Target: {directory}")
+        for relative in payload["locally_modified"]:
+            print(f"Locally modified: {relative}")
+        print(f"Next action: {payload['next_action']}")
+        for warning in payload["warnings"]:
+            print(f"Warning: {warning}")
+        print(payload["claim_boundary"])
+    return 0
+
+
+def _install_result(args: argparse.Namespace) -> dict[str, object]:
+    paths = _paths(args)
+    language = _resolve_language(args)
+    operation = _install_operation(args)
+    try:
+        release = _requested_release(args)
+    except ValueError as exc:
+        raise OmhError(str(exc)) from exc
+    if args.channel == "local" and not (args.from_skills_dir or args.source):
+        raise OmhError("local channel requires --from-skills-dir or --source")
+    source_dir = Path(args.from_skills_dir or args.source).expanduser().resolve() if (args.from_skills_dir or args.source) else None
+    source = str(source_dir) if source_dir else "builtin"
+    source_ref = _release_source_ref(args, release)
+    previous_release = _previous_release_update_state(paths)
+    # Read before install_skill_pack rewrites the manifest.
+    previous_manifest_sha256 = _previous_manifest_sha256(paths)
+    previous_manifest = read_manifest(paths.manifest_path)
+    skill_profile = _resolved_skill_profile(args, paths)
+    result = install_skill_pack(
+        paths,
+        source=source,
+        source_dir=source_dir,
+        force=args.force,
+        dry_run=args.dry_run,
+        profile=skill_profile,
+    )
+    result.update(
+        {
+            "operation": operation,
+            "release_channel": release.channel,
+            "release_version": release.version,
+            "release_package_url": release.package_url,
+            "release_artifact_kind": release.artifact_kind,
+            "release_artifact_note": release_artifact_note(release),
+            "release_source_ref": source_ref,
+            "language": language,
+        }
+    )
+    if not args.dry_run:
+        result["runtime_state_path"] = str(paths.runtime_state_path)
+        result["runtime_state_key"] = f"last_{operation}"
+    result["managed_skills"] = _managed_skills_status(result, dry_run=bool(args.dry_run))
+    result["command_package"] = _command_package_status_for_install(
+        operation=operation,
+        source=source,
+        dry_run=bool(args.dry_run),
+        command_package_updated=bool(getattr(args, "command_package_updated", False)),
+    )
+    result["workflow_content"] = _workflow_content_status(
+        paths,
+        previous_manifest_sha256,
+        dry_run=bool(args.dry_run),
+    )
+    result["release_update"] = _release_update_status(
+        release_channel=release.channel,
+        release_version=release.version,
+        release_package_url=release.package_url,
+        source_ref=source_ref,
+        explicit_metadata=_explicit_release_metadata_supplied(args),
+        previous=previous_release,
+        command_package=result["command_package"],
+        dry_run=bool(args.dry_run),
+    )
+    if not args.dry_run and source == "builtin":
+        result["update_change_note"] = record_update_change_note(
+            paths,
+            previous_manifest=previous_manifest,
+            current_manifest=result,
+            previous_version=str((previous_manifest or {}).get("version") or ""),
+        )
+    if not args.dry_run:
+        operation_log = _install_operation_log(result, source=source)
+        state_patch: dict[str, object] = {
+            "package": "oh-my-hermes",
+            "version": __version__,
+            "manifest_path": str(paths.manifest_path),
+            "manifest_sha256": sha256_file(paths.manifest_path),
+            "source": source,
+            "release_channel": release.channel,
+            "release_version": release.version,
+            "release_package_url": release.package_url,
+            "release_source_ref": source_ref,
+            "release_update": result["release_update"],
+            "installed_skills": len(result.get("skills", [])),
+            "skills_dir": str(paths.skills_dir),
+            f"last_{operation}": operation_log,
+        }
+        # Only overwrite a previously recorded identity with a freshly
+        # confirmed one; never regress it to "" just because update-check
+        # was off (or the probe failed) on this particular run. The helper
+        # also enforces the issue #1282 replayable advance policy: an open,
+        # unaccepted coverage gap (or a non-fast-forward ancestry) pins the
+        # cursor by returning "".
+        release_source_commit = _release_source_commit_for_state(paths, release)
+        if release_source_commit:
+            state_patch["release_source_commit"] = release_source_commit
+        update_state(paths, state_patch)
+    return result
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    self_update = _command_package_self_update_plan(args)
+    if self_update.get("should_update"):
+        return _run_command_package_self_update(args, self_update)
+    # Explicit local skill sources retain the content-only install contract.
+    if args.from_skills_dir or args.source:
+        code = cmd_install(args)
+        if code == 0:
+            _refresh_installed_menubar_app(args)
+        return code
+    payload: dict[str, object] = {}
+    code = cmd_install(args, result=payload, emit=False)
+    if code:
+        return code
+    failures: list[dict[str, object]] = []
+    primary_registration: dict[str, object] | None = None
+    try:
+        if _paths(args).hermes_plugin_dir.is_dir():
+            plugin = _refresh_installed_plugin_bundle(args)
+            payload["plugin_bundle"] = plugin
+            if plugin is None:
+                failures.append({"phase": "plugin_bundle", "error": "plugin refresh refused; preserve local changes and run `omh setup --force` after reviewing them"})
+            primary_registration = _refresh_hermes_registration(args)
+            _seed_model_chains_result(_paths(args), dry_run=bool(args.dry_run))
+        else:
+            primary_registration = _bootstrap_tui_surface(args)
+        if primary_registration is None:
+            failures.append({"phase": "registration", "error": "primary Hermes registration failed; run `omh setup` after repairing its config"})
+    except (OSError, UnicodeError, ValueError, OmhError, PluginPackError) as exc:
+        failures.append({"phase": "primary", "error": f"{type(exc).__name__}: {_bounded_command_error(str(exc))}"})
+    payload["hermes_registration"] = primary_registration
+    payload["menubar_app"] = _refresh_installed_menubar_app(args)
+    profile_results = _sync_hermes_profiles(args) if hasattr(args, "omh_home") else []
+    payload["hermes_profiles"] = profile_results
+    failures.extend(
+        {"phase": "profile_sync", "profile": row["profile"], "error": row["error"]}
+        for row in profile_results if row.get("status") == "failed"
+    )
+    code = 1 if failures else 0
+    payload.update({"status": "partial" if failures else "ok", "failures": failures, "exit_code": code})
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        if payload.get("skills") is not None:
+            _print_install_summary(payload, command="update", language=_resolve_language(args))
+        _print_display_release_lines(primary_registration, profile_results)
+        _print_registration_migrations(primary_registration, profile_results)
+        _print_omh_home_reclaims(profile_results)
+        _print_hermes_profiles_line(profile_results, language=_resolve_language(args))
+        for failure in failures:
+            label = failure.get("profile", failure["phase"])
+            print(f"  warning: {label}: {failure['error']}; repair this home and rerun `omh update`")
+        if not bool(getattr(args, "dry_run", False)) and hasattr(args, "omh_home"):
+            for line in _registration_ambiguity_lines(args):
+                print(f"  warning: {line}")
+            for hint in gateway_restart_hints(_paths(args)):
+                print(f"  {hint}")
+    return code
+
+
+def _bootstrap_tui_surface(args: argparse.Namespace) -> dict[str, object] | None:
+    """Give `omh update` on a never-set-up machine the plugin and its registration.
+
+    Update and setup must converge on the same machine state (owner decision,
+    2026-08-20): a user who only ever runs `omh update` still ends with the
+    plugin bundle installed, OMH registered and enabled in the Hermes config,
+    and the chain-override document seeded. The deliberate opt-out stays
+    respected: `omh uninstall --registration-only` keeps the plugin
+    directory in place, so an unregistered-but-installed machine never
+    reaches this path and stays unregistered.
+
+    Returns the registration pass's result, or None when the bundle or the
+    config could not be written (each says why on stderr).
+    """
+    paths = _paths(args)
+    try:
+        result = install_plugin_bundle(paths, force=args.force, dry_run=args.dry_run)
+    except PluginPackError as exc:
+        print(
+            f"note: could not install the OMH plugin bundle: {exc}; run `omh setup --force`",
+            file=sys.stderr,
+        )
+        return None
+    if not args.dry_run:
+        update_state(paths, {"last_plugin_distribution": result})
+    _seed_model_chains_result(paths, dry_run=bool(args.dry_run))
+    try:
+        return _apply_result(args)
+    except OmhError as exc:
+        # The bundle landed; an unwritable config must not fail the update.
+        # Say what is missing instead of leaving a half-silent install.
+        print(
+            f"note: could not register OMH in the Hermes config: {exc}; run `omh setup`",
+            file=sys.stderr,
+        )
+    return None
+
+
+def _hermes_profile_dirs(paths) -> list[tuple[str, "Path"]]:
+    """The bot-profile homes under the primary; doctor walks the same list."""
+    return hermes_profile_dirs(paths.hermes_home)
+
+
+def _profile_clone(args: argparse.Namespace, primary: OmhPaths, profile_dir: Path) -> argparse.Namespace:
+    """The argument set the sync runs one profile with: its home, the primary's store.
+
+    The pair is named explicitly because the resolver now reads a profile's
+    own `plugins.entries.omh.settings.omh_home` when nothing names a store
+    (#1679), and that is the profile's dispatch store, not the one the
+    managed skills are installed from. Every profile shares the primary's
+    store for those, as `uninstall_profile_plugin` records, and the
+    registration candidates the sync scores are the primary's too.
+    """
+    clone = argparse.Namespace(**vars(args))
+    clone.hermes_home = str(profile_dir)
+    clone.omh_home = str(primary.omh_home)
+    return clone
+
+
+def _profile_env_names_omh_home(profile_dir: Path) -> bool:
+    """Whether a profile chose its store through its `.env` `OMH_HOME` (#1679).
+
+    Names only, never the value: the choice is the profile's whatever it
+    says, and a setting written beside it would outrank it.
+    """
+    return bool(env_key_names(profile_dir, allowed=("OMH_HOME",)))
+
+
+def _profile_theme_home(profile_paths: OmhPaths, profile_dir: Path) -> Path | None:
+    """The store a bot profile's theme belongs in, or None when OMH cannot tell which store that is.
+
+    `_profile_clone` names the primary's store for everything the sync
+    installs, which is right for managed skills and wrong for a profile
+    that chose a store of its own: `omh --hermes-home <profile> theme`
+    resolves that profile's `settings.omh_home` (#1680), and so does the
+    OMH TUI that `omh --profile <name>` opens (`_tui_omh_home` in
+    `commands/bare_launch.py`), so its theme has to land there. One reader,
+    `configured_omh_home`, for both. A profile that names no store shares
+    the primary's.
+
+    None when the profile chose a store OMH cannot read: a setting in a
+    shape the standalone scan refuses, or an `OMH_HOME` in its `.env`,
+    whose value OMH never reads. Saving into the primary's store then
+    would hand the primary that profile's theme. That includes a setting
+    OMH wrote before the `.env` named a store: the same pass takes it back
+    (`reclaim_plugin_omh_home`, asked here with the record `_apply_result`
+    reads), so the store it names is no longer the profile's.
+    """
+    config_text = read_config(profile_paths.hermes_config_path)
+    env_names_store = _profile_env_names_omh_home(profile_dir)
+    if env_names_store:
+        state, _state_error = read_state_result(profile_paths)
+        record = (state or {}).get(MANAGED_CONFIG_WRITES_STATE_KEY)
+        if reclaim_plugin_omh_home(config_text, record, config_path=profile_paths.hermes_config_path).changed:
+            return None
+    configured = configured_omh_home(profile_paths.hermes_home)
+    if configured is not None:
+        return configured
+    if config_names_key(config_text, PLUGIN_OMH_HOME_KEY):
+        return None
+    return None if env_names_store else profile_paths.omh_home
+
+
+def _sync_hermes_profiles(args: argparse.Namespace) -> list[dict[str, object]]:
+    """Apply the managed OMH registration to every bot-profile home.
+
+    Each profile is its own Hermes home, so each gets the same per-home pair
+    the primary gets: the plugin bundle plus config registration, with the
+    same display release and legacy widget/skin removal. The primary
+    home's deliberate-unregistration rule carries over per profile: a
+    profile whose plugin directory exists while its config does not list the
+    skills directory chose to be unregistered, and neither setup nor update
+    puts it back. A profile with no bundle at all is a new bot — it gets the
+    full bootstrap, which is what makes bots created after install pick up
+    OMH on the next `omh update`.
+
+    The opt-out test asks whether the profile names ANY managed skills
+    directory, not the one this install would write today: see
+    `_managed_workflow_dir_candidates`.
+    """
+    results: list[dict[str, object]] = []
+    primary = _paths(args)
+    for name, profile_dir in _hermes_profile_dirs(primary):
+        entry: dict[str, object] = {"profile": name}
+        try:
+            clone = _profile_clone(args, primary, profile_dir)
+            profile_paths = _paths(clone)
+            config_text = read_config(profile_paths.hermes_config_path)
+            registered = any(
+                _external_dir_registered(config_text, candidate)
+                for candidate in _managed_workflow_dir_candidates(profile_paths)
+            )
+            if profile_paths.hermes_plugin_dir.is_dir() and not registered:
+                results.append(
+                    {
+                        "profile": name,
+                        "status": "unregistered_kept",
+                        "registration": "unchanged",
+                        "display_release": _unregistered_display_release(profile_paths, args),
+                    }
+                )
+                continue
+            entry = {
+                "profile": name,
+                "status": "refreshed" if profile_paths.hermes_plugin_dir.is_dir() else "bootstrapped",
+                # What the registration pass did to this home's config, so the
+                # update output can say a profile MOVED off the pre-pointer path
+                # (#1857) rather than folding that into "refreshed".
+                "registration": "unchanged",
+                "retired_external_dirs": [],
+            }
+            plugin = install_plugin_bundle(
+                profile_paths, force=bool(getattr(args, "force", False)), dry_run=bool(args.dry_run)
+            )
+            if plugin.get("status") == "host_managed":
+                # Hermes installed this profile's plugin; OMH wrote nothing to
+                # it, so "refreshed" would claim an update that did not happen.
+                entry["status"] = "host_managed"
+                entry["plugin_update_command"] = HERMES_PLUGIN_UPDATE_COMMAND
+            applied = _apply_result(
+                clone,
+                bind_omh_home=not _profile_env_names_omh_home(profile_dir),
+                theme_home=_profile_theme_home(profile_paths, profile_dir),
+            )
+            entry["registration"] = applied["registration"]
+            entry["retired_external_dirs"] = applied["retired_external_dirs"]
+            entry["registered_dir"] = applied["registered_dir"]
+            entry["display_release"] = applied["display_release"]
+            reclaimed = applied["plugin_omh_home"]["reclaimed"]  # type: ignore[index]
+            if reclaimed:
+                entry["omh_home_reclaimed"] = reclaimed
+        # A refusal is one profile's row, never the end of the update: the
+        # primary home and every other profile still get their refresh.
+        except (OSError, UnicodeError, ValueError, PluginPackError, OmhError) as exc:
+            entry["status"] = "failed"
+            entry["error"] = f"{type(exc).__name__}: {_bounded_command_error(str(exc))}"
+        results.append(entry)
+    return results
+
+
+def _uninstall_hermes_profiles(
+    args: argparse.Namespace, *, remove_all: bool, record: dict[str, object], primary: OmhPaths | None = None
+) -> list[dict[str, object]]:
+    """Reverse the per-profile sync: unregister every bot-profile home.
+
+    Full scopes also removes each profile's managed artifacts through the
+    manifest-checked helpers -- never a raw rmtree -- so a profile whose plugin
+    directory OMH cannot prove ownership of is kept and reported, exactly as the
+    primary is. Registration-only scopes keep the plugin directory on purpose:
+    plugin-dir-present plus unregistered is the deliberate opt-out marker
+    _sync_hermes_profiles respects, so unregistering must not destroy that state.
+    One malformed profile config fails its own row and never aborts the primary uninstall
+    halfway.
+    """
+    results: list[dict[str, object]] = []
+    # The primary config may already have lost its recorded store binding.
+    primary = primary or _paths(args)
+    for name, profile_dir in _hermes_profile_dirs(primary):
+        entry: dict[str, object] = {"profile": name}
+        try:
+            clone = _profile_clone(args, primary, profile_dir)
+            profile_paths = _paths(clone)
+            read_config(profile_paths.hermes_config_path)
+            rows: list[dict[str, str]] = []
+
+            def _unregister(config_text: str, profile_paths: OmhPaths = profile_paths) -> ConfigChange:
+                # Unregistration AND reversal both derive from the text
+                # `update_config` just read, so a retry re-derives them from
+                # the other writer's file. Deciding either from an earlier
+                # read and replaying the result is the stale whole-file copy
+                # #1742 exists to prevent.
+                change, fresh = _unregister_and_reverse(
+                    profile_paths, config_text, remove_all=remove_all, record=record
+                )
+                rows[:] = fresh
+                return change
+
+            change = update_config(
+                profile_paths.hermes_config_path,
+                _unregister,
+                omh_home=profile_paths.omh_home,
+                dry_run=bool(args.dry_run),
+            )
+            touched = change.changed
+            if rows:
+                entry["config_keys"] = rows
+            if remove_all:
+                plugin = uninstall_profile_plugin(
+                    profile_paths,
+                    dry_run=bool(args.dry_run),
+                    force=bool(args.force),
+                )
+                files = _remove_legacy_display_files(
+                    profile_paths,
+                    dry_run=bool(args.dry_run),
+                    config_text=change.text,
+                    released=_display_released(record, profile_paths),
+                )
+                touched = touched or bool(plugin["removed_paths"]) or bool(plugin["would_remove"])
+                kept_paths = [*plugin["kept_paths"], *_refused_display_files(files)]
+                if kept_paths:
+                    entry["kept_paths"] = kept_paths
+            kept_keys = _config_keys_kept(rows)
+            if kept_keys:
+                entry["config_keys_kept"] = kept_keys
+            entry["status"] = (
+                # "cleared" has to mean cleared. A profile whose config
+                # still names OMH -- because the person changed a value, or
+                # because a pre-record install cannot attribute one -- is
+                # reported as the partial thing it is, with the keys named.
+                ("partially_cleared" if kept_keys else "cleared" if touched else "absent")
+                if remove_all
+                else ("unregistered" if change.changed else "absent")
+            )
+        except (OSError, UnicodeError, ValueError, PluginPackError, OmhError) as exc:
+            entry["status"] = "failed"
+            entry["error"] = f"{type(exc).__name__}: {_bounded_command_error(str(exc))}"
+        results.append(entry)
+    return results
+
+
+_PROFILE_STATUS_LABELS = {
+    "bootstrapped": "set up",
+    "refreshed": "refreshed",
+    "host_managed": "refreshed; plugin managed by Hermes (`hermes plugins update omh`)",
+    "unregistered_kept": "left unregistered",
+    "failed": "failed",
+    "cleared": "cleared",
+    "partially_cleared": "cleared, some config keys kept",
+    "unregistered": "unregistered",
+    "absent": "nothing to remove",
+}
+
+
+def _print_hermes_profiles_line(results: list[dict[str, object]], *, language: str) -> None:
+    if not results:
+        return
+    summary = ", ".join(
+        f"{entry.get('profile')} ({_PROFILE_STATUS_LABELS.get(str(entry.get('status')), str(entry.get('status')))})"
+        for entry in results
+    )
+    print(f"  {tr(language, 'hermes_profiles_synced', summary=summary)}")
+
+
+def _print_registration_migrations(
+    primary: dict[str, object] | None, profile_results: list[dict[str, object]]
+) -> None:
+    """One line per home whose registration moved off an older managed path.
+
+    A person reads "refreshed" as nothing changed; a home that just stopped
+    naming `<omh_home>/skills` beside the generation pointer (#1857) changed
+    which files Hermes loads by name, and that is said in its own line.
+    """
+    for label, entry in [("Hermes registration", primary), *(
+        (f"Bot profile {row.get('profile')}: registration", row) for row in profile_results
+    )]:
+        if not entry or entry.get("registration") != "migrated":
+            continue
+        retired = entry.get("retired_external_dirs")
+        listed = ", ".join(str(item) for item in retired) if isinstance(retired, list) else ""
+        print(f"  {label} migrated from {listed} to {entry.get('registered_dir')}.")
+
+
+def _display_release_lines(label: str, release: object) -> list[str]:
+    """What one home's display release did, or nothing when it did nothing.
+
+    A person who opens `hermes` after this update and finds stock Hermes
+    should already have read why, and where their OMH theme went. Keys taken
+    back, files removed and a theme saved are said on the pass that does
+    them, and so is a theme store that could not be written, which holds the
+    release; a key the editor refused is said on every pass that tries it.
+    A file left in place (`kept_unmanaged`, `refused`) and a theme not
+    carried (`kept_saved`, `store_unknown`) are said only on the pass that
+    records the release (`recorded`): a pass that does not record it runs
+    again on the next update and would repeat them each time.
+
+    The header says bare `hermes` opens stock Hermes only when no OMH skin
+    file stays for `display.skin` (`kept_selected`). One stays for a skin
+    the config names, or for every OMH skin while the value cannot be read,
+    such as a record-less `display: {skin: omh-crimson}`; Hermes may then
+    still open with an OMH skin.
+    """
+    if not isinstance(release, dict):
+        return []
+    details: list[str] = []
+    keys = release.get("keys")
+    rows = [row for row in keys if isinstance(row, dict)] if isinstance(keys, list) else []
+    released = [str(row.get("key")) for row in rows if row.get("status") == "reversed"]
+    if released:
+        details.append(f"released {', '.join(released)}")
+    refused = [row for row in rows if row.get("status") == "refused"]
+    for row in refused:
+        details.append(
+            f"could not release {row.get('key')} ({row.get('detail')}); the next `omh setup` or `omh update` tries again"
+        )
+    files = release.get("files") if isinstance(release.get("files"), dict) else {}
+    widget = files.get("tui_widget") if isinstance(files.get("tui_widget"), dict) else {}  # type: ignore[union-attr]
+    skin = files.get("skin") if isinstance(files.get("skin"), dict) else {}  # type: ignore[union-attr]
+    skins = [entry for entry in skin.get("skins", []) if isinstance(entry, dict)]  # type: ignore[union-attr]
+    removed = [str(entry.get("filename")) for entry in skins if entry.get("status") == "removed"]
+    if widget.get("status") == "removed":  # type: ignore[union-attr]
+        removed.insert(0, "the OMH status widget")
+    if removed:
+        details.append(f"removed {', '.join(removed)}")
+    if release.get("recorded"):
+        for entry in skins:
+            if entry.get("status") == "kept_unmanaged":
+                details.append(f"kept {entry.get('path')}: it differs from what OMH installed, so it is yours")
+        if widget.get("status") == "kept_unmanaged":  # type: ignore[union-attr]
+            details.append(f"kept {widget.get('path')}: OMH cannot prove it installed it")  # type: ignore[union-attr]
+        for name, outcome in (("status widget", widget), ("skin files", skin)):
+            if outcome.get("status") == "refused":  # type: ignore[union-attr]
+                details.append(f"left the {name} in place: {outcome.get('reason')}")  # type: ignore[union-attr]
+    theme = release.get("theme") if isinstance(release.get("theme"), dict) else {}
+    if theme.get("status") == "saved":  # type: ignore[union-attr]
+        details.append(
+            f"saved OMH theme {theme.get('theme')} for the OMH TUI; `omh theme use <name>` changes it"  # type: ignore[union-attr]
+        )
+    elif theme.get("status") == "failed":  # type: ignore[union-attr]
+        details.append(
+            f"could not save OMH theme {theme.get('theme')} to {theme.get('path')} ({theme.get('reason')}); "  # type: ignore[union-attr]
+            "the display keys and files stay until the next `omh setup` or `omh update` can save it"
+        )
+    elif theme.get("status") == "store_unknown" and release.get("recorded"):  # type: ignore[union-attr]
+        details.append(
+            f"did not save OMH theme {theme.get('theme')}: this profile names its OMH home where OMH cannot read it "  # type: ignore[union-attr]
+            "(its .env, or a setting shape the reader refuses); "
+            f"`omh --omh-home <that home> theme use {theme.get('theme')}` saves it there"  # type: ignore[union-attr]
+        )
+    elif theme.get("status") == "kept_saved" and release.get("recorded"):  # type: ignore[union-attr]
+        details.append(
+            f"kept the saved OMH theme {theme.get('saved')} over {theme.get('theme')}, which display.skin named"  # type: ignore[union-attr]
+        )
+    if not details:
+        return []
+    if release.get("unregistered"):
+        header = f"{label}: this home is not registered, so its config is left as it is; files OMH installed:"
+    elif refused or theme.get("status") == "failed":  # type: ignore[union-attr]
+        header = f"{label}: some display keys OMH wrote are still in Hermes' config; bare `omh` opens the OMH TUI."
+    elif any(entry.get("status") == "kept_selected" for entry in skins):
+        header = f"{label}: OMH skin files stay while `display.skin` may still name one; bare `omh` opens the OMH TUI."
+    else:
+        header = f"{label}: bare `hermes` opens stock Hermes; bare `omh` opens the OMH TUI."
+    return [header, *(f"  {line}" for line in details)]
+
+
+def _print_display_release_lines(
+    primary: dict[str, object] | None, profile_results: list[dict[str, object]]
+) -> None:
+    for label, entry in [("Hermes display", primary), *(
+        (f"Bot profile {row.get('profile')}: Hermes display", row) for row in profile_results
+    )]:
+        if not entry:
+            continue
+        for line in _display_release_lines(label, entry.get("display_release")):
+            print(f"  {line}")
+
+
+def _print_omh_home_reclaims(profile_results: list[dict[str, object]]) -> None:
+    """One line per bot profile whose OMH-written store setting was taken back (#1973).
+
+    The profile's `.env` `OMH_HOME` binds its plugin from now on, which is a
+    different store from the one it bound yesterday, so it is said rather
+    than folded into "refreshed".
+    """
+    for row in profile_results:
+        reclaimed = row.get("omh_home_reclaimed")
+        if reclaimed:
+            print(
+                f"  Bot profile {row.get('profile')}: removed plugins.entries.omh.settings.omh_home "
+                f"({reclaimed}); its .env OMH_HOME applies."
+            )
+
+
+def _registration_ambiguity_lines(args: argparse.Namespace) -> list[str]:
+    """Doctor's ambiguity finding, re-read from disk after every home was written.
+
+    Empty after a migration that took; a home whose older entry was spelled
+    in a way `remove_external_dir` does not match keeps both, and this names
+    it in the same words `omh doctor` uses instead of leaving the next bot
+    chat to report an ambiguous skill name.
+    """
+    paths = _paths(args)
+    homes: list[tuple[str, OmhPaths]] = [(registration_home_label(paths.hermes_config_path), paths)]
+    for name, profile_dir in _hermes_profile_dirs(paths):
+        profile_paths = _paths(_profile_clone(args, paths, profile_dir))
+        homes.append((registration_home_label(profile_paths.hermes_config_path, profile=name), profile_paths))
+    lines: list[str] = []
+    for label, home_paths in homes:
+        try:
+            entries = registered_managed_entries(
+                read_config(home_paths.hermes_config_path), _managed_workflow_dir_candidates(home_paths)
+            )
+        except (OSError, UnicodeError, ValueError, OmhError) as exc:
+            lines.append(f"{label}: could not inspect registration: {_bounded_command_error(str(exc))}")
+            continue
+        if len(entries) > 1:
+            lines.append(ambiguous_registration_message(label, entries))
+    return lines
+
+
+def _registered_workflow_dir(paths: OmhPaths) -> Path:
+    """Keep installer consumers under the non-resolved shared pointer."""
+    current = managed_current_workflow_pack_dir()
+    if current is not None and current.is_dir() and _managed_command_runtime().get("managed"):
+        return current
+    return paths.skills_dir
+
+
+def _registration_retires_older_entries(registered_dir: Path) -> bool:
+    """Only the installer-managed command moves a home off its older entries.
+
+    `_registered_workflow_dir` returns the shared generation pointer when the
+    running command is the installer-managed one and `<omh_home>/skills`
+    otherwise -- a checkout run through `python -P -m omh.cli`, a pip or uv
+    tool install. From such a command the pointer is still a candidate, so
+    retiring "every other candidate" would unregister the pointer and move
+    the machine backwards onto that command's own pack, which is the
+    opposite of the migration #1857 asks for. An unmanaged command therefore
+    keeps the additive registration it always had and reports `added` or
+    `unchanged`; only the command that writes the pointer retires the older
+    entries. Decided by what this command writes, not by a runtime probe, so
+    the fixtures that stub the pointer and the managed verdict keep one seam.
+    """
+    current = managed_current_workflow_pack_dir()
+    return current is not None and _external_dir_key(registered_dir) == _external_dir_key(current)
+
+
+def _managed_workflow_dir_candidates(paths: OmhPaths) -> list[Path]:
+    """Every managed skills directory a registration may legitimately name.
+
+    `_registered_workflow_dir` picks the ONE this install would write today:
+    the shared generation pointer on a managed command install, otherwise the
+    OMH home's own skills directory. Both are OMH-owned, and which of them a
+    given home recorded depends only on when it was registered — so a home
+    naming either one is registered, not opted out. Only a home naming
+    neither has actually opted out.
+
+    Reading "registered" as "names today's path" is what froze the owner's
+    `profiles/miku`: the profile pointed at `~/.omh/skills` while the primary
+    home had moved to the generation pointer, so every `omh update` scored it
+    as the deliberate opt-out (plugin directory present, registration
+    "absent"), skipped the whole profile, and left its plugin bundle and TUI
+    widget on the generation they were installed at.
+
+    `<omh_home>/skills` is listed by name, not through `paths.skills_dir`: on
+    a managed command install `resolve_paths` already redirects `skills_dir`
+    to the running generation's pack, so the pre-pointer registration home —
+    the very path the frozen profile carries — would otherwise never be a
+    candidate on exactly the machines that need it (the first fix read
+    `paths.skills_dir` and passed its tests from an unmanaged interpreter).
+    """
+    candidates = [_registered_workflow_dir(paths)]
+    # The set itself lives beside doctor's reading of it
+    # (`install.skill_registration`): the writer and the two readers of "how
+    # many managed directories does this home name" must agree on the list,
+    # and this function only adds the ordering -- today's path first.
+    # `managed_current_workflow_pack_dir` is passed from this module's own
+    # binding so the managed-install fixtures keep stubbing one name.
+    for candidate in managed_skill_dir_candidates(paths, current=managed_current_workflow_pack_dir()):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _remove_managed_external_dirs(config_text: str, paths: OmhPaths) -> ConfigChange:
+    """Strip every OMH-managed skills directory this home may carry.
+
+    Removal has to read the same set `_managed_workflow_dir_candidates` reads,
+    or the opt-out becomes unreachable on exactly the installs that need it:
+    removing only today's path left a home registered at the older one with
+    its entry intact and its plugin directory in place, so the next
+    `omh update` scored it registered again and refreshed it. Unregistering
+    means unregistered, whichever managed path recorded it.
+
+    The reported message is the first removal that actually changed the
+    config; with nothing to remove, the last no-op's message stands, exactly
+    as a single-path removal reported before.
+    """
+    changed = False
+    message = ""
+    for candidate in _managed_workflow_dir_candidates(paths):
+        change = remove_external_dir(config_text, candidate)
+        config_text = change.text
+        if change.changed and not changed:
+            changed = True
+            message = change.message
+        elif not changed:
+            message = change.message
+    return ConfigChange(changed, message, config_text)
+
+
+def _managed_config_record(paths: OmhPaths) -> dict[str, object]:
+    """The per-config write record, read before anything is removed.
+
+    Read once and passed down, never re-read per home: `uninstall_skill_pack`
+    deletes the OMH home, and the bot-profile loop runs after it. A profile
+    that read its own record at that point found no `state.json` at all and
+    fell back to the no-record subset, which is the difference between a
+    profile config that comes back clean and one that keeps
+    `display.interface` and three collapsed sections.
+    """
+    primary = primary_hermes_home(paths.hermes_home)
+    primary_store = configured_omh_home(primary) if primary != paths.hermes_home else None
+    record: dict[str, object] = {}
+    if primary_store is not None and primary_store != paths.omh_home:
+        primary_paths = OmhPaths(omh_home=primary_store, hermes_home=primary)
+        state, _state_error = read_state_result(primary_paths)
+        record.update((state or {}).get(MANAGED_CONFIG_WRITES_STATE_KEY) or {})
+    state, _state_error = read_state_result(paths)
+    record.update((state or {}).get(MANAGED_CONFIG_WRITES_STATE_KEY) or {})
+    return record
+
+
+def _unregister_and_reverse(
+    paths: OmhPaths, config_text: str, *, remove_all: bool, record: dict[str, object]
+) -> tuple[ConfigChange, list[dict[str, str]]]:
+    """Unregister, and in the full scope take back the rest of what setup wrote.
+
+    One function for the primary home and for every bot profile, because
+    setup writes the same seven keys to each: `_sync_hermes_profiles` calls
+    `_apply_result` once per profile home. The two sides drifted once
+    already -- uninstall reversed the primary's keys and stripped only the
+    registration from each profile, so a bot home kept `memory.provider:
+    omh` naming the bundle the same run had just removed from it. Sharing
+    the code is what keeps "setup writes it here" and "uninstall takes it
+    back here" the same list.
+
+    Profiles share the primary's OMH store, so `read_state_result` reads one
+    `state.json` for all of them; the record is keyed by config path, which
+    is what makes each home get its own.
+    """
+    change = _remove_managed_external_dirs(config_text, paths)
+    if not remove_all:
+        # Unregistering is the whole scope here, but the container the
+        # registration lived in goes with it: a `skills.external_dirs:` this
+        # run emptied is a key OMH left behind, not a choice of the person's.
+        # The record decides that the same way the full scope decides it --
+        # without reading it, this scope would drop a `skills:` the record
+        # says the person already had. Every other managed container reads
+        # the same before and after, so the guess names them and removes none.
+        owned = load_managed_config_writes(record, config_path=paths.hermes_config_path)
+        created = owned.get("containers_created") if isinstance(owned.get("containers_created"), list) else []
+        cleanup = drop_emptied_containers(
+            change.text,
+            childless_containers(config_text),
+            recorded=(str(item) for item in created),
+            record_is_complete=bool(owned),
+        )
+        return ConfigChange(change.changed or cleanup.changed, change.message, cleanup.text), []
+    reversal, rows = reverse_managed_config(
+        change.text,
+        record,
+        config_path=paths.hermes_config_path,
+        text_before_removals=config_text,
+    )
+    return (
+        ConfigChange(change.changed or reversal.changed, change.message, reversal.text),
+        [row.as_dict() for row in rows],
+    )
+
+
+def _config_keys_kept(rows: list[dict[str, str]]) -> list[str]:
+    """The managed keys a reversal left with the person, by name."""
+    return sorted(str(row.get("key", "")) for row in rows if row.get("status") in {"kept", "unrecorded"})
+
+
+def _external_dir_registered(config: str, path: Path) -> bool:
+    entries = external_dirs(config)
+    wanted = _external_dir_key(path)
+    if any(_external_dir_key(entry) == wanted for entry in entries):
+        return True
+    return external_dir_registered(entries, path)
+
+
+def _external_dir_key(path: str | Path) -> str:
+    return external_dir_key(path)
+
+
+def _refresh_hermes_registration(args: argparse.Namespace) -> dict[str, object] | None:
+    """Carry a registered install forward to what the running version needs.
+
+    `omh setup` is meant to be a one-time act. It stopped being one the moment
+    a release added something to Hermes' config that only setup wrote: update
+    refreshed skills and the bundle, the new key never landed, and the fix was
+    to tell people to run setup again. The memory-provider slot was exactly
+    that, and it will not be the last.
+
+    Only for an install that is already registered -- the skills directory is
+    already in `skills.external_dirs`. Registering a fresh one stays setup's
+    job, and someone who deliberately unregistered OMH must not have update
+    put it back. Such a home still loses the widget and skin files an
+    earlier version left (`_unregistered_display_release`).
+    """
+    paths = _paths(args)
+    config_text = read_config(paths.hermes_config_path)
+    # Same candidate set the profile sync reads: a primary home registered at
+    # the older managed path is registered, and must be carried forward
+    # rather than read as a deliberate unregistration.
+    if not any(
+        _external_dir_registered(config_text, candidate)
+        for candidate in _managed_workflow_dir_candidates(paths)
+    ):
+        return {"display_release": _unregistered_display_release(paths, args)}
+    return _apply_result(args)
+
+
+def _refresh_installed_plugin_bundle(args: argparse.Namespace) -> dict[str, object] | None:
+    """Bring an already-installed plugin bundle up to the running version.
+
+    `omh update` used to refresh skills and stop there: `install_plugin_bundle`
+    was reachable only from `cmd_setup`, so the tools, hooks, and memory
+    provider under `$HERMES_HOME/plugins/omh/` stayed at whatever version last
+    ran setup. The three commands AGENTS.md tells ordinary users to know are
+    setup, update, and doctor -- and update was the one that did not update.
+
+    Only refreshes what is already there; a machine with no bundle at all goes
+    through `_bootstrap_tui_surface` instead, which installs the bundle AND
+    performs the Hermes registration/enablement half of the pair.
+    """
+    paths = _paths(args)
+    if not paths.hermes_plugin_dir.is_dir():
+        return None
+    try:
+        result = install_plugin_bundle(paths, force=args.force, dry_run=args.dry_run)
+    except PluginPackError as exc:
+        # Only confirmed content protection is a successful *plan*. Generic
+        # inspection/read/parse failures remain failed even during dry-run.
+        if args.dry_run and isinstance(exc, PluginContentProtectedError):
+            return {
+                "status": "would_refuse", "applied": False, "changed": False,
+                "observed": False, "dry_run": True,
+                "plugin_dir": str(paths.hermes_plugin_dir),
+                "reason": _bounded_command_error(str(exc)),
+                "observed_scope": "protected content; no plugin refresh applied",
+            }
+        # Actual protection refusals still make the final update partial.
+        print(f"note: OMH plugin refresh skipped: {_friendly_plugin_error(paths, str(exc))}", file=sys.stderr)
+        return None
+    if result.get("status") == "host_managed":
+        print(
+            f"note: {paths.hermes_plugin_dir} was installed by Hermes; OMH left it in place. "
+            "Update the plugin with `hermes plugins update omh`.",
+            file=sys.stderr,
+        )
+    if not args.dry_run:
+        update_state(paths, {"last_plugin_distribution": result})
+    return result
+
+
+def _refresh_installed_menubar_app(args: argparse.Namespace) -> dict[str, object] | None:
+    """Bring an already-installed native menu bar helper up to date."""
+    configured_omh_home = getattr(args, "omh_home", None)
+    configured_hermes_home = getattr(args, "hermes_home", None)
+    raw_homes = (
+        configured_omh_home if configured_omh_home not in (None, "") else os.environ.get("OMH_HOME"),
+        configured_hermes_home if configured_hermes_home not in (None, "") else os.environ.get("HERMES_HOME"),
+    )
+    if any(_configured_path_contains_symlink(value) for value in raw_homes):
+        return None
+    paths = _paths(args)
+    if not is_managed_menubar_install(paths):
+        return None
+    try:
+        result = setup_menubar_app(
+            paths,
+            dry_run=bool(args.dry_run),
+            start=True,
+            force=bool(args.force),
+        )
+    except (OSError, RuntimeError) as exc:
+        print(f"note: OMH menu bar helper was not refreshed: {exc}", file=sys.stderr)
+        return {"status": "failed", "reason": str(exc)}
+    if result.get("status") == "installed_start_failed":
+        reason = str(result.get("start_message", "launchctl start failed"))
+        print(f"note: OMH menu bar helper was not refreshed: {reason}", file=sys.stderr)
+    return result
+
+
+def _configured_path_contains_symlink(value: object) -> bool:
+    if value is None or value == "":
+        return False
+    path = Path(os.path.expandvars(str(value))).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    current = path
+    while True:
+        if current.is_symlink():
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
+def _configured_omh_home_link_refusal(args: argparse.Namespace, paths: OmhPaths) -> str | None:
+    """Resolution erases a configured home's symlink; uninstall still sees its spelling.
+
+    Checks the spelling `resolve_paths` used for the standalone lane: the
+    explicit `--omh-home`, else the home's persisted `omh_home` binding, else
+    the process `OMH_HOME`.
+    """
+    explicit = getattr(args, "omh_home", None)
+    if explicit not in (None, ""):
+        source, value = "--omh-home", str(explicit)
+    else:
+        try:
+            binding = plugin_omh_home_setting(read_config(paths.hermes_config_path))
+        except (OSError, UnicodeError):
+            return "OMH home ownership is unproven: the persisted omh_home binding is unreadable"
+        if binding:
+            raw_hermes = Path(str(getattr(args, "hermes_home", None) or os.environ.get("HERMES_HOME") or "~/.hermes")).expanduser()
+            binding = re.sub(r"\$\{(?:env:)?HERMES_HOME\}|\$HERMES_HOME\b|%HERMES_HOME%", lambda _: str(raw_hermes), binding)
+            bound = Path(os.path.expandvars(binding)).expanduser()
+            source, value = "the persisted omh_home binding", str(bound if bound.is_absolute() else raw_hermes / bound)
+        else:
+            source, value = "OMH_HOME", os.environ.get("OMH_HOME") or ""
+    if _configured_path_contains_symlink(value):
+        return f"refusing to remove an OMH home whose path configured by {source} passes through a symlink or directory junction"
+    return None
+
+
+def _command_package_self_update_plan(args: argparse.Namespace) -> dict[str, object]:
+    if bool(getattr(args, "command_package_updated", False)):
+        return {"should_update": False, "reason": "command package update already observed"}
+    if bool(getattr(args, "dry_run", False)):
+        return {"should_update": False, "reason": "dry run does not update the command package"}
+    if os.environ.get(SELF_UPDATE_REENTRY_ENV):
+        return {"should_update": False, "reason": "already re-entered after command package update"}
+    if os.environ.get(SELF_UPDATE_SKIP_ENV):
+        return {"should_update": False, "reason": f"{SELF_UPDATE_SKIP_ENV} is set"}
+    if getattr(args, "from_skills_dir", None) or getattr(args, "source", None):
+        return {"should_update": False, "reason": "explicit skill source updates workflows only"}
+    try:
+        release = package_url_for(args.channel or "preview", args.version or "", args.package_url or "")
+    except ValueError as exc:
+        raise OmhError(str(exc)) from exc
+    if release.channel == "local" and release.package_url == "local":
+        return {"should_update": False, "reason": "local updates require an explicit package source"}
+    package_manager, update_instruction = _command_package_update_guidance()
+    update_arguments = COMMAND_PACKAGE_UPDATE_ARGUMENTS.get(package_manager)
+    launcher = _validated_command_package_launcher(package_manager)
+    homebrew_commands = (
+        _validated_homebrew_commands()
+        if package_manager == "homebrew"
+        else None
+    )
+    if update_arguments is not None and (
+        launcher is not None or homebrew_commands is not None
+    ):
+        if _explicit_release_metadata_supplied(args):
+            raise OmhError(
+                "package-manager installs accept the default published update only; "
+                "use the owning manager directly for an explicit version or package URL"
+            )
+        if launcher is not None:
+            manager_command = COMMAND_PACKAGE_EXECUTABLES[package_manager]
+            manager_executable = shutil.which(manager_command)
+            runtime = str(launcher["runtime"])
+            reentry_command = [
+                runtime,
+                str(launcher["entrypoint"]),
+            ]
+        else:
+            assert homebrew_commands is not None
+            manager_command = "brew"
+            manager_executable = str(homebrew_commands["brew"])
+            runtime = ""
+            reentry_command = [str(homebrew_commands["omh"])]
+        if manager_executable is None:
+            return {
+                "should_update": False,
+                "reason": (
+                    f"cannot update command package because `{manager_command}` "
+                    "is not available on PATH"
+                ),
+            }
+        if not Path(manager_executable).is_file():
+            return {
+                "should_update": False,
+                "reason": (
+                    "cannot update command package because "
+                    f"`{manager_executable}` is not a file"
+                ),
+            }
+        if not Path(reentry_command[-1]).is_file():
+            return {
+                "should_update": False,
+                "reason": (
+                    "cannot re-enter the updated command package because "
+                    "its launcher is missing"
+                ),
+            }
+        try:
+            update_command = _package_manager_update_command(
+                package_manager,
+                manager_executable,
+                runtime=runtime,
+            )
+        except OmhError as exc:
+            return {
+                "should_update": False,
+                "reason": str(exc),
+            }
+        return {
+            "should_update": True,
+            "method": "package_manager",
+            "package_manager": package_manager,
+            "update_instruction": update_instruction,
+            "update_command": update_command,
+            "reentry_command": reentry_command,
+            "reason": f"running from the {package_manager} command package",
+        }
+    managed = _managed_command_runtime()
+    if not managed["managed"]:
+        return {"should_update": False, "reason": managed["reason"]}
+    return {
+        "should_update": True,
+        "method": "installer",
+        "release": release,
+        "python": managed["python"],
+        "venv_dir": managed["venv_dir"],
+        "reason": "running from installer-managed command package venv",
+    }
+
+
+def _run_command_package_self_update(args: argparse.Namespace, plan: dict[str, object]) -> int:
+    if plan.get("method") == "package_manager":
+        return _run_package_manager_self_update(args, plan)
+    # Installer-owned packages are never mutated in place.  The transaction
+    # stages command and workflow-pack bytes together, then flips one pointer.
+    from ..install.self_update import run_installer_self_update
+
+    result = run_installer_self_update(args, plan, runner=subprocess.run)
+    if _wants_json(args):
+        _print_json(result)
+    elif result.get("ok"):
+        print("OMH update complete: command and workflow pack activated together.")
+    else:
+        for line in _self_update_stop_lines(result):
+            print(line)
+    return 0 if result.get("ok") else 1
+
+
+def _self_update_stop_lines(result: dict[str, Any]) -> list[str]:
+    """Say why the transaction stopped, not only where.
+
+    The phase alone was the whole report, and "stopped during post_activation"
+    sent people to a bug tracker: the re-entered update had printed its own
+    error, but nothing tied that error to the rollback. The failing phase's
+    recorded reason closes that gap; its last line is the one that names the
+    cause, and the full text stays in the JSON result.
+    """
+    phase = str(result.get("phase") or "unknown")
+    lines = [f"OMH update stopped during {phase}; the known-good generation remains active."]
+    detail = result.get(phase)
+    reason = str(detail.get("reason") or "").strip() if isinstance(detail, dict) else ""
+    if reason:
+        lines.append(f"  reason: {reason.splitlines()[-1].strip()}")
+    restored = str((result.get("rollback") or {}).get("restored") or "")
+    if restored:
+        lines.append(f"  rolled back to generation {restored}")
+    lines.append("  Resolve the reason above, then rerun `omh update`.")
+    return lines
+
+
+def _run_package_manager_self_update(
+    args: argparse.Namespace,
+    plan: dict[str, object],
+) -> int:
+    package_manager = str(plan["package_manager"])
+    update_instruction = str(plan["update_instruction"])
+    update_command = list(cast(list[str], plan["update_command"]))
+    reentry_command = list(cast(list[str], plan["reentry_command"]))
+    wants_json = _wants_json(args)
+    progress = _HumanProgress(enabled=not wants_json, use_color=_use_color())
+    progress.header("OMH update", "Refresh the OMH command package and workflow pack.")
+    progress.step(
+        1,
+        2,
+        "Updating omh command package",
+        detail=update_instruction,
+    )
+    completed = subprocess.run(
+        update_command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        detail = _bounded_command_error(
+            completed.stderr
+            or completed.stdout
+            or f"{package_manager} update failed"
+        )
+        raise OmhError(f"command package update failed: {detail}")
+    progress.done("command package updated")
+    if not wants_json:
+        progress.step(2, 2, "Refreshing OMH workflows with the updated command")
+    argv = _reentry_argv_with_command_package_updated()
+    env = dict(os.environ)
+    env[SELF_UPDATE_REENTRY_ENV] = "1"
+    rerun = subprocess.run([*reentry_command, *argv], env=env)
+    return int(rerun.returncode)
+
+
+def _validated_command_package_launcher(
+    package_manager: str,
+) -> dict[str, Path] | None:
+    if package_manager not in {"npm", "bun"}:
+        return None
+    raw_root = os.environ.get(COMMAND_PACKAGE_ROOT_ENV, "")
+    raw_runtime = os.environ.get(COMMAND_PACKAGE_RUNTIME_ENV, "")
+    raw_entrypoint = os.environ.get(COMMAND_PACKAGE_ENTRYPOINT_ENV, "")
+    if not raw_root or not raw_runtime or not raw_entrypoint:
+        return None
+    try:
+        package_root = Path(raw_root).resolve(strict=True)
+        runtime = Path(raw_runtime).resolve(strict=True)
+        entrypoint = Path(raw_entrypoint).resolve(strict=True)
+        expected_entrypoint = (package_root / "bin" / "omh.js").resolve(
+            strict=True
+        )
+        package_manifest = json.loads(
+            (package_root / "package.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not package_root.is_dir()
+        or not runtime.is_file()
+        or not entrypoint.is_file()
+        or entrypoint != expected_entrypoint
+        or package_manifest.get("name") != "oh-my-hermes"
+        or package_manifest.get("version") != __version__
+        or package_manifest.get("bin", {}).get("omh") != "bin/omh.js"
+    ):
+        return None
+    return {
+        "package_root": package_root,
+        "runtime": runtime,
+        "entrypoint": entrypoint,
+    }
+
+
+def _validated_homebrew_commands() -> dict[str, Path] | None:
+    homebrew_root = _homebrew_prefix_root()
+    if homebrew_root is None:
+        return None
+    brew = homebrew_root / "bin" / "brew"
+    omh = homebrew_root / "bin" / "omh"
+    try:
+        cellar_omh = (homebrew_root / "Cellar" / "omh").resolve(strict=True)
+        installed_omh = omh.resolve(strict=True)
+    except OSError:
+        return None
+    if (
+        not brew.is_file()
+        or not installed_omh.is_file()
+        or not installed_omh.is_relative_to(cellar_omh)
+    ):
+        return None
+    return {"brew": brew, "omh": omh}
+
+
+def _package_manager_update_command(
+    package_manager: str,
+    executable: str,
+    *,
+    runtime: str,
+    platform: str = os.name,
+) -> list[str]:
+    arguments = COMMAND_PACKAGE_UPDATE_ARGUMENTS[package_manager]
+    executable_path = Path(executable)
+    if platform != "nt" or executable_path.suffix.casefold() not in {
+        ".bat",
+        ".cmd",
+    }:
+        return [str(executable_path), *arguments]
+    if package_manager != "npm" or not runtime:
+        raise OmhError(
+            f"cannot safely execute the Windows `{package_manager}` command shim"
+        )
+    npm_cli = (
+        executable_path.parent
+        / "node_modules"
+        / "npm"
+        / "bin"
+        / "npm-cli.js"
+    )
+    if not npm_cli.is_file():
+        raise OmhError("cannot locate npm-cli.js beside the Windows npm shim")
+    return [runtime, str(npm_cli), *arguments]
+
+
+def _bounded_command_error(value: str, *, limit: int = 2_000) -> str:
+    sanitized = ANSI_ESCAPE_RE.sub("", value)
+    sanitized = "".join(
+        character
+        for character in sanitized
+        if character in {"\n", "\t"} or ord(character) >= 32
+    ).strip()
+    if len(sanitized) <= limit:
+        return sanitized
+    return f"{sanitized[:limit]}…"
+
+
+def _reentry_argv_with_command_package_updated() -> list[str]:
+    argv = list(sys.argv[1:])
+    if "--command-package-updated" not in argv:
+        argv.append("--command-package-updated")
+    return argv
+
+
+def _managed_command_runtime() -> dict[str, object]:
+    venv_dir = managed_command_venv_dir()
+    if venv_dir is None:
+        return {"managed": False, "reason": "no home directory or OMH_VENV_DIR is available"}
+    executable = Path(sys.executable).expanduser()
+    if not command_runtime_owned(executable, venv_dir):
+        return {
+            "managed": False,
+            "reason": "current omh command is not running from the installer-managed OMH venv",
+            "python": str(executable.resolve()),
+            "venv_dir": str(venv_dir),
+        }
+    return {"managed": True, "reason": "", "python": str(executable), "venv_dir": str(venv_dir)}
+
+
+def _is_relative_to_without_resolving_symlinks(path: Path, parent: Path) -> bool:
+    try:
+        _normalize_without_final_symlink(path).relative_to(_normalize_without_final_symlink(parent))
+    except ValueError:
+        return False
+    return True
+
+
+def _normalize_without_final_symlink(path: Path) -> Path:
+    expanded = path.expanduser()
+    return expanded.parent.resolve() / expanded.name
+
+
+def _install_operation(args: argparse.Namespace) -> str:
+    command = str(getattr(args, "command", "install"))
+    return command if command in {"convert", "update"} else "install"
+
+
+def _managed_skills_status(result: dict[str, object], *, dry_run: bool) -> dict[str, object]:
+    skills = result.get("skills", [])
+    if not isinstance(skills, list):
+        skills = []
+    return {
+        "schema_version": "managed_skills_status/v1",
+        "status": "would_update" if dry_run else "updated",
+        "count": len(skills),
+        "skills_dir": str(result.get("skills_dir", "")),
+    }
+
+
+def _command_package_status_for_install(
+    *,
+    operation: str,
+    source: str,
+    dry_run: bool,
+    command_package_updated: bool = False,
+) -> dict[str, object]:
+    package_manager, update_instruction = _command_package_update_guidance()
+    status = "unchanged"
+    reason = "managed skills were refreshed from the currently installed command package"
+    updated = False
+    if command_package_updated:
+        status = "would_update" if dry_run else "updated"
+        updated = not dry_run
+        reason = (
+            f"{package_manager} refreshed the OMH command package before "
+            "running this command"
+        )
+    elif dry_run:
+        status = "would_remain_unchanged"
+        reason = "dry run previews managed skill changes without changing the command package"
+    elif operation == "update" and source == "builtin":
+        status = "not_updated"
+        reason = "managed skills were refreshed, but the omh command package was not updated in this run"
+    elif source != "builtin":
+        reason = "managed skills were refreshed from an explicit skill source; the command package was not changed"
+    return {
+        "schema_version": COMMAND_PACKAGE_STATUS_SCHEMA_VERSION,
+        "operation": operation,
+        "status": status,
+        "updated": updated,
+        "source": _command_package_source(command_package_updated=command_package_updated, source=source),
+        "reason": reason,
+        "package_manager": package_manager,
+        "update_instruction": update_instruction,
+    }
+
+
+def _command_package_source(*, command_package_updated: bool, source: str) -> str:
+    if command_package_updated:
+        return _command_package_update_guidance()[0]
+    if source == "builtin":
+        return "installed_command_package"
+    return "explicit_skill_source"
+
+
+def _release_source_ref(args: argparse.Namespace, release) -> str:
+    explicit = str(getattr(args, "source_ref", "") or "").strip()
+    if explicit:
+        return explicit
+    return str(getattr(release, "source_label", "") or "").strip()
+
+
+def _release_source_commit_for_state(paths, release) -> str:
+    """Best-effort remote `main` sha, recorded only when update-check is opted in.
+
+    This is the comparable local identity `omh update-check`'s startup probe
+    (`maintenance/update_check.py`) compares against a fresh remote read.
+    Piggybacks on this already-explicit `omh install`/`omh update` invocation
+    rather than adding a second, unscoped network surface (AGENTS.md
+    Implementation Boundaries): a network call rides along only when the user
+    has already opted update-check away from its shipped `off` default.
+    Scoped to the preview channel, the one that actually tracks `main` -- a
+    pinned stable tag or a local source is not meaningfully "behind main".
+    Silent no-op (returns "") on any failure; this metadata must never fail
+    the install/update command it rides along with.
+
+    Advance policy (issue #1282): the cursor advances only under a replayable
+    gap policy. `cursor_advance_allowed` reads the update-check cache (no
+    network) and refuses while a coverage gap is open and unaccepted or the
+    recorded ancestry is not a verified `fast_forward`, so `omh update` never
+    re-anchors `release_source_commit` across a failed required source read;
+    a completed recovery or an explicit `omh update-check accept-gap` re-arms
+    it. The gate is checked before the recording probe so a blocked advance
+    spends no network attempt.
+    """
+    if release.source_label != "main":
+        return ""
+    from ..maintenance.update_check import (
+        cursor_advance_allowed,
+        read_update_check_policy,
+        record_remote_commit_for_install,
+    )
+
+    if read_update_check_policy(paths)["mode"] == "off":
+        return ""
+    if not cursor_advance_allowed(paths):
+        return ""
+    return record_remote_commit_for_install(paths)
+
+
+def _explicit_release_metadata_supplied(args: argparse.Namespace) -> bool:
+    return any(
+        str(getattr(args, key, "") or "").strip()
+        for key in ("source_ref", "version", "package_url")
+    )
+
+
+def _resolved_skill_profile(args: argparse.Namespace, paths) -> str:
+    """The profile this run should record: what was asked for, else what is installed.
+
+    This used to be `"full" if --full else "core"`, which reset the recorded
+    profile on every run. An operator who installed the full catalog and then
+    ran plain `omh update` had their manifest rewritten to `core` while all the
+    full-only skills stayed on disk -- installs never delete -- so the install
+    reported a profile it did not have and told them to run `omh skill-profile
+    reconcile` to resolve a divergence nothing had asked for.
+
+    An update carries the install forward. Only `--full` and an explicit
+    reconcile change the profile, and reconcile stays the one path that deletes.
+    """
+    if bool(getattr(args, "core", False)):
+        return "core"
+    if bool(getattr(args, "full", False)):
+        return "full"
+    installed = str((read_manifest(paths.manifest_path) or {}).get("skill_profile") or "")
+    return installed if installed in SKILL_PROFILES else DEFAULT_SKILL_PROFILE
+
+
+def _previous_manifest_sha256(paths) -> str:
+    state, _ = read_state_result(paths)
+    return _string_value((state or {}).get("manifest_sha256"))
+
+
+def _workflow_content_status(paths, previous_sha256: str, *, dry_run: bool) -> dict[str, object]:
+    """Whether this run changed the installed workflow content.
+
+    On the preview channel the version does not move between updates, so the
+    version line alone cannot answer "did anything change?". The manifest hash
+    can, without a network call: it is already recorded on every install.
+    """
+
+    if dry_run:
+        return {"known": False, "reason": "dry run does not write the manifest"}
+    try:
+        current_sha256 = sha256_file(paths.manifest_path)
+    except OSError:
+        return {"known": False, "reason": "manifest is not readable"}
+    if not previous_sha256:
+        return {"known": False, "reason": "no previous manifest hash was recorded", "current_sha256": current_sha256}
+    return {
+        "known": True,
+        "changed": previous_sha256 != current_sha256,
+        "previous_sha256": previous_sha256,
+        "current_sha256": current_sha256,
+    }
+
+
+def _previous_release_update_state(paths) -> dict[str, object]:
+    state, _ = read_state_result(paths)
+    state = state or {}
+    candidates = [state.get("release_update"), state, state.get("last_update"), state.get("last_install")]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if isinstance(candidate.get("current"), dict):
+            return candidate["current"]
+        release_update = candidate.get("release_update")
+        if isinstance(release_update, dict) and isinstance(release_update.get("current"), dict):
+            return release_update["current"]
+        if any(
+            candidate.get(key)
+            for key in ("release_channel", "release_version", "release_package_url", "release_source_ref")
+        ):
+            return candidate
+    return {}
+
+
+def _release_update_status(
+    *,
+    release_channel: str,
+    release_version: str,
+    release_package_url: str,
+    source_ref: str,
+    explicit_metadata: bool,
+    previous: dict[str, object],
+    command_package: dict[str, object],
+    dry_run: bool,
+) -> dict[str, object]:
+    previous_channel = _string_value(previous.get("release_channel") or previous.get("channel"))
+    previous_version = _string_value(previous.get("release_version") or previous.get("version"))
+    previous_package_url = _string_value(previous.get("release_package_url") or previous.get("package_url"))
+    previous_ref = _string_value(previous.get("release_source_ref") or previous.get("source_ref"))
+    previous_package_version = _string_value(previous.get("package_version"))
+    current = {
+        "release_channel": release_channel,
+        "release_version": release_version,
+        "release_package_url": release_package_url,
+        "release_source_ref": source_ref,
+        "package_version": __version__,
+    }
+    previous_effective_version = _effective_release_version(
+        {"release_version": previous_version, "package_version": previous_package_version}
+    )
+    current_effective_version = _effective_release_version(current)
+    command_status = str(command_package.get("status", ""))
+    command_package_changed = bool(command_package.get("updated")) or command_status == "would_update"
+    metadata_changed = any(
+        [
+            _metadata_value_changed(previous_channel, release_channel, explicit=explicit_metadata),
+            _metadata_value_changed(previous_version, release_version, explicit=explicit_metadata),
+            _metadata_value_changed(previous_package_url, release_package_url, explicit=explicit_metadata),
+            _metadata_value_changed(previous_ref, source_ref, explicit=explicit_metadata),
+        ]
+    )
+    changed = command_package_changed or metadata_changed
+    if dry_run:
+        if command_package_changed:
+            status = "would_update"
+        elif metadata_changed:
+            status = "would_record_metadata"
+        else:
+            status = "would_refresh"
+    elif command_package_changed:
+        status = "updated"
+    elif metadata_changed:
+        status = "metadata_recorded"
+    else:
+        status = "refreshed"
+    return {
+        "schema_version": RELEASE_UPDATE_SCHEMA_VERSION,
+        "status": status,
+        "changed": changed,
+        "command_package_changed": command_package_changed,
+        "metadata_changed": metadata_changed,
+        "previous": {
+            "release_channel": previous_channel,
+            "release_version": previous_version,
+            "release_package_url": previous_package_url,
+            "release_source_ref": previous_ref,
+            "package_version": previous_package_version,
+        },
+        "current": current,
+        "display": {
+            "version_change": _change_label(previous_effective_version, current_effective_version),
+            "source_ref_change": _change_label(previous_ref, source_ref),
+            "package_url_change": _change_label(previous_package_url, release_package_url),
+        },
+    }
+
+
+def _string_value(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _metadata_value_changed(previous: str, current: str, *, explicit: bool) -> bool:
+    if explicit and current:
+        return previous != current
+    return bool(previous and previous != current)
+
+
+def _effective_release_version(release: dict[str, object]) -> str:
+    """Version to show a user for one release record.
+
+    `release_version` is only populated when the operator pinned one, which in
+    practice means the stable channel. Preview installs track a branch archive and
+    leave it empty, so fall back to the package version the command itself reports.
+    Without this an update reads `main -> main` and hides the upgrade that happened.
+    """
+
+    if not isinstance(release, dict):
+        return ""
+    pinned = _string_value(release.get("release_version") or release.get("version"))
+    if pinned:
+        return pinned
+    return _string_value(release.get("package_version"))
+
+
+def _change_label(previous: str, current: str) -> str:
+    if previous and current:
+        return f"{previous} -> {current}"
+    if current:
+        return f"(none) -> {current}"
+    if previous:
+        return f"{previous} -> (none)"
+    return ""
+
+
+def _install_operation_log(result: dict[str, object], *, source: str) -> dict[str, object]:
+    managed_skills = result.get("managed_skills", {})
+    command_package = result.get("command_package", {})
+    release_update = result.get("release_update", {})
+    return {
+        "operation": str(result.get("operation", "")),
+        "source": source,
+        "release_channel": str(result.get("release_channel", "")),
+        "release_version": str(result.get("release_version", "")),
+        "release_package_url": str(result.get("release_package_url", "")),
+        "release_source_ref": str(result.get("release_source_ref", "")),
+        "release_update": release_update if isinstance(release_update, dict) else {},
+        "managed_skills": managed_skills if isinstance(managed_skills, dict) else {},
+        "command_package": command_package if isinstance(command_package, dict) else {},
+    }
+
+
+def _setup_operator_summary(
+    args: argparse.Namespace,
+    paths,
+    steps: dict[str, object],
+    hermes_native: dict[str, object],
+) -> dict[str, object]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    status = "dry_run" if dry_run else "skills_only" if getattr(args, "skip_apply", False) else "configured"
+    plugin = steps.get("plugin", {})
+    plugin_status = str(plugin.get("status", "installed")) if isinstance(plugin, dict) else "installed"
+    menubar = steps.get("menubar", {})
+    menubar_status = str(menubar.get("status", "not_requested")) if isinstance(menubar, dict) else "not_requested"
+    team_status = "profile_pack" if getattr(args, "profile_pack", []) else "available"
+    mcp = steps.get("mcp", {})
+    mcp_mode = str(mcp.get("mode", "none")) if isinstance(mcp, dict) else "none"
+    mcp_host_config = mcp.get("host_config", {}) if isinstance(mcp, dict) else {}
+    mcp_host_config_status = str(mcp_host_config.get("status", "not_requested")) if isinstance(mcp_host_config, dict) else "not_requested"
+    profile = steps.get("profile", {})
+    operating_model_id = str(profile.get("operating_model_id", "")) if isinstance(profile, dict) else ""
+    memory_policy = profile.get("memory_policy", {}) if isinstance(profile, dict) else {}
+    memory_mode = str(memory_policy.get("mode", profile.get("memory_mode", "auto-safe"))) if isinstance(memory_policy, dict) else "auto-safe"
+    summary = {
+        "schema_version": SETUP_OPERATOR_SUMMARY_SCHEMA_VERSION,
+        "scope": _setup_scope(args),
+        "install_mode": "managed_skills",
+        "mcp_mode": mcp_mode,
+        "mcp_host": str(mcp.get("host", "generic")) if isinstance(mcp, dict) else "generic",
+        "mcp_host_config_status": mcp_host_config_status,
+        "mcp_host_config_path": str(mcp_host_config.get("path", "")) if isinstance(mcp_host_config, dict) else "",
+        "plugin_mode": plugin_status,
+        "menubar_mode": menubar_status,
+        "team_mode": team_status,
+        "operating_model_id": operating_model_id,
+        "memory_mode": memory_mode,
+        "memory_policy": memory_policy if isinstance(memory_policy, dict) else {},
+        "parallelism": profile.get("parallelism", {}) if isinstance(profile, dict) else {},
+        "status": status,
+        "requires_hermes_reload": bool(hermes_native.get("requires_hermes_reload", False)),
+        "paths": {
+            "omh_home": str(paths.omh_home),
+            "hermes_home": str(paths.hermes_home),
+            "skills_dir": str(paths.skills_dir),
+            "hermes_config_path": str(paths.hermes_config_path),
+        },
+        "command_path": inspect_omh_command_path(),
+        "providers": _provider_operator_summary(paths),
+        "state_log": {},
+    }
+    if not dry_run:
+        summary["state_log"] = {"path": str(paths.runtime_state_path), "entry": "last_setup"}
+    install = steps.get("install", {})
+    if isinstance(install, dict):
+        managed_skills = install.get("managed_skills", {})
+        if isinstance(managed_skills, dict):
+            summary["managed_skills"] = managed_skills
+    return summary
+
+
+def _provider_operator_summary(paths: OmhPaths) -> dict[str, object]:
+    """The providers routing counts after this setup, and the record's status.
+
+    A `--yes`, `--json`, or non-TTY setup asks no provider question, and
+    before this field it also said nothing about providers -- while the
+    chains were already reordering around whatever Hermes is linked to.
+    `counted` is every provider row routing judges served marks against,
+    each with where it was found (`recorded`, `login`, `config`, `env`);
+    `document_status` is the record's own status, so an `invalid:` record
+    (whose kinds and exclusions are dropped) is visible here too. Read-only;
+    ids and names only.
+    """
+    from ..plugin_bundle.omh.hermes_delegation import effective_provider_entitlements, provider_entitlements_path
+
+    _entitlements, document_status, rows = effective_provider_entitlements(paths.omh_home, paths.hermes_home)
+    return {
+        "document_path": str(provider_entitlements_path(paths.omh_home)),
+        "document_status": document_status,
+        "counted": [dict(row) for row in rows],
+    }
+
+
+def _setup_scope(args: argparse.Namespace) -> str:
+    if getattr(args, "omh_home", None) or getattr(args, "hermes_home", None):
+        return "custom"
+    return "project" if str(getattr(args, "scope", "") or "").strip().lower() == "project" else "user"
+
+
+def _doctor_operator_summary(checks: list[object]) -> dict[str, object]:
+    check_dicts = [
+        {
+            "name": str(getattr(check, "name", "")),
+            "ok": bool(getattr(check, "ok", False)),
+            "severity": str(getattr(check, "severity", "")),
+        }
+        for check in checks
+    ]
+    passing = sum(1 for check in check_dicts if check["ok"])
+    blocking = sum(1 for check in check_dicts if not check["ok"] and check["severity"] == "blocking")
+    warnings = sum(1 for check in check_dicts if check["severity"] == "warning")
+    return {
+        "schema_version": DOCTOR_SUMMARY_SCHEMA_VERSION,
+        "status": "ok" if doctor_ok(checks) else "needs_attention",
+        "passing": passing,
+        "total": len(check_dicts),
+        "blocking": blocking,
+        "warnings": warnings,
+        "groups": [
+            _doctor_group("command", check_dicts, ("command_path",)),
+            _doctor_group("managed_skills", check_dicts, ("manifest", "manifest_skills_dir", "local_modifications", "skill_freshness", "skills_dir", "skill:", "route_hint_skills", "guidance_projection", "hermes_skill_edits", "missing_managed_skills")),
+            _doctor_group("runtime", check_dicts, ("runtime_artifacts", "workflow_state", "runtime_state")),
+            _doctor_group("hermes_registration", check_dicts, ("hermes_config", "external_dir", "identity_conflicts", "runtime_context")),
+            _doctor_group("targets", check_dicts, ("target_registry", "target_topology")),
+            _doctor_group("model_routing", check_dicts, ("hermes_model_routing", "provider_entitlements")),
+            _doctor_group("optional_surfaces", check_dicts, ("plugin_", "team_profile_packs", "structural_search", "trigger_language_packs")),
+        ],
+    }
+
+
+def _doctor_group(name: str, checks: list[dict[str, object]], prefixes: tuple[str, ...]) -> dict[str, object]:
+    members = [
+        check
+        for check in checks
+        if any(str(check.get("name", "")).startswith(prefix) for prefix in prefixes)
+    ]
+    failed = [check for check in members if not check.get("ok")]
+    warning = any(str(check.get("severity", "")) == "warning" for check in members)
+    status = "needs_attention" if failed else "warning" if warning else "ok"
+    return {
+        "name": name,
+        "status": status,
+        "passing": sum(1 for check in members if check.get("ok")),
+        "total": len(members),
+        "failed": [str(check.get("name", "")) for check in failed],
+    }
+
+
+def _command_package_status_for_uninstall(result: dict[str, object]) -> dict[str, object]:
+    removed = _string_list(result.get("command_package_removed_paths", []))
+    would_remove = _string_list(result.get("command_package_would_remove", []))
+    kept = result.get("command_package_kept", [])
+    kept_items = kept if isinstance(kept, list) else []
+    removal_requested = bool(result.get("command_package_remove_requested", False))
+    dry_run = bool(result.get("dry_run", False))
+
+    if dry_run and would_remove:
+        status = "would_remove"
+        reason = "dry run found installer-managed command package paths"
+    elif removed:
+        status = "removed"
+        reason = "removed installer-managed command package paths"
+    elif kept_items:
+        status = "kept"
+        reason = _first_kept_reason(kept_items)
+    elif removal_requested:
+        status = "not_found"
+        reason = "command package removal was requested, but no installer-managed command package paths were found"
+    else:
+        status = "not_requested"
+        reason = "command package removal was not requested"
+
+    return {
+        "schema_version": COMMAND_PACKAGE_STATUS_SCHEMA_VERSION,
+        "operation": "uninstall",
+        "status": status,
+        "removal_requested": removal_requested,
+        "removed": bool(removed),
+        "would_remove": bool(would_remove),
+        "kept": bool(kept_items),
+        "reason": reason,
+        "remaining_command_instruction": tr(
+            str(result.get("language", "en")),
+            "uninstall_command_still_available",
+        )
+        if kept_items
+        else "",
+    }
+
+
+def _first_kept_reason(items: list[object]) -> str:
+    for item in items:
+        if isinstance(item, dict):
+            reason = str(item.get("reason", "")).strip()
+            if reason:
+                return reason
+    return "command package was not removed"
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def cmd_convert(args: argparse.Namespace) -> int:
+    args.source = args.from_skills_dir
+    args.channel = "local"
+    args.version = ""
+    args.package_url = ""
+    return cmd_install(args)
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    result = _apply_result(args)
+    if _wants_json(args):
+        _print_json(result)
+    else:
+        _print_apply_summary(result)
+    return 0
+
+
+def _carry_theme_choice(
+    paths: OmhPaths, previous_writes: object, *, theme_home: Path | None, dry_run: bool
+) -> dict[str, object]:
+    """Save an OMH theme `display.skin` names into the OMH store, before the release removes it.
+
+    On every pass until this config's release is recorded: after it, an
+    `omh*` skin in the config is the person's Hermes choice, not a theme OMH
+    set. That includes a pass whose release the editor refuses. Such a pass
+    leaves `display.skin` naming the same palette, which the OMH TUI
+    already opens with while the store holds none (`effective_theme`), so
+    saving it changes nothing that home's OMH TUI shows, and a store other
+    homes share keeps the theme of the home that goes first on the run,
+    whether or not that home's release was refused. Never the default
+    theme (`omh`, sky), with or without a record:
+    setup wrote it as a default nobody picked, an empty store already opens
+    with it, and saving it would make sky a choice that wins over a theme a
+    bot profile sharing this store did pick.
+
+    A theme already saved wins: `omh theme use` saved it, and that command
+    writes only the store, or another home sharing the store carried its
+    own earlier on this run, and one store holds one theme. When it differs
+    from this home's skin, the result names both (`kept_saved`) so the
+    output can say which one the OMH TUI opens with.
+
+    Runs before the config write. A store that cannot be written is
+    `failed`, never raised: the caller then holds the whole display release
+    for that pass, so `display.skin` does not go with its theme unsaved,
+    while the registration keys the same pass carries still land.
+    """
+    owned = load_managed_config_writes(previous_writes, config_path=paths.hermes_config_path)
+    theme = theme_for_skin_name(display_skin_selection(read_config(paths.hermes_config_path)))
+    result: dict[str, object] = {
+        "status": "none",
+        "theme": "",
+        "path": str(theme_store_path(theme_home)) if theme_home is not None else "",
+    }
+    if owned.get(DISPLAY_RELEASED_FIELD) or theme is None or theme == default_theme():
+        return result
+    result["theme"] = theme.short_name
+    if theme_home is None:
+        # A store OMH cannot tell: named in the profile's `.env`, or in a
+        # setting OMH cannot read or takes back on this pass (see
+        # `_profile_theme_home`).
+        result["status"] = "store_unknown"
+        return result
+    saved = read_theme_choice(theme_home)
+    if saved is not None:
+        result["status"] = "already_saved" if saved == theme else "kept_saved"
+        result["saved"] = saved.short_name
+    elif dry_run:
+        result["status"] = "would_save"
+    else:
+        try:
+            write_theme_choice(theme_home, theme)
+        except OSError as exc:
+            result["status"] = "failed"
+            result["reason"] = str(exc)
+            return result
+        result["status"] = "saved"
+    return result
+
+
+def _selected_skins(config_text: str) -> tuple[str, ...]:
+    """The skins a Hermes config still selects: the one `display.skin` names, or every OMH skin when it cannot be read.
+
+    Behind `display_read_refusal`, not the editor's wider guards: a quoted
+    key, an anchor or a BOM elsewhere in the file stops the editor but not
+    this read, which reads past a leading BOM as Hermes does, and keeping
+    every OMH skin file over one kept all four for good beside a skin of
+    the person's own. In a shape that does make the
+    read unreliable (a flow, duplicate or dotted `display`, a second `skin`
+    in the block, a tag or anchor on the value) the reader can return a
+    value that is not the one Hermes resolves, such as "!!str omh-crimson",
+    so every OMH skin file stays while `display.skin` is named at all.
+    """
+    if not config_names_key(config_text, DISPLAY_SKIN_KEY):
+        return ()
+    # Past a leading BOM, as Hermes' YAML loader reads the file.
+    readable = config_text.removeprefix("\ufeff")
+    named = _plain_scalar(display_skin_selection(readable))
+    if named and not display_read_refusal(readable, "skin"):
+        return (named,)
+    return available_skins()
+
+
+def _remove_legacy_display_files(
+    paths: OmhPaths, *, dry_run: bool, config_text: str, released: bool
+) -> dict[str, object]:
+    """Remove the status widget and skin files earlier versions installed into this Hermes home.
+
+    The manifest-checked uninstallers, so a file OMH cannot prove it wrote
+    (a skin the person edited) stays and is reported `kept_unmanaged`, and
+    the skin `config_text` still selects stays (`kept_selected`), since
+    removing it would leave Hermes naming a skin that is not there. With
+    `released`, a skin file is OMH's by its manifest record only, never by
+    its shipped bytes. A registered home passes it once its release was
+    recorded: that pass removed every file either proof covered, so one
+    with the shipped bytes that appears later is the person's own copy. An
+    unregistered home always passes it (`_unregistered_display_release`).
+    A symlinked destination is refused, and so is a file that cannot be
+    unlinked. Either is reported (`refused`) rather than raised: setup,
+    update and uninstall all call this after their config write has landed,
+    and raising here skipped what follows it, the write record on setup and
+    update, the bot-profile loop and the command package on uninstall.
+    """
+    files: dict[str, object] = {}
+    try:
+        files["tui_widget"] = uninstall_tui_widget(paths.hermes_home, dry_run=dry_run)
+    except (TuiWidgetInstallError, OSError) as exc:
+        files["tui_widget"] = {"status": "refused", "reason": str(exc), "path": str(paths.hermes_home / "tui-widgets")}
+    try:
+        files["skin"] = uninstall_skin(
+            paths.hermes_home, dry_run=dry_run, keep=_selected_skins(config_text), manifest_only=released
+        )
+    except (SkinInstallError, OSError) as exc:
+        files["skin"] = {"status": "refused", "reason": str(exc), "path": str(paths.hermes_home / "skins")}
+    return files
+
+
+def _unregistered_display_release(paths: OmhPaths, args: argparse.Namespace) -> dict[str, object]:
+    """The widget and skin files an earlier version left in a home that stays unregistered.
+
+    Registering is what carries the config release, so a home that opted out
+    keeps its config as it is. The files are OMH's own, though, and the
+    widget drew the OMH HUD inside Hermes' terminal, so they go: the skin
+    the config still names stays, and a skin file is OMH's by its manifest
+    record only. Such a home never records the release, so the
+    shipped-bytes proof a registered home drops after its release would
+    otherwise apply on every update, and take a copy the person put back
+    each time.
+    """
+    return {
+        "unregistered": True,
+        "files": _remove_legacy_display_files(
+            paths,
+            dry_run=bool(args.dry_run),
+            config_text=read_config(paths.hermes_config_path),
+            released=True,
+        ),
+    }
+
+
+def _display_released(record: object, paths: OmhPaths) -> bool:
+    """Whether this home's config record carries `display_released_at`."""
+    return bool(load_managed_config_writes(record, config_path=paths.hermes_config_path).get(DISPLAY_RELEASED_FIELD))
+
+
+def _refused_display_files(files: dict[str, object]) -> list[dict[str, str]]:
+    """The widget or skin removals `_remove_legacy_display_files` refused, as uninstall `kept_paths` rows."""
+    return [
+        {"path": str(outcome.get("path", "")), "reason": str(outcome.get("reason", ""))}
+        for outcome in files.values()
+        if isinstance(outcome, dict) and outcome.get("status") == "refused"
+    ]
+
+
+# `_apply_result`'s default theme store: the OMH home the command resolved.
+_RESOLVED_THEME_STORE = object()
+
+
+def _apply_result(
+    args: argparse.Namespace, *, bind_omh_home: bool = True, theme_home: Path | None | object = _RESOLVED_THEME_STORE
+) -> dict[str, object]:
+    """Write every managed key into this home's Hermes config, in one mutation.
+
+    `bind_omh_home` is off only for a bot-profile home whose `.env` names
+    `OMH_HOME`: that is the profile's own choice of store (#1679), and a
+    setting written here would outrank it. A setting OMH wrote before the
+    `.env` named one is taken back, while it still says what the record
+    says OMH wrote (#1973). A profile that chose through its own
+    `settings.omh_home` is kept by the unset-only writer, and one that
+    chose neither is given the primary's store, which its managed skills
+    already come from (#1967). That holds for `~/.omh` too: a
+    single-profile process reaches it with nothing named, but a
+    multiplexed one refuses every profile that names no store (#2037).
+
+    The same pass takes back the display keys earlier versions wrote
+    (`release_managed_display`), then removes the status widget and skin
+    files OMH can prove it installed, so bare `hermes` opens stock Hermes.
+    An OMH theme in `display.skin` is saved to the OMH store first, so the
+    OMH TUI keeps it: in `paths.omh_home`, or in the `theme_home` the
+    bot-profile sync names (`_profile_theme_home`). A `theme_home` of None
+    is a store OMH cannot tell, and no theme is saved (`store_unknown`).
+    """
+    paths = _paths(args)
+    memory_mode = str(getattr(args, "memory_mode", "") or "") or "auto-safe"
+    # One mutation, run against the text `update_config` just read and run
+    # again on a retry, so a route write landing mid-pass makes this pass
+    # re-derive its seven changes from the other writer's file instead of
+    # writing a stale whole-file copy over it (#1742).
+    applied: dict[str, ConfigChange] = {}
+    current = ""
+    registered_dir = _registered_workflow_dir(paths)
+    retired_external_dirs: list[str] = []
+    # Register today's path and retire every other managed candidate in the
+    # same text: a home carried forward from the pre-pointer path used to
+    # keep `<omh_home>/skills` beside the generation pointer, and Hermes
+    # refuses a bare skill name that resolves to two different files (#1857).
+    # Only the command that writes the pointer retires anything; an unmanaged
+    # command stays additive (see `_registration_retires_older_entries`). The
+    # opt-out rule sits in the two callers that decide whether this home is
+    # registered at all.
+    retire_candidates = (
+        _managed_workflow_dir_candidates(paths) if _registration_retires_older_entries(registered_dir) else []
+    )
+    # Read before the mutation: the reclaim below decides from it whether a
+    # setting is OMH's, and the record this pass writes carries it forward.
+    state_before, _state_error = read_state_result(paths)
+    previous_writes = (state_before or {}).get(MANAGED_CONFIG_WRITES_STATE_KEY)
+    already_released = _display_released(previous_writes, paths)
+    theme = _carry_theme_choice(
+        paths,
+        previous_writes,
+        theme_home=paths.omh_home if theme_home is _RESOLVED_THEME_STORE else theme_home,  # type: ignore[arg-type]
+        dry_run=bool(args.dry_run),
+    )
+    # The theme store could not take the theme `display.skin` names, so this
+    # pass leaves every display key and file where it is; the next one retries.
+    release_waits = theme["status"] == "failed"
+    display_rows: list[dict[str, str]] = []
+
+    def _apply(config_text: str) -> ConfigChange:
+        nonlocal current, display_rows, retired_external_dirs
+        current = config_text
+        # Re-derived on every pass of the mutation, so a retry reads the
+        # other writer's file.
+        migration = migrate_managed_registration(current, registered_dir, retire_candidates)
+        change = ConfigChange(migration.added, migration.message, migration.text)
+        retired_external_dirs = list(migration.retired)
+        compression = ensure_compression_defaults(migration.text)
+        # Installing the bridge and switching it on are separate steps in
+        # Hermes. Doing only the first leaves an install that passes every
+        # structural check while no OMH tool is reachable in chat.
+        plugin_enable = ensure_plugin_enabled(compression.text, PLUGIN_NAME)
+        # OMH writes no display key any more: bare `omh` opens the OMH TUI,
+        # and bare `hermes` is Hermes' own terminal. This takes back the ones
+        # earlier versions wrote, once per config; everything else in this
+        # pass keeps OMH working inside Hermes.
+        if release_waits:
+            display_release, rows = ConfigChange(False, "the OMH theme could not be saved", plugin_enable.text), []
+        else:
+            display_release, rows = release_managed_display(
+                plugin_enable.text, previous_writes, config_path=paths.hermes_config_path
+            )
+        display_rows = [row.as_dict() for row in rows]
+        # Same reasoning one layer down. OMH's memory provider ships inside the
+        # bundle, and a provider Hermes never selects is a provider that never
+        # runs -- so requiring a control-plane command to switch it on meant the
+        # people AGENTS.md says should only need setup/update/doctor would never
+        # have it. Claims the slot only when it is free; `set_memory_provider`
+        # refuses when another product holds it, because Hermes runs exactly one.
+        memory_provider = maybe_set_memory_provider(display_release.text, MEMORY_PROVIDER_NAME, memory_mode)
+        # Last, and unset-only. Without it the plugin in a home installed at
+        # any store but `~/.omh` binds `~/.omh` unless Hermes is started
+        # with `OMH_HOME` exported, and reads another install's manifest
+        # (#1960); and at `~/.omh` itself a multiplexed process (a gateway
+        # serving several profiles, Desktop `serve`) refuses to load it,
+        # because there a profile must name its store (#2037).
+        if not bind_omh_home:
+            plugin_omh_home = reclaim_plugin_omh_home(
+                memory_provider.text, previous_writes, config_path=paths.hermes_config_path
+            )
+            if not plugin_omh_home.changed:
+                plugin_omh_home = ConfigChange(
+                    False, "a bot profile names its own store in its .env OMH_HOME", memory_provider.text
+                )
+        else:
+            plugin_omh_home = ensure_plugin_omh_home(memory_provider.text, paths.omh_home)
+        applied.update(
+            {
+                "external_dir": change,
+                "compression": compression,
+                "plugin_enable": plugin_enable,
+                "display_release": display_release,
+                "memory_provider": memory_provider,
+                "plugin_omh_home": plugin_omh_home,
+            }
+        )
+        return ConfigChange(
+            any(step.changed for step in applied.values()) or bool(retired_external_dirs),
+            change.message,
+            plugin_omh_home.text,
+        )
+
+    try:
+        update_config(
+            paths.hermes_config_path, _apply, omh_home=paths.omh_home, dry_run=bool(args.dry_run)
+        )
+    except ValueError as exc:
+        raise OmhError(str(exc)) from exc
+    change = applied["external_dir"]
+    registration = "migrated" if retired_external_dirs else "added" if change.changed else "unchanged"
+    compression = applied["compression"]
+    plugin_enable = applied["plugin_enable"]
+    display_release = applied["display_release"]
+    memory_provider = applied["memory_provider"]
+    plugin_omh_home = applied["plugin_omh_home"]
+    # Only the profile branch removes this key, so a change there is a reclaim.
+    reclaimed = plugin_omh_home_setting(current) if not bind_omh_home and plugin_omh_home.changed else ""
+    # The record of what this pass added, carried forward from any earlier
+    # one. `omh uninstall` reads it to reverse exactly the keys OMH wrote and
+    # leave every value the person has since changed; without it, three of
+    # the seven keys are indistinguishable from a personal choice and have to
+    # be left behind (#1725).
+    # A key the editor refused for its shape may still be OMH's, so it stays
+    # in the record and the release is not recorded: the next pass asks again.
+    # A release held for the theme store keeps every display key the same way.
+    held = set(DISPLAY_KEYS) if release_waits else {row["key"] for row in display_rows if row["status"] == "refused"}
+    config_writes = managed_config_writes(
+        current,
+        plugin_omh_home.text,
+        config_path=paths.hermes_config_path,
+        previous=previous_writes,
+        released=(
+            *(key for key in DISPLAY_KEYS if key not in held),
+            *((PLUGIN_OMH_HOME_KEY,) if reclaimed else ()),
+        ),
+        display_released=not held,
+    )
+    # After the config, never before, and keeping the skin the config still
+    # names: removing it would leave Hermes pointing at nothing.
+    legacy_files = {} if release_waits else _remove_legacy_display_files(
+        paths,
+        dry_run=bool(args.dry_run),
+        config_text=plugin_omh_home.text,
+        released=already_released,
+    )
+    if not args.dry_run:
+        update_state(
+            paths,
+            {
+                "hermes_config_path": str(paths.hermes_config_path),
+                "last_applied_skills_dir": str(registered_dir),
+                "external_dir_registered": _external_dir_registered(
+                    read_config(paths.hermes_config_path),
+                    registered_dir,
+                ),
+                MANAGED_CONFIG_WRITES_STATE_KEY: config_writes,
+            },
+        )
+    return {
+        "changed": (
+            change.changed
+            or bool(retired_external_dirs)
+            or compression.changed
+            or plugin_enable.changed
+            or display_release.changed
+            or memory_provider.changed
+            or plugin_omh_home.changed
+        ),
+        "message": change.message,
+        "config": str(paths.hermes_config_path),
+        "skills_dir": str(paths.skills_dir),
+        # "migrated" when an older managed entry was retired in the same
+        # write, "added" when only today's path went in, else "unchanged".
+        "registration": registration,
+        "registered_dir": registered_dir.expanduser().as_posix(),
+        "retired_external_dirs": list(retired_external_dirs),
+        "dry_run": args.dry_run,
+        "compression_defaults": {"changed": compression.changed, "message": compression.message},
+        "plugin_enabled": {"changed": plugin_enable.changed, "message": plugin_enable.message},
+        # What the display release took back, kept, and carried into the
+        # OMH theme store, plus the widget and skin files it removed.
+        "display_release": {
+            "changed": display_release.changed,
+            "message": display_release.message,
+            # True on the one pass that records `display_released_at`.
+            "recorded": not already_released and not held,
+            "keys": display_rows,
+            "theme": theme,
+            "files": legacy_files,
+        },
+        "memory_provider": {
+            "changed": memory_provider.changed,
+            "message": memory_provider.message,
+            "selected": memory_provider_selection(memory_provider.text),
+        },
+        "plugin_omh_home": {
+            "changed": plugin_omh_home.changed,
+            "message": plugin_omh_home.message,
+            "selected": plugin_omh_home_setting(plugin_omh_home.text),
+            # The value taken back from a bot profile whose `.env` now names
+            # its own store (#1973), or "".
+            "reclaimed": reclaimed,
+        },
+        "managed_config_writes": config_writes,
+    }
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    language = _resolve_language(args)
+    if args.registration_only and (args.remove_files or args.all or args.purge):
+        raise OmhError("--registration-only cannot be combined with --remove-files, --all, or --purge")
+    try:
+        paths = _paths(args)
+        read_config(paths.hermes_config_path)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OmhError(f"Hermes home {getattr(args, 'hermes_home', None) or 'primary'}: unreadable config: {exc}") from exc
+    remove_all = bool(args.all or args.purge or (not args.registration_only and not args.remove_files))
+    plan = store_removal_plan(paths, remove_profiles=remove_all) if remove_all or args.remove_files else {}
+    blocked = bool(plan.get("failed"))
+    record = _managed_config_record(paths)
+    registration_message = ""
+    reversal_rows: list[dict[str, str]] = []
+
+    def _unregister(config_text: str) -> ConfigChange:
+        # Unregistration AND reversal both derive from the text
+        # `update_config` just read, so a retry re-derives them from the
+        # other writer's file. Deciding either from an earlier read and
+        # replaying the result is the stale whole-file copy #1742 exists to
+        # prevent.
+        nonlocal registration_message, reversal_rows
+        change, rows = _unregister_and_reverse(
+            paths, config_text, remove_all=remove_all, record=record
+        )
+        registration_message = change.message
+        reversal_rows = rows
+        return change
+
+    try:
+        # `config_message` stays the registration message it has always
+        # been: the summary line reads "Hermes registration: {message}" and
+        # is mapped to a translation key by its exact text. Everything the
+        # reversal did is reported per key through `config_keys`.
+        #
+        # This write lands BEFORE the menubar, skill-pack, widget, skin,
+        # profile and command-package removals below, as it always has. A
+        # failure in any of those leaves a reversed config beside a bundle
+        # still on disk. That is the safer of the two directions -- Hermes
+        # ignores a plugin it is not told to load, while a config still
+        # naming `omh` after the bundle is gone is the exact cost #1725
+        # exists to remove -- but the blast radius went from one key to
+        # seven, so it is written down.
+        update = (
+            ConfigChange(False, "unreadable reference inventory; repair the named homes before retrying uninstall", read_config(paths.hermes_config_path))
+            if blocked else update_config(
+                paths.hermes_config_path, _unregister, omh_home=paths.omh_home, dry_run=bool(args.dry_run)
+            )
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OmhError(str(exc)) from exc
+    config_changed = update.changed
+    menubar_result = (
+        uninstall_menubar_app(paths, dry_run=bool(args.dry_run))
+        if remove_all and not blocked and _uninstall_should_remove_menubar(args)
+        else {"status": "not_requested", "operation": "uninstall"}
+    )
+    # A readable inventory is not proof that a child's guarded config write
+    # will succeed. Detach first, then inspect the persisted references again
+    # before removing the shared store or the interpreter running this command.
+    profile_results = [] if blocked else _uninstall_hermes_profiles(
+        args, remove_all=remove_all, record=record, primary=paths
+    )
+    if not blocked and (remove_all or args.remove_files):
+        detached = () if args.dry_run or not remove_all else tuple(
+            paths.hermes_home / "profiles" / str(row["profile"])
+            for row in profile_results if row.get("status") != "failed"
+        )
+        plan = store_removal_plan(paths, remove_profiles=remove_all, detached_homes=detached)
+        failed_profiles = [str(row["profile"]) for row in profile_results if row.get("status") == "failed"]
+        if failed_profiles and plan.get("status") != "kept":
+            plan = {"status": "kept", "reason": "profile detach failed; repair the named profiles before retrying uninstall",
+                    "homes": failed_profiles, "failed": False}
+        blocked = bool(plan.get("failed"))
+    result = uninstall_skill_pack(
+        paths,
+        remove_files=bool(args.remove_files),
+        remove_all=remove_all,
+        dry_run=bool(args.dry_run),
+        force=bool(args.force),
+        remove_command_package=bool(remove_all and not args.keep_command),
+        store_plan=plan,
+        home_refusal=_configured_omh_home_link_refusal(args, paths),
+    )
+    legacy_files = (
+        _remove_legacy_display_files(
+            paths,
+            dry_run=bool(args.dry_run),
+            config_text=update.text,
+            released=_display_released(record, paths),
+        )
+        if remove_all and not blocked
+        else {"tui_widget": {"status": "not_requested"}, "skin": {"status": "not_requested"}}
+    )
+    tui_widget_result = legacy_files["tui_widget"]
+    skin_result = legacy_files["skin"]
+    scope = (
+        tr(language, "uninstall_scope_all")
+        if remove_all
+        else tr(language, "uninstall_scope_files")
+        if args.remove_files
+        else tr(language, "uninstall_scope_registration")
+    )
+    result.update(
+        {
+            "operation": "uninstall",
+            "config_changed": config_changed,
+            "config_message": registration_message,
+            "config_keys": reversal_rows,
+            "scope": scope,
+            "registration_only": bool(args.registration_only),
+            "dry_run": args.dry_run,
+            "menubar_app": menubar_result,
+            "tui_widget": tui_widget_result,
+            "skin": skin_result,
+            "language": language,
+        }
+    )
+    if profile_results:
+        result["hermes_profiles"] = profile_results
+    result["command_package"] = _command_package_status_for_uninstall(result)
+    code = 1 if blocked or any(row.get("status") == "failed" for row in profile_results) else 0
+    result.update({"status": "failed" if blocked else "partial" if code else "ok", "exit_code": code})
+    if _wants_json(args):
+        _print_json(result)
+    else:
+        _print_uninstall_summary(result, language=language)
+        if blocked:
+            print(f"  warning: unreadable reference inventory: {plan}; repair the named homes before retrying uninstall")
+    return code
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    paths = _paths(args)
+    manifest = read_manifest(paths.manifest_path)
+    payload = _catalog_aware_list_payload(manifest)
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        _print_list_summary(payload, manifest_path=paths.manifest_path, skills_dir=paths.skills_dir)
+    return 0
+
+
+def cmd_skill_profile_status(args: argparse.Namespace) -> int:
+    payload = skill_profile_report(_paths(args))
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        _print_skill_profile_status_summary(payload)
+    return 0
+
+
+def cmd_skill_profile_reconcile(args: argparse.Namespace) -> int:
+    paths = _paths(args)
+    payload = reconcile_skill_profile(
+        paths,
+        target_profile=str(getattr(args, "to", "core")),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    if not payload.get("dry_run"):
+        state = payload.get("profile_state_after", {})
+        update_state(
+            paths,
+            {
+                "manifest_path": str(paths.manifest_path),
+                "manifest_sha256": sha256_file(paths.manifest_path),
+                "installed_skills": state.get("installed_skill_count", 0) if isinstance(state, dict) else 0,
+                "skills_dir": str(paths.skills_dir),
+                "last_skill_profile_reconcile": {
+                    "target_profile": payload.get("target_profile", ""),
+                    "removed_skills": payload.get("removed_skills", []),
+                    "retained_skills": payload.get("retained_skills", []),
+                    "effective_profile": state.get("effective_profile", "") if isinstance(state, dict) else "",
+                },
+            },
+        )
+        payload["runtime_state_path"] = str(paths.runtime_state_path)
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        _print_skill_profile_reconcile_summary(payload)
+    return 0
+
+
+def _print_skill_profile_status_summary(payload: dict[str, object]) -> None:
+    use_color = _use_color()
+    state = payload.get("profile_state", {})
+    if not isinstance(state, dict):
+        state = {}
+    print(_color("OMH skill profile", "1;36", use_color))
+    print(_color("Summary", "1;32", use_color))
+    if not payload.get("installed"):
+        print("  Status: not installed")
+        print(f"  Manifest: {payload.get('manifest_path', '')}")
+        print(_color("Next", "1;32", use_color))
+        print("  Run `omh setup` to install managed Hermes skills.")
+        return
+    print(f"  Requested profile: {state.get('requested_profile', '') or 'unrecorded'}")
+    print(f"  Effective profile: {state.get('effective_profile', '')}")
+    print(
+        f"  Installed skills: {state.get('installed_catalog_skill_count', 0)} catalog "
+        f"(core profile is {state.get('core_profile_skill_count', 0)}, "
+        f"full profile is {state.get('full_profile_skill_count', 0)})"
+    )
+    full_only = state.get("full_only_installed_skills", [])
+    if isinstance(full_only, list) and full_only:
+        print(f"  Full-only skills installed: {len(full_only)}")
+    unmanaged_count = state.get("unmanaged_skill_count", 0)
+    if isinstance(unmanaged_count, int) and unmanaged_count:
+        print(f"  Non-catalog skill directories: {unmanaged_count}")
+    retained = payload.get("retained_skills", [])
+    if isinstance(retained, list) and retained:
+        print(_color("Retained by reconcile", "1;33", use_color))
+        for item in retained[:12]:
+            if isinstance(item, dict):
+                print(f"  - {item.get('name', '')}: {item.get('reason', '')}")
+    print(_color("Context cost", "1;32", use_color))
+    print(f"  {state.get('context_cost_note', '')}")
+    print(f"  {state.get('non_destructive_default', '')}")
+    print(_color("Next", "1;32", use_color))
+    reconcilable = payload.get("reconcilable_skills", [])
+    if isinstance(reconcilable, list) and reconcilable:
+        print(f"  Run `{SKILL_PROFILE_RECONCILE_COMMAND} --dry-run` to preview removing {len(reconcilable)} skill(s).")
+    else:
+        print("  Nothing to reconcile; the installed skills already match the recorded profile.")
+
+
+def _print_skill_profile_reconcile_summary(payload: dict[str, object]) -> None:
+    use_color = _use_color()
+    dry_run = bool(payload.get("dry_run"))
+    title = "OMH skill profile reconcile preview" if dry_run else "OMH skill profile reconciled"
+    removed = payload.get("would_remove_skills" if dry_run else "removed_skills", [])
+    if not isinstance(removed, list):
+        removed = []
+    before = payload.get("profile_state_before", {})
+    after = payload.get("profile_state_after", before)
+    if not isinstance(before, dict):
+        before = {}
+    if not isinstance(after, dict):
+        after = {}
+    print(_color(title, "1;36", use_color))
+    print(_color("Summary", "1;32", use_color))
+    print(f"  Target profile: {payload.get('target_profile', '')}")
+    print(f"  Effective profile before: {before.get('effective_profile', '')}")
+    if not dry_run:
+        print(f"  Effective profile after: {after.get('effective_profile', '')}")
+    verb = "Would remove" if dry_run else "Removed"
+    print(f"  {verb}: {len(removed)} unmodified managed full-only skill(s)")
+    if removed:
+        shown = [str(name) for name in removed[:12]]
+        print("  Names: " + ", ".join(shown) + (" ..." if len(removed) > len(shown) else ""))
+    retained = payload.get("retained_skills", [])
+    if isinstance(retained, list) and retained:
+        print(_color("Retained", "1;33", use_color))
+        for item in retained[:12]:
+            if isinstance(item, dict):
+                print(f"  - {item.get('name', '')}: {item.get('reason', '')}")
+    print(_color("Context cost", "1;32", use_color))
+    print(f"  {payload.get('context_cost_note', '')}")
+    print(f"  {payload.get('non_destructive_default', '')}")
+    print(_color("Next", "1;32", use_color))
+    if dry_run:
+        print(f"  Rerun without `--dry-run` to apply: `{SKILL_PROFILE_RECONCILE_COMMAND}`.")
+    else:
+        print("  Restart or reload Hermes Agent so it picks up the smaller skill set.")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    # The pairwise sub-check replaces the checklist rather than appending to
+    # it: it answers a question about two profiles that are not the one this
+    # invocation resolved, and folding its verdicts into the local health
+    # count would make `passing/total` mean two different things at once.
+    if getattr(args, "profile_isolation", None):
+        from .profile_isolation import run_profile_isolation
+
+        return run_profile_isolation(args)
+    language = _resolve_language(args)
+    payload = _doctor_result(args)
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        _print_doctor_summary(payload, language=language)
+    return 0 if payload["ok"] else 1
+
+
+def _catalog_aware_list_payload(manifest: dict[str, object] | None) -> dict[str, object]:
+    payload = dict(manifest or {"schema_version": 1, "skills": [], "message": "not installed"})
+    raw_skills = payload.get("skills", [])
+    if not isinstance(raw_skills, list):
+        raw_skills = []
+    capabilities = {
+        str(item.get("id")): item
+        for item in skill_capabilities()
+        if isinstance(item, dict) and item.get("id")
+    }
+    enriched_skills: list[dict[str, object]] = []
+    for raw_skill in raw_skills:
+        if not isinstance(raw_skill, dict):
+            continue
+        record = dict(raw_skill)
+        capability = capabilities.get(str(record.get("name") or ""))
+        if capability:
+            record.update(_list_skill_catalog_fields(capability))
+        enriched_skills.append(record)
+    payload["skills"] = enriched_skills
+    payload["catalog_context"] = _list_catalog_context(enriched_skills)
+    return payload
+
+
+def _list_skill_catalog_fields(capability: dict[str, object]) -> dict[str, object]:
+    fields = {
+        "description": capability.get("description", ""),
+        "category": capability.get("category", ""),
+        "phase": capability.get("phase", ""),
+        "hermes_role": capability.get("hermes_role", ""),
+        "use_for": capability.get("use_for", ""),
+        "preferred_usage": capability.get("preferred_usage", ""),
+        "awareness_lane": capability.get("awareness_lane", ""),
+        "awareness_lane_label": capability.get("awareness_lane_label", ""),
+        "workflow_routing_hint": capability.get("workflow_routing_hint", ""),
+        "handoff_policy": capability.get("handoff_policy", ""),
+        "evidence_boundary": capability.get("evidence_boundary", ""),
+    }
+    triggers = capability.get("triggers", [])
+    if isinstance(triggers, list):
+        fields["triggers"] = [str(item) for item in triggers[:10] if str(item)]
+    required_inputs = capability.get("required_inputs", [])
+    if isinstance(required_inputs, list):
+        fields["required_inputs"] = [str(item) for item in required_inputs[:8] if str(item)]
+    expected_outputs = capability.get("expected_outputs", [])
+    if isinstance(expected_outputs, list):
+        fields["expected_outputs"] = [str(item) for item in expected_outputs[:8] if str(item)]
+    return fields
+
+
+def _list_catalog_context(skills: list[dict[str, object]]) -> dict[str, object]:
+    names = {str(skill.get("name") or "") for skill in skills}
+    described_count = sum(1 for skill in skills if skill.get("description"))
+    summary = capability_summary()
+    lanes = []
+    for lane in summary.get("lanes", []):
+        if not isinstance(lane, dict):
+            continue
+        lane_skills = [str(skill) for skill in lane.get("primary_skills", []) if str(skill) in names]
+        if not lane_skills:
+            continue
+        lanes.append(
+            {
+                "id": lane.get("id", ""),
+                "label": lane.get("label", ""),
+                "owner_role": lane.get("owner_role", ""),
+                "use_for": lane.get("use_for", ""),
+                "primary_skills": lane_skills,
+                "examples": lane.get("examples", []),
+            }
+        )
+    return {
+        "schema_version": "omh_installed_skill_catalog_context/v1",
+        "purpose": (
+            "Hermes-facing context for answering what installed OMH workflows are available "
+            "without asking the user to approve extra shell catalog commands."
+        ),
+        "skill_count": len(skills),
+        "described_skill_count": described_count,
+        "lanes": lanes,
+        "direct_response_guidance": [
+            "Summarize workflow lanes before listing every skill.",
+            "Offer `./omh` or the matching clean skill name when the user wants to choose manually.",
+            "Use workflow_routing_hint and evidence_boundary before claiming execution or runtime evidence.",
+        ],
+        "evidence_boundary": summary.get("evidence_boundary", ""),
+    }
+
+
+def _doctor_result(args: argparse.Namespace) -> dict[str, object]:
+    paths = _paths(args)
+    # Both default to today's behaviour; each flag turns off one thing only.
+    personal_files = not getattr(args, "no_personal_files", False)
+    state_write = not getattr(args, "no_state_write", False)
+    checks = run_doctor(paths, state_write=state_write)
+    next_action = recommended_next_action(checks)
+    summary = _doctor_operator_summary(checks)
+    runtime_writable = any(check.name == "runtime_artifacts" and check.ok for check in checks)
+    runtime_state_readable = not any(check.name == "runtime_state" and not check.ok for check in checks)
+    state_log: dict[str, str] = {}
+    if state_write and runtime_writable and runtime_state_readable:
+        update_state(
+            paths,
+            {
+                "last_doctor": {
+                    "ok": doctor_ok(checks),
+                    "checks": {check.name: check.ok for check in checks},
+                    "summary": summary,
+                    "recommended_next_action": next_action,
+                }
+            },
+        )
+        state_log = {"path": str(paths.runtime_state_path), "entry": "last_doctor"}
+    advisories = run_doctor_advisories(paths, personal_files=personal_files)
+    payload: dict[str, object] = {
+        "ok": doctor_ok(checks),
+        "checks": [check.__dict__ for check in checks],
+        "summary": summary,
+        "state_log": state_log,
+        "recommended_next_action": next_action,
+        "advisories": advisories.to_dict(),
+        # Diagnostic provenance for the command that produced this report. It
+        # is deliberately not a doctor check: an installed artifact with no
+        # stamped identity is a normal state, not a health failure, so it must
+        # not move the doctor status, the issue counts, or the exit code.
+        "build_identity": probe_build_identity(),
+        "language": _resolve_language(args),
+    }
+    # Only when a control is on, so a default run's payload keeps its shape.
+    if not (personal_files and state_write):
+        payload["privacy_controls"] = _doctor_privacy_controls(personal_files=personal_files, state_write=state_write)
+    return payload
+
+
+def _doctor_privacy_controls(*, personal_files: bool, state_write: bool) -> dict[str, object]:
+    """Say which doctor privacy controls were on and what each one left undone."""
+    return {
+        "personal_files": "read" if personal_files else "not_read",
+        "personal_files_skipped": (
+            [] if personal_files else ["advisory:soul_missing_or_starter", "advisory:hermes_memory_staleness"]
+        ),
+        "state_write": "enabled" if state_write else "disabled",
+        "state_write_skipped": (
+            []
+            if state_write
+            else ["runtime/state.json last_doctor", "runtime_artifacts write probe", "workflow_state write probe"]
+        ),
+    }
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    args.with_plugin = True
+    validate_model_setup_args(args)
+    language = _setup_language(args)
+    paths = _paths(args)
+    if getattr(args, "interactive", False) and _setup_should_interact(args) and not _wizard_has_terminal():
+        # Without a terminal on stdin every prompt reads EOF and takes its
+        # default, so the user would never see the choices the wizard exists
+        # to ask. Refuse before anything is written.
+        next_command = _noninteractive_rerun_command(getattr(args, "_argv", None) or sys.argv[1:])
+        print(tr(language, "setup_interactive_needs_terminal", command=next_command), file=sys.stderr)
+        refusal: dict[str, object] = {
+            "ok": False,
+            "refused": True,
+            "refusal_reason": "interactive_requires_terminal",
+            "next_action": "rerun_with_no_interactive_json",
+            "next_command": next_command,
+            "language": language,
+        }
+        # A person at a terminal reads the line above; a caller capturing
+        # stdout (the agent shell this refusal exists for) gets the record.
+        try:
+            stdout_is_terminal = sys.stdout.isatty()
+        except (AttributeError, ValueError):
+            stdout_is_terminal = False
+        if not stdout_is_terminal:
+            _print_json(refusal)
+        return _setup_exit_code(refusal)
+    if _setup_should_interact(args):
+        if not _setup_paths_were_explicit(args) and not getattr(args, "scope", None):
+            args.scope = _ask_setup_scope(use_color=_use_color(), language=language)
+            paths = _paths(args)
+        _run_setup_wizard(args, paths, language)
+    if getattr(args, "star", False):
+        _star_github_repo(language=language, use_color=_use_color(), dry_run=bool(args.dry_run))
+    if not args.with_mcp and (
+        str(getattr(args, "mcp_host", "generic") or "generic") != "generic"
+        or getattr(args, "mcp_config_path", None)
+    ):
+        raise OmhError("--mcp-host and --mcp-config-path require --with-mcp.")
+
+    progress = _HumanProgress(enabled=not _wants_json(args), use_color=_use_color())
+    if not _wants_json(args):
+        progress.header(tr(language, "setup_title"), tr(language, "setup_subtitle"))
+    setup_menubar = _setup_should_attempt_menubar(args)
+    total_steps = 5 + (1 if args.with_mcp else 0) + (1 if args.profile_pack else 0) + (1 if setup_menubar else 0)
+    step_index = 1
+
+    progress.step(step_index, total_steps, tr(language, "step_install_skills"))
+    steps: dict[str, object] = {"install": _install_result(args)}
+    install_skills = steps["install"].get("skills", []) if isinstance(steps["install"], dict) else []
+    progress.done(tr(language, "done_skills_installed", count=len(install_skills) if isinstance(install_skills, list) else 0))
+    step_index += 1
+
+    progress.step(step_index, total_steps, tr(language, "step_register"))
+    if args.skip_apply:
+        steps["apply"] = {"skipped": True, "message": "Skipped Hermes config registration because --skip-apply was set."}
+        progress.skip(tr(language, "skip_by_flag", flag="--skip-apply"))
+    else:
+        steps["apply"] = _apply_result(args)
+        apply_message = steps["apply"].get("message", "configured") if isinstance(steps["apply"], dict) else "configured"
+        progress.done(_config_change_label(language, str(apply_message)))
+    step_index += 1
+
+    progress.step(step_index, total_steps, tr(language, "step_plugin"))
+    steps["plugin"] = _plugin_setup_result(args, paths)
+    # Every install gets the editable mixture-chain override document so
+    # customizing routing is a config edit, not a source edit.
+    steps["model_chains"] = _seed_model_chains_result(paths, dry_run=bool(args.dry_run))
+    # Bot profiles are independent Hermes homes under <hermes_home>/profiles;
+    # registering only the primary home is why bot chats saw zero OMH skills.
+    steps["hermes_profiles"] = _sync_hermes_profiles(args) if not args.skip_apply else []
+    plugin_status = steps["plugin"].get("status", "installed") if isinstance(steps["plugin"], dict) else "installed"
+    progress.done(_plugin_status_label(language, str(plugin_status)))
+    step_index += 1
+
+    if setup_menubar:
+        progress.step(step_index, total_steps, tr(language, "step_menubar"), detail=str(paths.omh_home / "menubar"))
+        steps["menubar"] = _menubar_setup_result(args, paths)
+        menubar_status = str(steps["menubar"].get("status", "unknown")) if isinstance(steps["menubar"], dict) else "unknown"
+        if menubar_status in {"running", "installed", "dry_run"}:
+            progress.done(_menubar_status_label(language, menubar_status))
+        else:
+            reason = str(steps["menubar"].get("reason", menubar_status)) if isinstance(steps["menubar"], dict) else menubar_status
+            progress.skip(reason)
+        step_index += 1
+    else:
+        steps["menubar"] = {"schema_version": "menubar_app/v1", "status": "not_requested"}
+
+    steps["mcp"] = _mcp_setup_result(args, paths)
+    if args.with_mcp:
+        progress.step(step_index, total_steps, tr(language, "step_mcp"), detail=str(paths.runtime_state_path))
+        mcp_status = steps["mcp"].get("status", "bridge_requested") if isinstance(steps["mcp"], dict) else "bridge_requested"
+        progress.done(tr(language, "done_mcp_bridge", status=_mcp_status_label(language, str(mcp_status))))
+        step_index += 1
+
+    if args.profile_pack:
+        progress.step(step_index, total_steps, tr(language, "step_team"), detail=", ".join(args.profile_pack))
+        steps["team_profiles"] = _team_profile_setup_result(args, paths)
+        progress.done(
+            tr(language, "done_profile_packs", count=len(steps["team_profiles"]) if isinstance(steps["team_profiles"], list) else 0)
+        )
+        step_index += 1
+
+    progress.step(step_index, total_steps, tr(language, "step_preferences"))
+    steps["profile"] = _setup_profile_result(args, paths)
+    profile_executor = steps["profile"].get("default_executor", "choose") if isinstance(steps["profile"], dict) else "choose"
+    progress.done(tr(language, "done_default_executor", executor=_executor_summary(language, str(profile_executor))))
+    step_index += 1
+
+    progress.step(step_index, total_steps, tr(language, "step_targets"))
+    steps["targets"] = record_target_observation(
+        paths,
+        source="setup",
+        dry_run=args.dry_run,
+        ensure_config=not args.skip_apply,
+        setup_context={
+            "apply_skipped": bool(args.skip_apply),
+            "with_plugin": True,
+            "with_menubar": bool(setup_menubar),
+            "with_mcp": bool(args.with_mcp),
+            "profile_packs": list(args.profile_pack),
+            "setup_profiles": list(args.profile),
+            "default_executor": str(getattr(args, "default_executor", "") or ""),
+            "operating_model": str(getattr(args, "operating_model", "") or ""),
+            "memory_mode": str(getattr(args, "memory_mode", "") or "auto-safe"),
+        },
+    )
+    target_topology = steps["targets"].get("topology", {}) if isinstance(steps["targets"], dict) else {}
+    if isinstance(target_topology, dict):
+        progress.done(
+            tr(
+                language,
+                "done_target_topology",
+                mode=target_topology.get("mode", "unknown"),
+                count=target_topology.get("known_target_count", 0),
+            )
+        )
+    else:
+        progress.done(tr(language, "target_recorded"))
+    if getattr(args, "model_setup", False):
+        dependencies = _model_setup_flow_dependencies(paths)
+        steps["model_activation"] = model_activation_result(
+            args,
+            language=language,
+            dependencies=dependencies,
+        )
+        if not _wants_json(args):
+            print_model_activation_summary(
+                steps["model_activation"],
+                language=language,
+                use_color=_use_color,
+                color=_color,
+            )
+    if args.dry_run:
+        bootstrap_final_state = (
+            "dry run would install generated skills and register the managed OMH skills directory for Hermes discovery"
+            if not args.skip_apply
+            else "dry run would install generated skills, but Hermes discovery registration would be skipped"
+        )
+    elif args.skip_apply:
+        bootstrap_final_state = "generated skills are installed, but Hermes discovery registration was skipped"
+    else:
+        bootstrap_final_state = "generated skills are installed in the managed OMH skills directory and registered for Hermes discovery"
+    discovery_status = (
+        "dry_run_not_observed"
+        if args.dry_run
+        else "not_registered_skip_apply"
+        if args.skip_apply
+        else "config_registered_reload_required"
+    )
+    # v2: the setup payload no longer carries the branded-TUI fields v1 did
+    # (`tui_verdict`, `steps.tui_widget`, `steps.skin`,
+    # `steps.hermes_tui_preflight`, and `steps.apply.tui_interface`, `.skin`
+    # and `.display_sections`); `steps.apply.display_release` replaces them.
+    hermes_native = {
+        "schema_version": "hermes_native_setup/v2",
+        "mode": "omh_bootstrap",
+        "dry_run": bool(args.dry_run),
+        "observed": not args.dry_run and not args.skip_apply,
+        "observed_scope": "local install/apply steps only; this does not prove Hermes reloaded or used the skill",
+        "discovery_status": discovery_status,
+        "requires_hermes_reload": not args.skip_apply,
+        "normal_user_surface": "Hermes Agent chat and installed Hermes skills",
+        "setup_scope": _setup_scope(args),
+        # The tap only. A hub install lands in the Hermes home's own skills
+        # directory, which outranks OMH's managed one: from Hermes 0.21.6 that
+        # copy hides the managed skill for good, older hosts refuse the shared
+        # name as ambiguous, and either way it never receives an OMH update.
+        "equivalent_hermes_commands": [
+            "hermes skills tap add rlaope/oh-my-hermes",
+        ],
+        "bootstrap_final_state": bootstrap_final_state,
+        "skills_dir": str(paths.skills_dir),
+        "hermes_config_path": str(paths.hermes_config_path),
+        "hermes_config_key": "skills.external_dirs",
+        "mcp_setup": steps["mcp"],
+        "target_topology": steps["targets"]["topology"],
+        "wrapper_backend_surface": "omh chat interact and runtime commands are adapter/operator contracts, not the normal chat UX",
+    }
+
+    # `ok` means what the exit code means: every step setup was asked to run
+    # ran. A model step that could not run makes it false here and in the
+    # state record, so a reader of `ok` alone is not told otherwise.
+    setup_ok = _setup_exit_code({"steps": steps}) == 0
+    if not args.dry_run:
+        operator_summary = _setup_operator_summary(args, paths, steps, hermes_native)
+        state_patch: dict[str, object] = {
+            "last_setup": {
+                "ok": setup_ok,
+                "apply_skipped": bool(args.skip_apply),
+                "hermes_native": hermes_native,
+                "operator_summary": operator_summary,
+                "setup_profile": steps["profile"],
+                "mcp_setup": steps["mcp"],
+                "menubar_app": steps["menubar"],
+                "team_profiles": steps.get("team_profiles", []),
+                "target_observation": steps["targets"],
+            }
+        }
+        durable_mcp_host_config = _durable_mcp_host_config_record(steps["mcp"])
+        if durable_mcp_host_config:
+            state_patch["last_mcp_host_config_install"] = durable_mcp_host_config
+        update_state(paths, state_patch)
+    else:
+        operator_summary = _setup_operator_summary(args, paths, steps, hermes_native)
+    payload: dict[str, object] = {
+        "ok": setup_ok,
+        "steps": steps,
+        "dry_run": args.dry_run,
+        "hermes_native": hermes_native,
+        "operator_summary": operator_summary,
+        "language": language,
+    }
+    payload["plugin_distribution"] = steps["plugin"]
+    if steps.get("hermes_profiles"):
+        payload["hermes_profiles"] = steps["hermes_profiles"]
+    if args.profile_pack:
+        payload["team_profiles"] = steps["team_profiles"]
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        _print_setup_summary(payload, language=language)
+    return _setup_exit_code(payload)
+
+
+def _noninteractive_rerun_command(argv: list[str]) -> str:
+    """The refused command line with the wizard swapped for the scripted path.
+
+    Every other flag the user passed is kept, so `--model-setup`, `--scope`,
+    `--profile-pack` and the homes survive. argparse accepts a unique prefix
+    such as `--inter`, so a prefix of `--interactive` is dropped too.
+    """
+    rerun = ["omh"]
+    for token in argv:
+        if token.startswith("--") and len(token) > 2 and "--interactive".startswith(token):
+            continue
+        rerun.append(token)
+    rerun.extend(flag for flag in ("--no-interactive", "--json") if flag not in rerun)
+    return shlex.join(rerun)
+
+
+# Model-step statuses that mean the step could not run at all. A missing
+# prerequisite maps to 3; a Hermes that is there but failed maps to 1.
+_MODEL_STEP_NOT_RUN_STATUSES = frozenset({"hermes_unavailable", "hermes_config_missing", "hermes_config_unreadable"})
+_MODEL_STEP_FAILED_STATUSES = frozenset({"hermes_command_failed"})
+
+
+def _setup_exit_code(payload: Any) -> int:
+    """0 when every step setup was asked to run ran.
+
+    1 when setup refused to start: `--interactive` was asked for with no
+    terminal on stdin, so nothing ran and nothing was written. Not 0, because
+    a caller reading only the status would be told the user's choices were
+    collected; 1 is what the other mappers return for a refused run. Not 2,
+    which `main` returns for an OmhError: the flags parsed, and the same
+    choices succeed as `--no-interactive --json`.
+
+    3 when the install steps finished (or, on a dry run, were previewed) but
+    the requested model step could not run: no `hermes` executable was found
+    (`hermes_unavailable`), or Hermes' config file does not exist
+    (`hermes_config_missing`) or exists but cannot be read
+    (`hermes_config_unreadable`), as `steps.model_activation.status`. Not 0,
+    because a wrapper reading only the status would be told the models were
+    set up or previewed when nothing was inspected; not 1, because nothing
+    OMH installed failed and the same command succeeds once the prerequisite
+    is there; not 2, which `main` returns for an OmhError. 3 is what the
+    other mappers return for a command that ran but could not inspect what it
+    needed (`_profile_isolation_exit_code`,
+    `_memory_evidence_exit_code`).
+
+    1 when Hermes is on PATH but a command the model step needs failed: it
+    exited nonzero, timed out, or answered in a shape the adapter refuses
+    (`hermes_command_failed`). That is a fault in the Hermes the user has,
+    not a prerequisite they can supply, so it is not 3.
+
+    Generic failure signals -- a refused or interrupted run, or a unit
+    carrying a failure kind -- are never success either, so this mapper
+    cannot be passed by ignoring them.
+    """
+    summary = payload if isinstance(payload, dict) else {}
+    if summary.get("refused") or summary.get("interrupted"):
+        return 1
+    units = summary.get("units")
+    if isinstance(units, list) and any(isinstance(unit, dict) and unit.get("failure_kind") for unit in units):
+        return 1
+    steps = summary.get("steps")
+    activation = steps.get("model_activation") if isinstance(steps, dict) else None
+    status = activation.get("status") if isinstance(activation, dict) else None
+    if status in _MODEL_STEP_FAILED_STATUSES:
+        return 1
+    if status in _MODEL_STEP_NOT_RUN_STATUSES:
+        return 3
+    return 0
+
+
+def _setup_should_interact(args: argparse.Namespace) -> bool:
+    if _wants_json(args) or getattr(args, "dry_run", False):
+        return False
+    if getattr(args, "interactive", False):
+        return True
+    if getattr(args, "no_interactive", False) or getattr(args, "yes", False):
+        return False
+    if (
+        args.profile
+        or getattr(args, "default_executor", None)
+        or args.profile_pack
+        or args.with_mcp
+        or getattr(args, "memory_mode", None)
+        or getattr(args, "with_menubar", False)
+        or getattr(args, "no_menubar", False)
+        or args.skip_apply
+        or getattr(args, "scope", None)
+        or getattr(args, "model_setup", False)
+    ):
+        return False
+    return _stdin_is_tty() and sys.stdout.isatty()
+
+
+# Binary name per external CLI profile, read-only PATH lookup only -- never
+# invoked. Mirrors `_COMMANDS` in `coding/executor_readiness.py` (that table
+# is module-private and also carries runtime-only profiles setup never asks
+# about); kept as its own small map so this file does not reach into another
+# module's private state for two literals that are unlikely to drift.
+_EXTERNAL_CLI_BINARY_BY_PROFILE: dict[str, str] = {"claude-code": "claude", "codex": "codex"}
+
+
+def _detect_external_cli_profiles(home: Path | None = None) -> dict[str, dict[str, object]]:
+    """Read-only, no-invoke detection for the two external coding CLIs.
+
+    A binary on PATH plus a local auth/config marker is `prepared` evidence,
+    never `observed` (READINESS_EVIDENCE_RULE in `coding/coding_delegation.py`):
+    this never runs either CLI, so "detected" means the binary resolves on
+    PATH, and the login marker only refines the printed label.
+    """
+    detected: dict[str, dict[str, object]] = {}
+    for profile in EXTERNAL_CLI_PROFILES:
+        command = _EXTERNAL_CLI_BINARY_BY_PROFILE[profile]
+        signal = auth_signal_for_profile(profile, home=home)
+        detected[profile] = {
+            "binary_present": shutil.which(command) is not None,
+            "login_marker": signal.get("login_marker", "unknown"),
+        }
+    return detected
+
+
+def _detected_external_cli_profiles() -> list[str]:
+    """External coding CLIs whose binary resolves on PATH, in profile order."""
+    detected = _detect_external_cli_profiles()
+    return [profile for profile in EXTERNAL_CLI_PROFILES if detected[profile]["binary_present"]]
+
+
+def _will_ask_maestro_delegation(args: argparse.Namespace, paths: OmhPaths) -> bool:
+    """Whether `_ask_maestro_delegation_choice` puts a question on screen.
+
+    The group returns early on this, so the wizard can count the question
+    before the first prompt is printed.
+    """
+    if hasattr(args, "_maestro_delegation_choice"):
+        return False
+    return bool(_detected_external_cli_profiles())
+
+
+def _ask_maestro_delegation_choice(args: argparse.Namespace, paths: OmhPaths, language: str) -> None:
+    """Ask, at most once, whether to set up the maestro coding-delegation lane.
+
+    Only reached from the interactive wizard (`_setup_should_interact`), so
+    `--yes`, `--no-interactive`, `--json`, and non-TTY runs never see this
+    question and never mutate anything here. No CLI is ever invoked to answer
+    it -- see `_detect_external_cli_profiles`. A "no" or no detected CLI
+    changes nothing and prints nothing persistent.
+    """
+    if not _will_ask_maestro_delegation(args, paths):
+        # A repeat call keeps the answer it already has; a first call with no
+        # detected CLI records "not asked" the way it always did.
+        if not hasattr(args, "_maestro_delegation_choice"):
+            args._maestro_delegation_choice = None
+        return
+    detected_profiles = _detected_external_cli_profiles()
+    accepted = _ask_yes_no(
+        tr(language, "maestro_delegation_prompt", clis=", ".join(detected_profiles)),
+        default=False,
+        use_color=_use_color(),
+        note=tr(language, "maestro_delegation_note"),
+        language=language,
+    )
+    args._maestro_delegation_choice = accepted
+    if not accepted:
+        return
+    seed_result = _seed_dispatch_model_preferences_result(paths, dry_run=False)
+    print(tr(language, "maestro_delegation_seeded", path=str(seed_result.get("path", ""))))
+    print(tr(language, "maestro_delegation_pointers"))
+    # The category dial is the part of the lane worth configuring during
+    # install: offer the guided walk right here. A "no" changes nothing —
+    # the built-in category table stays in effect until the operator opts in.
+    if _ask_yes_no(
+        tr(language, "maestro_category_prompt"),
+        default=False,
+        use_color=_use_color(),
+        note=tr(language, "maestro_category_note"),
+        language=language,
+    ):
+        from .coding import category_maestro_interview
+
+        category_maestro_interview(paths)
+
+
+def _stdin_is_tty() -> bool:
+    return stdin_is_tty()
+
+
+def _wizard_has_terminal() -> bool:
+    """Whether an explicit `--interactive` may run the wizard at all.
+
+    The same probe as `_stdin_is_tty`, kept as its own seam: tests that drive
+    the wizard with scripted answers open this gate without also turning on
+    the terminal-only model-chains offer that `_stdin_is_tty` decides.
+    """
+    return _stdin_is_tty()
+
+
+def _will_ask_model_chains_interview(args: argparse.Namespace, paths: OmhPaths) -> bool:
+    """Whether `_ask_model_chains_interview` puts a question on screen.
+
+    The group returns early on this, so the wizard counts the question the
+    same way the group decides to ask it.
+    """
+    if hasattr(args, "_model_chains_interview_choice"):
+        return False
+    return _stdin_is_tty()
+
+
+def _ask_model_chains_interview(args: argparse.Namespace, paths: OmhPaths, language: str) -> None:
+    """Ask, at most once, whether to walk the native lane's model chains now.
+
+    The Hermes harness is the default coding path, so its per-category chains
+    deserve the same inline offer the Maestro lane's category dial already
+    gets. Only reached from the interactive wizard (`_setup_should_interact`),
+    so `--yes`, `--no-interactive`, `--json`, `--dry-run`, and every flag in
+    that gate's list never see this question. A "no" changes nothing: step 3
+    still seeds the empty override document and the shipped chains stay in
+    effect until the operator opts in.
+
+    The offer needs a terminal of its own because the interview refuses
+    without one -- a question whose "yes" could only print a refusal is not
+    worth asking, which is the same reason the maestro question stays silent
+    when no external CLI is on PATH.
+    """
+    if not _will_ask_model_chains_interview(args, paths):
+        # A repeat call keeps the answer it already has; a first call without
+        # a terminal records "not asked" the way it always did.
+        if not hasattr(args, "_model_chains_interview_choice"):
+            args._model_chains_interview_choice = None
+        return
+    accepted = _ask_yes_no(
+        tr(language, "model_chains_interview_prompt"),
+        default=False,
+        use_color=_use_color(),
+        note=tr(language, "model_chains_interview_note"),
+        language=language,
+    )
+    args._model_chains_interview_choice = accepted
+    if not accepted:
+        return
+    from .model_chains import model_chains_interview
+
+    model_chains_interview(paths)
+
+
+# The candidate sources that are not an env-var name. Both come from the
+# bundle's detector so the interview offers exactly the rows routing already
+# counts on its own (see `provider_detection`).
+_PROVIDER_SOURCE_CONFIG = LINKED_SOURCE_CONFIG
+_PROVIDER_SOURCE_LOGIN = LINKED_SOURCE_LOGIN
+
+
+def _env_key_names(paths: OmhPaths) -> set[str]:
+    """Variable NAMES present in `$HERMES_HOME/.env` or the environment; no values.
+
+    The shell's names are offered here, where a person confirms each row;
+    routing-time detection reads `.env` alone (see `provider_detection`).
+    """
+    return set(env_key_names(paths.hermes_home, os.environ))
+
+
+def _provider_candidates(paths: OmhPaths) -> list[tuple[str, str, str]]:
+    """Provider ids worth asking about: `(id, default kind, where it was found)`.
+
+    The rows are the bundle's `detect_linked_providers` rows -- a `hermes
+    auth` login, a `providers.<id>` key or `model.provider`, an env-key NAME
+    -- so the interview offers exactly what routing already counts without
+    it, and exists to let the operator correct a kind, clear a row, or add
+    an id OMH could not place. The third element is the evidence line and
+    nothing else: `login`, `config`, or the variable NAME. It is a reason to
+    pre-tick a row, never a claim that the account works.
+    """
+    candidates: list[tuple[str, str, str]] = []
+    for row in detect_linked_providers(paths.hermes_home, env_names=_env_key_names(paths)):
+        source = row["evidence"] if row["source"] == LINKED_SOURCE_ENV else row["source"]
+        candidates.append((row["id"], row["kind"], source))
+    return candidates
+
+
+# Display names for the multi-select rows. Plain vendor names the operator
+# recognizes; the recorded document still holds the entitlement vocabulary
+# token, never these strings. Vendor names stay untranslated because they are
+# proper nouns -- the localized half of a row is its description line.
+_PROVIDER_DISPLAY_LABELS: dict[str, str] = {
+    "anthropic": "Anthropic (Claude)",
+    "apitopia": "Apitopia",
+    "ccapi": "CCAPI",
+    "deepseek": "DeepSeek",
+    "gemini": "Google Gemini API",
+    "google": "Google AI Studio",
+    "kimi-coding": "Moonshot (Kimi)",
+    "kimi-coding-cn": "Moonshot (Kimi, China)",
+    "openai": "OpenAI (GPT)",
+    "openai-api": "OpenAI API (GPT)",
+    "openai-codex": "OpenAI Codex",
+    "opencode": "OpenCode",
+    "opencode-zen": "OpenCode Zen",
+    "opencode-go": "OpenCode Go",
+    "opencode-free": "OpenCode Free",
+    "openrouter": "OpenRouter",
+    "qwen-oauth": "Qwen",
+    "alibaba": "Alibaba Cloud (Qwen)",
+    "alibaba-coding-plan": "Alibaba Cloud Coding Plan",
+    "xai": "xAI (Grok)",
+    "xai-oauth": "xAI Grok OAuth",
+    "zai": "Z.ai (GLM)",
+    "opengateway": "OpenGateway",
+    "nous": "Nous Portal",
+    "copilot": "GitHub Copilot",
+}
+# OMH's own gateway. Its kind is `gateway`, not a vendor family, so it is
+# absent from PROVIDER_FAMILY_VOCABULARY (that tuple mirrors the catalog's
+# vendor families and is parity-gated elsewhere) -- the row is added here, at
+# the presentation layer, instead. It reaches the list on its own even when
+# OPENGATEWAY_API_KEY is not set yet: offering it only once the key exists is
+# a chicken-and-egg that hides the service from everyone who has it but has
+# not configured it. The id matches `_ENV_KEY_PROVIDER_HINTS` and
+# `_PROVIDER_ENV` in `coding/hermes_child_dispatch.py`.
+_OPENGATEWAY_PROVIDER_ID = "opengateway"
+# The "leave everything as it is" row. Not a provider id -- `is_provider_id_token`
+# rejects a leading underscore, so this can never collide with one, and it is
+# never written to the document.
+_PROVIDER_SKIP_CHOICE = "__skip__"
+# The "a provider not listed here" row. Same guarantees as the skip row: not a
+# provider id, never pre-ticked, never written. Ticking it is what opens the
+# add-by-name prompt, so Enter on the list ends the step unless it is ticked.
+_PROVIDER_OTHER_CHOICE = "__other__"
+
+
+def _provider_entitlement_options(
+    candidates: list[tuple[str, str, str]],
+    previous_providers: dict[str, str],
+    language: str,
+    previous_excluded: Iterable[str] = (),
+) -> tuple[list[dict[str, str]], list[str], dict[str, str]]:
+    """Rows for the provider multi-select: `(options, pre-ticked ids, kind per id)`.
+
+    Order is found-here first, then whatever the operator recorded last time,
+    then the rest of the family vocabulary, then OpenGateway, then the
+    "other provider" row, then the skip row -- so the rows that matter lead
+    and the always-present rows sit where the eye ends up. A pre-ticked row is a DEFAULT, not a finding:
+    EXECUTOR_AUTH_SIGNALS_CLAIM_BOUNDARY holds here too -- a config key or a
+    variable name is not an account, a tier, or a quota. Every pre-ticked row
+    stays clearable, and only what the operator leaves ticked is written, so
+    the document keeps meaning "what the operator said they hold".
+
+    Pre-ticking: everything found on this machine, plus whatever the operator
+    recorded last time, minus the found rows they cleared last time
+    (`excluded_providers`). A found row is what routing already counts on
+    its own, so it arrives ticked even on a re-run; clearing it is what
+    writes the exclusion that makes routing stop. The skip and "other" rows
+    are never pre-ticked -- "leave everything as it is" has to be chosen,
+    never defaulted into, and a pre-ticked "other" would bring back the
+    second prompt it exists to make optional.
+    """
+    from ..plugin_bundle.omh.hermes_delegation import (
+        MULTI_VENDOR_PROVIDER_KINDS,
+        PROVIDER_FAMILY_VOCABULARY,
+        PROVIDER_KIND_GATEWAY,
+    )
+
+    kinds: dict[str, str] = {}
+    descriptions: dict[str, str] = {}
+    order: list[str] = []
+    for provider_id, hinted_kind, source in candidates:
+        # A key name the operator once recorded under the family's own id
+        # (`openai` for OPENAI_API_KEY) is one account, not a second row.
+        is_env_row = source not in (_PROVIDER_SOURCE_CONFIG, _PROVIDER_SOURCE_LOGIN)
+        if (
+            provider_id not in previous_providers
+            and is_env_row
+            and env_row_is_covered({"source": LINKED_SOURCE_ENV, "kind": hinted_kind}, previous_providers)
+        ):
+            continue
+        order.append(provider_id)
+        kinds[provider_id] = previous_providers.get(provider_id, hinted_kind)
+        if source == _PROVIDER_SOURCE_CONFIG:
+            descriptions[provider_id] = tr(language, "provider_detected_config")
+        elif source == _PROVIDER_SOURCE_LOGIN:
+            descriptions[provider_id] = tr(language, "provider_detected_login")
+        else:
+            descriptions[provider_id] = tr(language, "provider_detected_env", name=source)
+    for provider_id in sorted(previous_providers):
+        if provider_id in kinds:
+            continue
+        order.append(provider_id)
+        kinds[provider_id] = previous_providers[provider_id]
+        descriptions[provider_id] = tr(language, "provider_recorded_before")
+    for family in PROVIDER_FAMILY_VOCABULARY:
+        if family in kinds:
+            continue
+        order.append(family)
+        kinds[family] = family
+        descriptions[family] = tr(language, "provider_kind_relay") if family in MULTI_VENDOR_PROVIDER_KINDS else ""
+    if _OPENGATEWAY_PROVIDER_ID not in kinds:
+        order.append(_OPENGATEWAY_PROVIDER_ID)
+        kinds[_OPENGATEWAY_PROVIDER_ID] = PROVIDER_KIND_GATEWAY
+        descriptions[_OPENGATEWAY_PROVIDER_ID] = tr(language, "provider_opengateway_desc")
+    order.append(_PROVIDER_OTHER_CHOICE)
+    descriptions[_PROVIDER_OTHER_CHOICE] = tr(language, "provider_other_desc")
+    order.append(_PROVIDER_SKIP_CHOICE)
+    descriptions[_PROVIDER_SKIP_CHOICE] = tr(language, "provider_skip_desc")
+    labels = {
+        _PROVIDER_OTHER_CHOICE: tr(language, "provider_other_label"),
+        _PROVIDER_SKIP_CHOICE: tr(language, "provider_skip_label"),
+    }
+    options = [
+        {
+            "choice": str(index + 1),
+            "value": provider_id,
+            "label": labels.get(provider_id) or _PROVIDER_DISPLAY_LABELS.get(provider_id, provider_id),
+            "description": descriptions[provider_id],
+        }
+        for index, provider_id in enumerate(order)
+    ]
+    detected_ids = {provider_id for provider_id, _kind, _source in candidates}
+    preselect = set(previous_providers) | (detected_ids - set(previous_excluded))
+    preselect -= {_PROVIDER_OTHER_CHOICE, _PROVIDER_SKIP_CHOICE}
+    return options, [provider_id for provider_id in order if provider_id in preselect], kinds
+
+
+def _detected_subscription_cli_profiles() -> list[str]:
+    """Subscription CLIs whose binary resolves on PATH, in profile order."""
+    from ..plugin_bundle.omh.hermes_delegation import SUBSCRIPTION_CLI_PROFILES
+
+    detected = _detect_external_cli_profiles()
+    return [
+        profile
+        for profile in SUBSCRIPTION_CLI_PROFILES
+        if detected.get(profile, {}).get("binary_present")
+    ]
+
+
+def _will_ask_provider_entitlements(args: argparse.Namespace, paths: OmhPaths) -> bool:
+    """Whether `_ask_provider_entitlements` puts a question on screen.
+
+    Nothing found and no subscription CLI on PATH leaves the operator with an
+    empty list and a yes/no about nothing, so the group says nothing at all --
+    and this is the same read, called by the group for its own early return.
+    """
+    if hasattr(args, "_provider_entitlements"):
+        return False
+    return bool(_provider_candidates(paths) or _detected_subscription_cli_profiles())
+
+
+def _ask_provider_entitlements(args: argparse.Namespace, paths: OmhPaths, language: str) -> None:
+    """Ask, at most once, which providers and subscription CLIs this machine holds.
+
+    One list, not a question per candidate: the operator ticks what they can
+    reach (rows found on this machine pre-ticked and clearable), and then the
+    one subscription CLI that exists is a yes/no. A pre-ticked row is a
+    default, never a finding -- what is written is still only what the
+    operator left ticked.
+
+    The list's last row is "leave everything as it is", and choosing it writes
+    NOTHING: no entitlement document, no dispatch-model seed. An earlier
+    record stays, the linked providers keep counting on their own, and the
+    machine behaves exactly as it does for someone who never answered --
+    which is the seeded chain order only when nothing is linked either. It
+    is exclusive -- ticking it beside a provider is contradictory, so the
+    prompt refuses and asks again rather than guessing which half the
+    operator meant. That row replaced a separate
+    gate question ("Record which providers ... ?") whose "no" did precisely
+    this; keeping both would have been two ways to say the same thing, and the
+    one inside the list is the one the operator can see next to what it
+    declines.
+
+    The row just above it, "other provider", is the only way into the
+    add-by-name prompt. That prompt used to follow the list unconditionally,
+    so Enter on the list looked like the end of the step while a second,
+    easy-to-miss prompt still waited for its own Enter. Now Enter on the list
+    ends the step unless the operator ticked "other". Ticking it beside skip is
+    refused like any other row beside skip. Picking it never unticks a row: in
+    the typed menu an answer of only its number (`17`) keeps every pre-ticked
+    row, and in the keyboard menu `1` `7` reaches row 17.
+
+    Every account is different, and the shipped chains cannot know which of
+    their entries this operator can actually reach. The answer is recorded as
+    `~/.omh/routing/providers.json` (provider id -> kind, plus the confirmed
+    subscription CLIs); `effective_mixture_category_chains` then reorders each
+    chain so the reachable entries lead, without dropping anything. Only the
+    interactive wizard reaches this: `--yes`, `--no-interactive`, `--json`,
+    and runs without `--interactive` on a non-TTY ask nothing and write
+    nothing. Detection is read-only (`hermes auth` login ids, config keys,
+    env-key names, PATH presence); no provider or CLI is invoked. Routing
+    counts the same linked providers on its own
+    (`effective_provider_entitlements`); the record exists to correct a
+    kind, clear a row, add an id OMH could not place, and name a
+    subscription CLI.
+
+    A confirmed Claude Code subscription is a Maestro-lane entitlement: the
+    Hermes lane cannot spend it (Hermes needs an API provider), so the only
+    routing consequence is the Claude Code `--model` preference, seeded to the
+    Claude chain head when the operator has not set one.
+    """
+    if not _will_ask_provider_entitlements(args, paths):
+        # A repeat call keeps the answer it already has; a first call with
+        # nothing to offer records "not asked" the way it always did.
+        if not hasattr(args, "_provider_entitlements"):
+            args._provider_entitlements = None
+        return
+    from ..plugin_bundle.omh.hermes_delegation import (
+        MULTI_VENDOR_PROVIDER_KINDS,
+        PROVIDER_ENTITLEMENTS_SCHEMA_VERSION,
+        PROVIDER_FAMILY_VOCABULARY,
+        PROVIDER_KIND_GATEWAY,
+        PROVIDER_KIND_UNKNOWN,
+        is_provider_id_token,
+        load_provider_entitlements,
+    )
+
+    existing, existing_status = load_provider_entitlements(paths.omh_home)
+    candidates = _provider_candidates(paths)
+    detected_profiles = _detected_subscription_cli_profiles()
+    use_color = _use_color()
+    if existing_status.startswith("invalid:"):
+        print(_color(tr(language, "provider_entitlements_invalid", status=existing_status), "33", use_color))
+
+    previous_providers = dict(existing.get("providers", {})) if existing else {}
+    previous_clis = list(existing.get("subscription_clis", [])) if existing else []
+    previous_excluded = list(existing.get("excluded_providers", [])) if existing else []
+    kinds = (PROVIDER_KIND_GATEWAY, *PROVIDER_FAMILY_VOCABULARY, PROVIDER_KIND_UNKNOWN)
+    kind_options = [
+        {
+            "choice": str(index + 1),
+            "value": kind,
+            "label": kind,
+            "description": tr(language, "provider_kind_relay") if kind in MULTI_VENDOR_PROVIDER_KINDS else "",
+        }
+        for index, kind in enumerate(kinds)
+    ]
+
+    def ask_kind(provider_id: str, default_kind: str) -> str:
+        default_choice = next(option["choice"] for option in kind_options if option["value"] == default_kind)
+        return _ask_single_choice(
+            tr(language, "provider_kind_title", provider=provider_id),
+            [tr(language, "provider_kind_intro")],
+            kind_options,
+            default_choice=default_choice,
+            use_color=use_color,
+            language=language,
+        )
+
+    # One list instead of a yes/no plus a sixteen-option kind menu per
+    # candidate: the kind a row records is the one detection or the previous
+    # answer already implies, and the kind menu stays only on the add loop,
+    # where the operator typed an id OMH knows nothing about.
+    options, preselected, kind_by_id = _provider_entitlement_options(
+        candidates, previous_providers, language, previous_excluded
+    )
+    chosen = _ask_multi_choice(
+        tr(language, "provider_select_title"),
+        [
+            tr(language, "provider_select_intro_1"),
+            tr(language, "provider_select_intro_2"),
+            tr(language, "provider_entitlements_note"),
+        ],
+        options,
+        selected=preselected,
+        exclusive={_PROVIDER_SKIP_CHOICE},
+        # Typing only the "other" row's number asks for a name. It must not
+        # untick the found rows, which would record them as excluded.
+        additive={_PROVIDER_OTHER_CHOICE},
+        use_color=use_color,
+        language=language,
+    )
+    if _PROVIDER_SKIP_CHOICE in chosen:
+        # "Leave everything as it is": no document, no seed, no further
+        # question. Same contract as the Maestro category question's "no" --
+        # nothing the operator did not already have takes effect. The linked
+        # providers routing counts on its own keep counting.
+        args._provider_entitlements = None
+        print(tr(language, "provider_entitlements_skipped"))
+        return
+    providers = {
+        provider_id: kind_by_id[provider_id] for provider_id in chosen if provider_id != _PROVIDER_OTHER_CHOICE
+    }
+    # Providers Hermes reaches some other way (a builtin with a key OMH does
+    # not recognize, a gateway named only in a route) can be added by name,
+    # once the operator ticked the "other provider" row asking for that.
+    while _PROVIDER_OTHER_CHOICE in chosen:
+        extra = _ask(tr(language, "provider_add_prompt"), default="", use_color=use_color).strip()
+        if not extra:
+            break
+        # Two different things go wrong here and the operator's next move
+        # differs: a duplicate is already in the document and needs nothing,
+        # a malformed id has to be retyped. One message that ORs the reasons
+        # told them neither.
+        if extra in providers:
+            print(_color(tr(language, "provider_add_duplicate", provider=extra), "31", use_color))
+            continue
+        if not is_provider_id_token(extra):
+            print(_color(tr(language, "provider_add_rejected", provider=extra), "31", use_color))
+            continue
+        providers[extra] = ask_kind(extra, previous_providers.get(extra, PROVIDER_KIND_GATEWAY))
+    subscription_clis: list[str] = []
+    for profile in detected_profiles:
+        if _ask_yes_no(
+            tr(language, "subscription_cli_prompt", cli=profile),
+            default=profile in previous_clis or not previous_clis,
+            use_color=use_color,
+            note=tr(language, "subscription_cli_note", cli=profile),
+            language=language,
+        ):
+            subscription_clis.append(profile)
+
+    document: dict[str, object] = {
+        "schema_version": PROVIDER_ENTITLEMENTS_SCHEMA_VERSION,
+        "providers": providers,
+        "subscription_clis": subscription_clis,
+    }
+    # A found row the operator cleared is linked to Hermes and would count
+    # on its own; recording the clearing is what makes routing stop counting
+    # it. Written only when there is one, so a document with nothing cleared
+    # keeps the bytes it always had.
+    excluded = sorted(provider_id for provider_id, _kind, _source in candidates if provider_id not in providers)
+    if excluded:
+        document["excluded_providers"] = excluded
+    # The same writer `omh model-chains provider set` uses: one producer for
+    # this document, validated through the reader's own rules, so the
+    # interview and the scriptable path cannot drift.
+    from .provider_entitlements import write_provider_entitlements
+
+    path = write_provider_entitlements(paths.omh_home, document)
+    args._provider_entitlements = document
+    print(tr(language, "provider_entitlements_recorded", path=str(path)))
+    if "claude-code" in subscription_clis:
+        seed = _seed_claude_code_dispatch_head(paths)
+        status = str(seed.get("status", ""))
+        if status == "seeded":
+            print(tr(language, "claude_code_dispatch_seeded", model=str(seed.get("model", "")), path=str(seed.get("path", ""))))
+        elif status == "already_present":
+            print(tr(language, "claude_code_dispatch_kept", path=str(seed.get("path", ""))))
+        else:
+            print(_color(tr(language, "claude_code_dispatch_unreadable", path=str(seed.get("path", ""))), "33", use_color))
+
+
+def _seed_claude_code_dispatch_head(paths: OmhPaths) -> dict[str, object]:
+    """Point the Claude Code profile's `--model` at the Claude chain head, once.
+
+    Only a confirmed Claude Code subscription reaches here. An existing
+    `claude-code` entry, whatever its value, is never overwritten; an existing
+    file without one gains the entry. A file the dispatch reader would not
+    accept (wrong or missing `schema_version`, `profiles` not an object,
+    unparsable) is left alone and reported as `unreadable`, so the seed is
+    never a write the reader ignores. The value is the head of the Maestro
+    lane's Claude chain, so it moves with the shipped chain rather than being
+    a second place to maintain. Since 2026-10-13 that head is the pinned
+    `claude-opus-5-5` id (owner decision), not an alias: a dispatch preference
+    has no fallback walk, so an account that does not serve the pinned id
+    sees the CLI's rejection and edits the entry (to `opus`, the chain's
+    always-resolving tail).
+    """
+    from ..coding.model_routing import CLAUDE_FRONTIER_CHAIN_MODELS
+
+    path = dispatch_model_preferences_path(paths.omh_home)
+    payload: dict[str, object] = {"path": str(path), "model": CLAUDE_FRONTIER_CHAIN_MODELS[0]}
+    document: dict[str, object] = {
+        "schema_version": DISPATCH_MODEL_PREFERENCE_SCHEMA_VERSION,
+        "profiles": {},
+    }
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            payload["status"] = "unreadable"
+            return payload
+        if (
+            not isinstance(loaded, dict)
+            or loaded.get("schema_version") != DISPATCH_MODEL_PREFERENCE_SCHEMA_VERSION
+            or not isinstance(loaded.get("profiles"), dict)
+        ):
+            payload["status"] = "unreadable"
+            return payload
+        document = loaded
+    profiles = document["profiles"]
+    assert isinstance(profiles, dict)
+    if str(profiles.get("claude-code", "") or "").strip():
+        payload["status"] = "already_present"
+        return payload
+    profiles["claude-code"] = CLAUDE_FRONTIER_CHAIN_MODELS[0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    payload["status"] = "seeded"
+    return payload
+
+
+def _seed_dispatch_model_preferences_result(paths: OmhPaths, *, dry_run: bool) -> dict[str, object]:
+    """Seed the optional per-owner dispatch-model preference document, if absent.
+
+    This document is otherwise operator-edited only -- nothing else seeds or
+    writes it automatically. An explicit "yes" to the maestro-delegation setup
+    question is the only caller, and only when the file does not already
+    exist; an existing file, however it got there, is never overwritten.
+    """
+    path = dispatch_model_preferences_path(paths.omh_home)
+    payload: dict[str, object] = {
+        "schema_version": "dispatch_model_preference_seed/v1",
+        "path": str(path),
+        "dry_run": bool(dry_run),
+    }
+    if path.exists():
+        payload["status"] = "already_present"
+        return payload
+    if dry_run:
+        payload["status"] = "dry_run"
+        return payload
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {
+        "schema_version": DISPATCH_MODEL_PREFERENCE_SCHEMA_VERSION,
+        "profiles": {},
+    }
+    atomic_write_text(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    payload["status"] = "seeded"
+    return payload
+
+
+def _print_model_preview_review(payload: dict[str, object], *, language: str) -> None:
+    print_model_preview_review(
+        payload,
+        language=language,
+        use_color=_use_color,
+        color=_color,
+    )
+
+
+def _model_setup_flow_dependencies(paths: OmhPaths) -> ModelSetupFlowDependencies:
+    # Every `hermes` spawn on this path (inspect, apply, and the rollback and
+    # re-inspection inside apply) acts on the home setup targets -- the
+    # `--hermes-home` or `--scope project` home -- not whatever HERMES_HOME or
+    # ~/.hermes the calling shell points at.
+    hermes_env = {**os.environ, "HERMES_HOME": str(paths.hermes_home)}
+    return ModelSetupFlowDependencies(
+        discover_local_models=discover_local_models,
+        inspect_hermes_model_config=lambda: inspect_hermes_model_config(env=hermes_env),
+        preview_hermes_model_config=preview_hermes_model_config,
+        apply_hermes_model_config=lambda preview, **kwargs: apply_hermes_model_config(
+            preview, env=hermes_env, **kwargs
+        ),
+        resolve_model_recommendation=resolve_model_recommendation,
+        ask_yes_no=_ask_yes_no,
+        ask=_ask,
+        use_color=_use_color,
+        print_model_preview_review=_print_model_preview_review,
+    )
+
+
+def _setup_should_attempt_menubar(args: argparse.Namespace) -> bool:
+    if getattr(args, "no_menubar", False):
+        return False
+    if getattr(args, "with_menubar", False):
+        return True
+    if os.environ.get("OMH_MENUBAR", "1") == "0":
+        return False
+    if _wants_json(args) or getattr(args, "dry_run", False):
+        return False
+    if _setup_scope(args) != "user":
+        return False
+    if _setup_paths_were_explicit(args):
+        return False
+    return sys.platform == "darwin"
+
+
+def _uninstall_should_remove_menubar(args: argparse.Namespace) -> bool:
+    return _setup_scope(args) == "user" and not _setup_paths_were_explicit(args)
+
+
+def _resolve_language(args: argparse.Namespace) -> str:
+    raw = getattr(args, "language", None)
+    try:
+        return normalize_language(raw) if raw else language_from_env()
+    except ValueError as exc:
+        raise OmhError(str(exc)) from exc
+
+
+def _setup_language(args: argparse.Namespace) -> str:
+    # English-first product surface: localized output is explicit opt-in via
+    # --language or OMH_LANG, never inferred from the OS locale.
+    if _language_was_explicit(args):
+        return _resolve_language(args)
+    return "en"
+
+
+def _language_was_explicit(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "language", None) or os.environ.get("OMH_LANG") or os.environ.get("OMH_LANGUAGE"))
+
+
+def _setup_paths_were_explicit(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "omh_home", None) or getattr(args, "hermes_home", None))
+
+
+def _ask_setup_scope(*, use_color: bool, language: str) -> str:
+    return _ask_single_choice(
+        tr(language, "scope_title"),
+        [
+            tr(language, "scope_intro_1"),
+            tr(language, "scope_intro_2"),
+        ],
+        [
+            {
+                "choice": "1",
+                "value": "user",
+                "label": tr(language, "scope_user_label"),
+                "description": tr(language, "scope_user_desc"),
+            },
+            {
+                "choice": "2",
+                "value": "project",
+                "label": tr(language, "scope_project_label"),
+                "description": tr(language, "scope_project_desc"),
+            },
+        ],
+        default_choice="1",
+        use_color=use_color,
+        language=language,
+    )
+
+
+class _WizardQuestion(NamedTuple):
+    """One question group of the interactive setup wizard.
+
+    `will_ask` is the predicate the group itself returns early on, so the
+    heading the operator reads is counted from the groups that actually speak
+    instead of being declared beside them.
+    """
+
+    key: str
+    label_key: str
+    will_ask: Callable[[argparse.Namespace, OmhPaths], bool]
+    ask: Callable[[argparse.Namespace, OmhPaths, str], None]
+
+
+def _wizard_question_groups() -> tuple[_WizardQuestion, ...]:
+    """The wizard's question groups, in the order it asks them.
+
+    Built at call time rather than as a module constant so the rows can name
+    functions defined further down this file.
+    """
+    return (
+        _WizardQuestion(
+            "maestro_delegation",
+            "wizard_step_maestro_delegation",
+            _will_ask_maestro_delegation,
+            _ask_maestro_delegation_choice,
+        ),
+        _WizardQuestion(
+            "provider_entitlements",
+            "wizard_step_provider_entitlements",
+            _will_ask_provider_entitlements,
+            _ask_provider_entitlements,
+        ),
+        # Last of the prompting block that touches routing: the entitlement
+        # answers are what reorder the chains, so the operator meets the chain
+        # editor right after the explanation of how chains get shaped on this
+        # machine. Ordering against `_seed_model_chains_result` (step 3) is
+        # non-destructive either way -- the seed early-returns
+        # `already_present` when the interview has just written the document,
+        # and seeds it empty when nothing changed.
+        _WizardQuestion(
+            "model_chains",
+            "wizard_step_model_chains",
+            _will_ask_model_chains_interview,
+            _ask_model_chains_interview,
+        ),
+        _WizardQuestion(
+            "mcp_host",
+            "wizard_step_mcp_host",
+            _will_ask_mcp_host,
+            _ask_mcp_host_choice,
+        ),
+        # Last on purpose. Every group above configures how the assistant
+        # behaves; this one configures how the install maintains itself, and
+        # the apply phase right after it is the answer's first reader.
+        _WizardQuestion(
+            "update_check",
+            "wizard_step_update_check",
+            _will_ask_update_check,
+            _ask_update_check_choice,
+        ),
+    )
+
+
+def _planned_wizard_questions(args: argparse.Namespace, paths: OmhPaths) -> list[_WizardQuestion]:
+    """The groups that will ask something, decided before the first prompt.
+
+    Every predicate reads only argparse flags, the Hermes config file, PATH,
+    whether stdin is a terminal, and -- for `update_check` -- the OMH home's
+    own setup profile. No group's answer or side effect feeds a later group's
+    predicate: the groups that write, write under `omh_home`, and the one
+    predicate that reads from there reads a key
+    (`setup-profile.json:update_check`) that only `write_update_check_policy`
+    ever sets, which no earlier group calls. So the total printed in `[k/n]`
+    is the total the operator ends up answering, and the numbering stays
+    contiguous.
+    """
+    return [question for question in _wizard_question_groups() if question.will_ask(args, paths)]
+
+
+def _run_setup_wizard(args: argparse.Namespace, paths, language: str) -> None:
+    use_color = _use_color()
+    explicit_profile_packs = list(getattr(args, "profile_pack", []) or [])
+    print(_color(tr(language, "setup_title"), "1;36", use_color))
+    print(tr(language, "wizard_subtitle"))
+    print(f"{tr(language, 'hermes_home')}: {_color(str(paths.hermes_home), '36', use_color)}")
+    if paths.hermes_config_path.exists():
+        config_text = read_config(paths.hermes_config_path)
+        registered = external_dir_registered(external_dirs(config_text), paths.skills_dir)
+        status = tr(language, "status_already_registered") if registered else tr(language, "status_will_register")
+        print(f"{tr(language, 'hermes_config')}: {_color(str(paths.hermes_config_path), '36', use_color)} ({status})")
+    else:
+        print(f"{tr(language, 'hermes_config')}: {_color(str(paths.hermes_config_path), '36', use_color)} ({tr(language, 'status_will_create')})")
+    print(f"{tr(language, 'managed_skills')}: {_color(str(paths.skills_dir), '36', use_color)}")
+    # The same `[k/n]` framing the apply phase uses, over the groups that will
+    # actually ask something on this machine, so a question phase that skips
+    # two groups says so instead of counting questions nobody sees.
+    questions = _planned_wizard_questions(args, paths)
+    numbering = {question.key: index for index, question in enumerate(questions, start=1)}
+    progress = _HumanProgress(enabled=True, use_color=use_color)
+    for question in _wizard_question_groups():
+        index = numbering.get(question.key)
+        if index is not None:
+            # Same renderer as the apply phase, so the line is identical;
+            # `pause=False` because what follows is a prompt that waits.
+            progress.step(index, len(questions), tr(language, question.label_key), pause=False)
+        # Every group is still called, heading or not: a group that asks
+        # nothing records "not asked" on the namespace the way it always did.
+        question.ask(args, paths, language)
+
+    # This default used to sit between the chain question and the MCP one,
+    # which is now inside the loop. It is a recorded default rather than
+    # something the operator was asked, and no question group reads
+    # `args.profile`, so the two are order-independent.
+    if not args.profile and not getattr(args, "default_executor", None):
+        # No upfront coding-owner question: safety-first records "choose" so
+        # Hermes asks at the first coding request instead of setup time.
+        args.profile = ["safety-first"]
+    args.profile_pack = explicit_profile_packs
+    print("")
+
+
+def _star_github_repo(*, language: str, use_color: bool, dry_run: bool = False) -> None:
+    if dry_run:
+        print(_color(tr(language, "github_star_dry_run"), "33", use_color))
+        print("")
+        return
+    result = _try_star_github_repo()
+    if result["ok"]:
+        print(_color(tr(language, "github_star_thanks"), "1;32", use_color))
+    else:
+        reason = str(result.get("reason") or "GitHub star was not recorded")
+        print(_color(tr(language, "github_star_failed", reason=reason), "33", use_color))
+        print(tr(language, "github_star_continue"))
+    print("")
+
+
+def _try_star_github_repo() -> dict[str, object]:
+    command = ["gh", "api", "-X", "PUT", "/user/starred/rlaope/oh-my-hermes"]
+    try:
+        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+    except FileNotFoundError:
+        return {"ok": False, "reason": "GitHub CLI `gh` is not installed or not on PATH."}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": "GitHub CLI star command timed out."}
+    except OSError as exc:
+        return {"ok": False, "reason": f"GitHub CLI could not run: {exc}"}
+    if completed.returncode == 0:
+        return {"ok": True, "reason": "starred_or_already_starred"}
+    detail = (completed.stderr or completed.stdout or "gh repo star failed").strip()
+    return {"ok": False, "reason": detail}
+
+
+def _ask_mcp_host(*, use_color: bool, language: str, default_host: str = "generic") -> str:
+    options = [
+        {"choice": "1", "value": "generic", "label": "Generic MCP", "description": tr(language, "mcp_host_generic_desc")},
+        {"choice": "2", "value": "codex", "label": "Codex", "description": tr(language, "mcp_host_codex_desc")},
+        {"choice": "3", "value": "claude-code", "label": "Claude Code", "description": tr(language, "mcp_host_claude_desc")},
+        {"choice": "4", "value": "opencode", "label": "OpenCode", "description": tr(language, "mcp_host_opencode_desc")},
+        {"choice": "5", "value": "cursor", "label": "Cursor", "description": tr(language, "mcp_host_cursor_desc")},
+    ]
+    default_choice = next((option["choice"] for option in options if option["value"] == default_host), "1")
+    return _ask_single_choice(
+        tr(language, "mcp_host_title"),
+        [tr(language, "mcp_host_intro")],
+        options,
+        default_choice=default_choice,
+        use_color=use_color,
+        language=language,
+    )
+
+
+def _will_ask_mcp_host(args: argparse.Namespace, paths: OmhPaths) -> bool:
+    """Whether `_ask_mcp_host_choice` puts a question on screen.
+
+    `--with-mcp` without an explicit `--mcp-host` is the only combination
+    that asks, and neither flag is touched by an earlier answer.
+    """
+    if not getattr(args, "with_mcp", False):
+        return False
+    return str(getattr(args, "mcp_host", "generic") or "generic") == "generic"
+
+
+def _ask_mcp_host_choice(args: argparse.Namespace, paths: OmhPaths, language: str) -> None:
+    if not _will_ask_mcp_host(args, paths):
+        return
+    args.mcp_host = _ask_mcp_host(
+        use_color=_use_color(),
+        language=language,
+        default_host=_default_mcp_host_for_executor(str(getattr(args, "default_executor", "") or "")),
+    )
+
+
+def _default_mcp_host_for_executor(executor: str) -> str:
+    normalized = executor.strip().lower()
+    if normalized == "codex":
+        return "codex"
+    if normalized == "claude-code":
+        return "claude-code"
+    return "generic"
+
+
+def _will_ask_update_check(args: argparse.Namespace, paths: OmhPaths) -> bool:
+    """Whether `_ask_update_check_choice` puts a question on screen.
+
+    Asked at most once per OMH home. What settles it is that a mode was
+    recorded, not which one, so choosing the shipped `off` closes the question
+    exactly as choosing `notify` does -- the answer is the record, not the
+    deviation from the default.
+
+    `read_update_check_policy` cannot express that. It normalizes an absent
+    record to `off`, so "never asked" and "answered off" come back identical
+    and a predicate reading it would re-ask on every interactive run forever.
+    `update_check_policy_recorded` reads the stored record instead, which is
+    the only place the two differ.
+    """
+    if hasattr(args, "_update_check_mode"):
+        return False
+    from ..maintenance.update_check import update_check_policy_recorded
+
+    return not update_check_policy_recorded(paths)
+
+
+def _ask_update_check_choice(args: argparse.Namespace, paths: OmhPaths, language: str) -> None:
+    """Ask, at most once, whether OMH should watch for its own updates at launch.
+
+    The capability already shipped as `omh update-check set --mode
+    off|notify|auto`, default `off`, run from the launch path in `main.py`.
+    Nothing here changes that default: the shipped value stays `off`, so
+    `--yes`, `--json`, `--no-interactive`, and every run without a terminal
+    install exactly what they install today and write nothing. This question
+    exists because the only way to find the capability was to already know the
+    command's name.
+
+    The pre-selected option is `DEFAULT_UPDATE_CHECK_MODE`, read from the
+    module that defines the shipped default rather than written here as a
+    literal, so Enter through the wizard lands where a `--yes` install lands
+    and cannot drift away from it. Enter must not be how a machine starts
+    making network requests.
+
+    Both other modes contact GitHub at most once per interval (24 hours), and
+    `auto` additionally runs `omh update` when `main` is ahead; the option
+    descriptions say so in those terms. Whatever is chosen is written through
+    `write_update_check_policy` into `$OMH_HOME/setup-profile.json`, which is
+    inside OMH's own home and therefore reversed by the same `omh uninstall`
+    that removes the home.
+
+    Deliberately last in the wizard: every other group configures how the
+    assistant behaves, while this one configures how the install maintains
+    itself, and the apply phase right after it is the first reader of the
+    answer. `_release_source_commit_for_state` returns early while the mode
+    is `off`, so an opt-in recorded here is already in effect for this same
+    run's cursor anchoring rather than waiting for the next command.
+    """
+    if not _will_ask_update_check(args, paths):
+        # A repeat call keeps the answer it already has; a first call over an
+        # answered home records "not asked" the way the other groups do.
+        if not hasattr(args, "_update_check_mode"):
+            args._update_check_mode = None
+        return
+    from ..maintenance.update_check import (
+        DEFAULT_UPDATE_CHECK_MODE,
+        UPDATE_CHECK_MODES,
+        write_update_check_policy,
+    )
+
+    # Rows derived from the mode vocabulary, not restated beside it: a mode
+    # added there and not described here raises a missing-message KeyError at
+    # ask time instead of quietly never being offered.
+    options = [
+        {
+            "choice": str(index + 1),
+            "value": mode,
+            "label": tr(language, f"update_check_mode_{mode}"),
+            "description": tr(language, f"update_check_mode_{mode}_desc"),
+        }
+        for index, mode in enumerate(UPDATE_CHECK_MODES)
+    ]
+    default_choice = next(option["choice"] for option in options if option["value"] == DEFAULT_UPDATE_CHECK_MODE)
+    mode = _ask_single_choice(
+        tr(language, "update_check_title"),
+        [tr(language, "update_check_intro")],
+        options,
+        default_choice=default_choice,
+        use_color=_use_color(),
+        language=language,
+    )
+    args._update_check_mode = mode
+    write_update_check_policy(paths, mode=mode)
+    print(tr(language, "update_check_recorded", mode=mode))
+
+
+def _ask_yes_no(prompt: str, *, default: bool, use_color: bool, note: str = "", language: str = "en") -> bool:
+    if _keyboard_menu_available():
+        value = _ask_single_choice(
+            prompt,
+            [note] if note else [],
+            [
+                {"choice": "1", "value": "yes", "label": tr(language, "yes"), "description": tr(language, "yes_desc")},
+                {"choice": "2", "value": "no", "label": tr(language, "no"), "description": tr(language, "no_desc")},
+            ],
+            default_choice="1" if default else "2",
+            use_color=use_color,
+            language=language,
+        )
+        return value == "yes"
+    suffix = "Y/n" if default else "y/N"
+    if note:
+        print(f"  {note}")
+    while True:
+        value = _ask(prompt, default=suffix, use_color=use_color).strip().lower()
+        if not value or value == suffix.lower():
+            return default
+        if value in {"y", "yes", "1", "예", "네", "はい", "是"}:
+            return True
+        if value in {"n", "no", "2", "아니요", "いいえ", "否"}:
+            return False
+        print(_color(tr(language, "invalid_yes_no"), "31", use_color))
+
+
+def _ask_single_choice(
+    title: str,
+    intro_lines: list[str],
+    options: list[dict[str, str]],
+    *,
+    default_choice: str,
+    use_color: bool,
+    language: str = "en",
+) -> str:
+    normalized = [_normalize_choice_option(option) for option in options]
+    if _keyboard_menu_available():
+        return _keyboard_single_choice(title, intro_lines, normalized, default_choice=default_choice, use_color=use_color, language=language)
+
+    print("")
+    print(_color(title, "1;32", use_color))
+    for line in intro_lines:
+        print(f"  {line}")
+    for option in normalized:
+        suffix = f" ({tr(language, 'recommended')})" if option["choice"] == default_choice else ""
+        print(f"  {option['choice']}) {option['label']}{suffix}")
+        if option["description"]:
+            print(f"     {option['description']}")
+    values_by_choice = {option["choice"]: option["value"] for option in normalized}
+    values_by_value = {option["value"]: option["value"] for option in normalized}
+    while True:
+        raw = _ask(tr(language, "select"), default=default_choice, use_color=use_color).strip()
+        value = raw or default_choice
+        if value in values_by_choice:
+            return values_by_choice[value]
+        if value in values_by_value:
+            return values_by_value[value]
+        valid = ", ".join(option["choice"] for option in normalized)
+        print(_color(tr(language, "invalid_selection", valid=valid), "31", use_color))
+
+
+def _exclusive_choice_conflict(values: list[str], exclusive: set[str]) -> str:
+    """The first exclusive value that was picked alongside something else, else ""."""
+    if len(values) < 2:
+        return ""
+    return next((value for value in values if value in exclusive), "")
+
+
+def _ask_multi_choice(
+    title: str,
+    intro_lines: list[str],
+    options: list[dict[str, str]],
+    *,
+    selected: list[str],
+    use_color: bool,
+    language: str = "en",
+    exclusive: set[str] | None = None,
+    additive: set[str] | None = None,
+) -> list[str]:
+    """Tick any number of options; returns the ticked values in option order.
+
+    The single-choice sibling's shape: same colors, same localized labels, the
+    keyboard menu when one is available and a typed fallback when it is not.
+    Empty input keeps the pre-selected set, so a machine whose detected rows
+    are already right answers with one Enter.
+
+    A value in `exclusive` may only be chosen alone. Picked beside anything
+    else it is contradictory, so both paths refuse and ask again rather than
+    resolving it by a rule the operator cannot see.
+
+    A value in `additive` is an action row, not an answer about the other
+    rows. A typed answer replaces the ticked set, so a typed answer that names
+    only additive rows would otherwise clear every pre-ticked row. Instead, it
+    is added to the ticked rows. The keyboard menu needs no such rule, because
+    ticking a row there never clears another.
+
+    There is deliberately no "none" token: a caller that needs "none of these"
+    as an answer gives the list a row that says so, which is legible next to
+    what it declines in a way a magic `0` is not.
+    """
+    exclusive = exclusive or set()
+    normalized = [_normalize_choice_option(option) for option in options]
+    ticked = {option["choice"] for option in normalized if option["value"] in selected}
+    labels_by_value = {option["value"]: option["label"] for option in normalized}
+    if _keyboard_menu_available():
+        return _keyboard_multi_choice(
+            title, intro_lines, normalized, ticked, exclusive, use_color=use_color, language=language
+        )
+
+    print("")
+    print(_color(title, "1;32", use_color))
+    for line in intro_lines:
+        print(f"  {line}")
+    for option in normalized:
+        mark = "[x]" if option["choice"] in ticked else "[ ]"
+        print(f"  {option['choice']}) {mark} {option['label']}")
+        if option["description"]:
+            print(f"     {option['description']}")
+    default = ",".join(option["choice"] for option in normalized if option["choice"] in ticked)
+    values_by_choice = {option["choice"]: option["value"] for option in normalized}
+    values_by_value = {option["value"]: option["value"] for option in normalized}
+    while True:
+        raw = _ask(tr(language, "select_multi"), default=default, use_color=use_color).strip()
+        if not raw:
+            picked = [option["value"] for option in normalized if option["choice"] in ticked]
+        else:
+            tokens = [token for token in re.split(r"[,\s]+", raw) if token]
+            resolved = [values_by_choice.get(token) or values_by_value.get(token) for token in tokens]
+            if not all(resolved):
+                valid = ", ".join(option["choice"] for option in normalized)
+                print(_color(tr(language, "invalid_selection", valid=valid), "31", use_color))
+                continue
+            picked = [value for index, value in enumerate(resolved) if value not in resolved[:index]]
+            if additive and set(picked) <= additive:
+                picked = [
+                    option["value"]
+                    for option in normalized
+                    if option["choice"] in ticked or option["value"] in picked
+                ]
+        conflict = _exclusive_choice_conflict(picked, exclusive)
+        if conflict:
+            print(_color(tr(language, "exclusive_selection", label=labels_by_value[conflict]), "31", use_color))
+            continue
+        return picked
+
+
+def _normalize_choice_option(option: dict[str, str]) -> dict[str, str]:
+    return {
+        "choice": str(option.get("choice", "")).strip(),
+        "value": str(option.get("value", "")).strip(),
+        "label": str(option.get("label", "")).strip(),
+        "description": str(option.get("description", "")).strip(),
+    }
+
+
+def _keyboard_single_choice(
+    title: str,
+    intro_lines: list[str],
+    options: list[dict[str, str]],
+    *,
+    default_choice: str,
+    use_color: bool,
+    language: str = "en",
+) -> str:
+    cursor = _default_choice_index(options, default_choice)
+    rendered_option_rows = 0
+    first_render = True
+    choices = [option["choice"] for option in options]
+    pending = ""
+    while True:
+        lines = _choice_menu_lines(
+            title,
+            intro_lines,
+            options,
+            cursor,
+            default_choice=default_choice,
+            use_color=use_color,
+            language=language,
+        )
+        option_lines = _choice_menu_option_lines(lines, intro_lines)
+        if pending:
+            note = _menu_pending_note(language, "menu_pending_row", pending, use_color)
+            option_lines = [*option_lines, note]
+            lines = [*lines, note]
+        if first_render:
+            sys.stdout.write("\n".join(lines) + "\n")
+            first_render = False
+        else:
+            sys.stdout.write(f"\033[{rendered_option_rows}F\033[J")
+            sys.stdout.write("\n".join(option_lines) + "\n")
+        sys.stdout.flush()
+        rendered_option_rows = _rendered_terminal_rows(option_lines)
+        key = _read_tui_key()
+        if key in {"\x03", "\x04"}:
+            raise KeyboardInterrupt
+        if len(key) == 1 and key in "0123456789":
+            pending, number = _menu_number_key(pending, key, choices)
+            if number:
+                return options[choices.index(number)]["value"]
+            if pending in choices:
+                cursor = choices.index(pending)
+            continue
+        pending = ""
+        if key in {"\x1b[A", "k"}:
+            cursor = (cursor - 1) % len(options)
+            continue
+        if key in {"\x1b[B", "j"}:
+            cursor = (cursor + 1) % len(options)
+            continue
+        if key in {"\r", "\n", " "}:
+            return options[cursor]["value"]
+
+
+def _menu_number_key(pending: str, key: str, choices: list[str]) -> tuple[str, str]:
+    """One digit key folded into the row number being typed: `(pending, complete)`.
+
+    Keys arrive one at a time, so on a list with more than nine rows, acting
+    on each digit made `1` then `7` act on row 1 and then on row 7, never on
+    row 17. In the single-choice menu the `7` then leaked into the next
+    prompt. A digit that a further digit could still extend (`1` when row 17
+    exists) is therefore held as `pending`. The menu moves the cursor to it
+    and shows a note saying so. A number nothing can extend is complete and
+    is acted on at once, so a list of up to nine rows behaves exactly as
+    before.
+
+    Only Space or Enter acts on a pending row; a digit always builds a
+    number. A digit that no row continues therefore starts a new number
+    (`1` then `9`, with no row 19, is row 9) rather than acting on row 1 as
+    well. Acting on row 1 would mean a keystroke the note just described as
+    "a second digit" picks row 1, which in the single-choice menu closes the
+    menu on a row nobody confirmed. An unusable digit (`0`) is ignored.
+    """
+    number = pending + key
+    if not any(choice.startswith(number) for choice in choices):
+        number = key
+    if not any(choice.startswith(number) for choice in choices):
+        return "", ""
+    if any(choice != number and choice.startswith(number) for choice in choices):
+        return number, ""
+    return "", number
+
+
+def _menu_pending_note(language: str, message_key: str, pending: str, use_color: bool) -> str:
+    """The line under a keyboard menu that shows the row number still being typed."""
+    return _color(f"  {tr(language, message_key, row=pending)}", "1;33", use_color)
+
+
+def _keyboard_multi_choice(
+    title: str,
+    intro_lines: list[str],
+    options: list[dict[str, str]],
+    ticked: set[str],
+    exclusive: set[str] | None = None,
+    *,
+    use_color: bool,
+    language: str = "en",
+) -> list[str]:
+    """`_keyboard_single_choice` with a tick per row: Space or a digit toggles, Enter confirms.
+
+    A value in `exclusive` may only be confirmed alone. Enter on a
+    contradictory tick set keeps the menu up with the reason appended, so the
+    operator fixes it in place instead of losing the list.
+
+    Digits build a row number through `_menu_number_key`. Before that,
+    `1` then `7` toggled row 1, a found provider that was then silently
+    recorded as excluded. While a number is pending, the cursor sits on that
+    row and a note under the list says so. Space toggles the row under the
+    cursor as usual, and Enter toggles the pending row and then confirms, as
+    a lone `1` then Enter always did.
+    """
+    exclusive = exclusive or set()
+    ticked = set(ticked)
+    cursor = 0
+    rendered_option_rows = 0
+    first_render = True
+    error = ""
+    choices = [option["choice"] for option in options]
+    pending = ""
+    while True:
+        lines = _choice_menu_lines(
+            title,
+            intro_lines,
+            options,
+            cursor,
+            default_choice="",
+            use_color=use_color,
+            language=language,
+            ticked=ticked,
+            hint_key="menu_hint_multi",
+        )
+        option_lines = _choice_menu_option_lines(lines, intro_lines)
+        if error:
+            # Appended to the option block so the next redraw erases it with
+            # the rows -- `rendered_option_rows` is measured after the append.
+            option_lines = [*option_lines, _color(f"  {error}", "31", use_color)]
+            lines = [*lines, option_lines[-1]]
+        if pending:
+            note = _menu_pending_note(language, "menu_pending_row_multi", pending, use_color)
+            option_lines = [*option_lines, note]
+            lines = [*lines, note]
+        if first_render:
+            sys.stdout.write("\n".join(lines) + "\n")
+            first_render = False
+        else:
+            sys.stdout.write(f"\033[{rendered_option_rows}F\033[J")
+            sys.stdout.write("\n".join(option_lines) + "\n")
+        sys.stdout.flush()
+        rendered_option_rows = _rendered_terminal_rows(option_lines)
+        error = ""
+        key = _read_tui_key()
+        if key in {"\x03", "\x04"}:
+            raise KeyboardInterrupt
+        if len(key) == 1 and key in "0123456789":
+            pending, number = _menu_number_key(pending, key, choices)
+            if number:
+                cursor = choices.index(number)
+                ticked ^= {number}
+            elif pending in choices:
+                cursor = choices.index(pending)
+            continue
+        if pending in choices and key in {"\r", "\n"}:
+            ticked ^= {pending}
+        pending = ""
+        if key in {"\x1b[A", "k"}:
+            cursor = (cursor - 1) % len(options)
+            continue
+        if key in {"\x1b[B", "j"}:
+            cursor = (cursor + 1) % len(options)
+            continue
+        if key == " ":
+            ticked ^= {options[cursor]["choice"]}
+            continue
+        if key in {"\r", "\n"}:
+            picked = [option["value"] for option in options if option["choice"] in ticked]
+            conflict = _exclusive_choice_conflict(picked, exclusive)
+            if not conflict:
+                return picked
+            label = next(option["label"] for option in options if option["value"] == conflict)
+            error = tr(language, "exclusive_selection", label=label)
+            continue
+
+
+def _choice_menu_lines(
+    title: str,
+    intro_lines: list[str],
+    options: list[dict[str, str]],
+    cursor: int,
+    *,
+    default_choice: str,
+    use_color: bool,
+    language: str = "en",
+    ticked: set[str] | None = None,
+    hint_key: str = "menu_hint",
+) -> list[str]:
+    lines = ["", _color(title, "1;32", use_color)]
+    for line in intro_lines:
+        lines.append(f"  {line}")
+    lines.append(_color(f"  {tr(language, hint_key)}", "2", use_color))
+    for index, option in enumerate(options):
+        active = index == cursor
+        pointer = ">" if active else " "
+        suffix = f" ({tr(language, 'recommended')})" if option["choice"] == default_choice else ""
+        mark = "" if ticked is None else ("[x] " if option["choice"] in ticked else "[ ] ")
+        label = f"  {pointer} {option['choice']}) {mark}{option['label']}{suffix}"
+        if active:
+            label = _color(label, "1;36", use_color)
+        lines.append(label)
+        if option["description"]:
+            lines.append(f"      {option['description']}")
+    return lines
+
+
+def _choice_menu_option_lines(lines: list[str], intro_lines: list[str]) -> list[str]:
+    option_start = 3 + len(intro_lines)
+    return lines[option_start:]
+
+
+def _rendered_terminal_rows(lines: list[str], columns: int | None = None) -> int:
+    if columns is None:
+        columns = shutil.get_terminal_size((80, 24)).columns
+    columns = max(1, columns)
+    rows = 0
+    for line in lines:
+        width = _visible_text_width(line)
+        rows += max(1, (width + columns - 1) // columns)
+    return rows
+
+
+def _visible_text_width(text: str) -> int:
+    visible = ANSI_ESCAPE_RE.sub("", text)
+    width = 0
+    for character in visible:
+        if unicodedata.combining(character):
+            continue
+        category = unicodedata.category(character)
+        if category in {"Cc", "Cf"}:
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in {"F", "W"} else 1
+    return width
+
+
+def _default_choice_index(options: list[dict[str, str]], default_choice: str) -> int:
+    for index, option in enumerate(options):
+        if option["choice"] == default_choice:
+            return index
+    return 0
+
+
+def _keyboard_menu_available() -> bool:
+    return (
+        termios is not None
+        and tty is not None
+        and stdin_is_tty()
+        and sys.stdout.isatty()
+        and os.environ.get("TERM", "") != "dumb"
+        and os.environ.get("OMH_NO_TUI", "") != "1"
+    )
+
+
+# `termios.tcgetattr` returns [iflag, oflag, cflag, lflag, ispeed, ospeed, cc].
+_TERMIOS_CONTROL_CHARACTERS = 6
+# Both bounds exist because a keypress is not the only thing that can arrive.
+# VTIME is in tenths of a second and ends a read with nothing to return, so a
+# lone ESC -- a real key, pressed to back out -- cannot hang the installer
+# waiting for a sequence that is never coming. The character cap ends a
+# sequence whose final byte never arrives, so a stream of parameter bytes
+# cannot hold the loop either. Sixteen is past every sequence a keyboard
+# sends; the longest one named here is six (`ESC [ 1 ; 5 D`).
+_ESCAPE_TAIL_TIMEOUT_TENTHS = 1
+_ESCAPE_SEQUENCE_MAX_CHARACTERS = 16
+
+
+def _read_escape_tail() -> str:
+    """The rest of one escape sequence after its ESC, read to its own end.
+
+    Reading a fixed two characters left the rest of a longer keypress -- a
+    modified arrow such as `ESC [ 1 ; 5 D`, or a mouse report -- in the input
+    queue, where the next read takes it for separate keypresses. That matters
+    more now that the queue is no longer flushed: `5` is a menu choice, so one
+    Ctrl+Left would otherwise pick option 5 and return. Consuming the whole
+    sequence is what makes that unreachable rather than merely unlikely.
+    """
+    file_descriptor = sys.stdin.fileno()
+    mode = termios.tcgetattr(file_descriptor)
+    mode[_TERMIOS_CONTROL_CHARACTERS][termios.VMIN] = 0
+    mode[_TERMIOS_CONTROL_CHARACTERS][termios.VTIME] = _ESCAPE_TAIL_TIMEOUT_TENTHS
+    termios.tcsetattr(file_descriptor, termios.TCSANOW, mode)
+    introducer = sys.stdin.read(1)
+    if introducer == "":
+        return ""  # a lone ESC: the key itself, not the start of anything
+    if introducer == "O":
+        return introducer + sys.stdin.read(1)  # SS3, always exactly one more
+    if introducer != "[":
+        return introducer  # ESC + one character, which is how Alt+key arrives
+    sequence = introducer
+    while len(sequence) < _ESCAPE_SEQUENCE_MAX_CHARACTERS:
+        character = sys.stdin.read(1)
+        if character == "":
+            return sequence  # cut short; there is nothing left to wait for
+        sequence += character
+        if "\x40" <= character <= "\x7e":
+            return sequence  # the CSI final byte, and the end of the keypress
+    return sequence
+
+
+def _read_tui_key() -> str:
+    if termios is None or tty is None:
+        return "\n"
+    file_descriptor = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(file_descriptor)
+    try:
+        # TCSADRAIN rather than `tty.setraw`'s default TCSAFLUSH. The two are
+        # the same call except that TCSAFLUSH also DISCARDS input not yet
+        # read, and this runs once per keypress rather than once per menu --
+        # so the default threw away everything the operator typed while the
+        # menu was repainting. Nothing here wanted that flush: discarding on
+        # entry is a technique for dropping a terminal's unsolicited reply,
+        # and setup never queries the terminal. Both forms wait for pending
+        # output first, so this is not a new place to block.
+        tty.setraw(file_descriptor, termios.TCSADRAIN)
+        key = sys.stdin.read(1)
+        if key == "\x1b":
+            key += _read_escape_tail()
+        return key
+    finally:
+        termios.tcsetattr(file_descriptor, termios.TCSADRAIN, old_settings)
+
+
+# A person who just answered an arrow-key menu keeps pressing arrows into the
+# next free-text prompt, and `input()` hands back the raw escape bytes
+# (`\x1b[B`, `\x1b[A`, ...) as if they had been typed. Left in, they are
+# scored as an answer, rejected, and echoed back -- which reprograms the
+# terminal and makes the rejection unreadable. Alternation order matters: the
+# multi-byte sequences have to match before the bare-ESC catch-all, or a CSI
+# loses only its ESC and leaves `[B` behind as text.
+_CONTROL_INPUT_RE = re.compile(
+    "\x1b\\[[0-?]*[ -/]*[@-~]"  # CSI: ESC [ params intermediates final
+    "|\x1bO[@-~]"  # SS3: ESC O x, the arrow keys in application-cursor mode
+    # The reported line ended `^[[`: the Enter that submitted it landed
+    # inside a sequence, so the last one has no final byte. Dropping only its
+    # ESC as a C0 would leave `[` standing as a typed answer, which is how a
+    # person who typed nothing got told `[` was not a plain identifier.
+    "|\x1b\\[[0-?]*[ -/]*\\Z"
+    "|\x1bO\\Z"
+    "|[\x00-\x1f\x7f-\x9f]"  # bare ESC, any other C0, DEL, C1
+)
+
+
+def _strip_control_input(value: str) -> str:
+    """Terminal control input removed from a line a person typed."""
+    return _CONTROL_INPUT_RE.sub("", value)
+
+
+def _ask(prompt: str, *, default: str, use_color: bool) -> str:
+    # Stripped here rather than at each call site so every free-text setup
+    # prompt gets it, and so no caller can echo a control byte back: a line of
+    # nothing but arrow keys reads as empty, which each call site already
+    # treats as "Enter".
+    try:
+        raw = input(f"{_color('?', '1;36', use_color)} {prompt} [{default}]: ")
+    except EOFError:
+        print("")
+        return ""
+    return _strip_control_input(raw).strip()
+
+
+def _use_color() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _color(text: str, code: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+class _HumanProgress:
+    def __init__(self, *, enabled: bool, use_color: bool) -> None:
+        self.enabled = enabled
+        self.use_color = use_color
+
+    def header(self, title: str, subtitle: str) -> None:
+        if not self.enabled:
+            return
+        print(_color(title, "1;36", self.use_color))
+        print(subtitle)
+        print("")
+
+    def step(self, index: int, total: int, label: str, *, detail: str = "", pause: bool = True) -> None:
+        if not self.enabled:
+            return
+        prefix = _color(f"[{index}/{total}]", "1;36", self.use_color)
+        print(f"{prefix} {label}...", flush=True)
+        if detail:
+            print(f"      {detail}", flush=True)
+        # `pause=False` renders the identical line without the settle. The
+        # settle makes a line readable when more output lands on top of it
+        # immediately, which is the apply phase; a heading over a question is
+        # followed by a prompt that waits for a person, so it buys nothing --
+        # and `_read_tui_key` flushes the input queue on every read (#1778),
+        # so delay added before a menu's first read is a window in which a
+        # keypress is silently discarded.
+        if pause:
+            self._brief_tty_pause()
+
+    def done(self, message: str = "done") -> None:
+        if not self.enabled:
+            return
+        print(f"      {_color('[ok]', '1;32', self.use_color)} {message}", flush=True)
+        self._brief_tty_pause()
+
+    def skip(self, message: str) -> None:
+        if not self.enabled:
+            return
+        print(f"      {_color('[skip]', '1;33', self.use_color)} {message}", flush=True)
+        self._brief_tty_pause()
+
+    @staticmethod
+    def _brief_tty_pause() -> None:
+        if sys.stdout.isatty() and os.environ.get("OMH_PROGRESS", "1") != "0":
+            time.sleep(0.04)
+
+
+def _print_setup_summary(payload: dict[str, object], *, language: str = "en") -> None:
+    use_color = _use_color()
+    steps = payload.get("steps", {})
+    hermes_native = payload.get("hermes_native", {})
+    operator_summary = payload.get("operator_summary", {})
+    if not isinstance(steps, dict):
+        steps = {}
+    if not isinstance(hermes_native, dict):
+        hermes_native = {}
+    if not isinstance(operator_summary, dict):
+        operator_summary = {}
+
+    install = steps.get("install", {})
+    profile = steps.get("profile", {})
+    skills = install.get("skills", []) if isinstance(install, dict) else []
+
+    dry_run = bool(payload.get("dry_run", False))
+    title = tr(language, "setup_preview_complete") if dry_run else tr(language, "setup_complete")
+    print("")
+    print(_color(title, "1;36", use_color))
+    mcp_mode_label = tr(language, "setup_mcp_mode_" + str(operator_summary.get("mcp_mode", "none")))
+    command_path = operator_summary.get("command_path", {})
+    if isinstance(command_path, dict) and not command_path.get("found"):
+        print(f"  {tr(language, 'command_path_missing')}")
+        print(f"  {tr(language, 'command_path_missing_next')}")
+    print(f"  {tr(language, 'done_skills_ready', count=len(skills))}")
+
+    discovery_status = str(hermes_native.get("discovery_status", ""))
+    if discovery_status == "config_registered_reload_required":
+        print(
+            f"  {tr(language, 'registration_configured', path=hermes_native.get('hermes_config_path', ''))}"
+        )
+    elif discovery_status == "dry_run_not_observed":
+        print(f"  {tr(language, 'registration_dry_run')}")
+    elif discovery_status == "not_registered_skip_apply":
+        print(f"  {tr(language, 'registration_skipped')}")
+    else:
+        print(f"  {tr(language, 'registration_unknown', status=discovery_status or 'unknown')}")
+
+    if isinstance(profile, dict):
+        executor = str(profile.get("default_executor", ""))
+        if executor:
+            print(f"  {tr(language, 'default_handoff', summary=_executor_summary(language, executor))}")
+
+
+    providers = operator_summary.get("providers")
+    if isinstance(providers, dict):
+        print(f"  {_provider_summary_line(providers, language=language)}")
+    plugin = payload.get("plugin_distribution")
+    if isinstance(plugin, dict):
+        print(f"  {tr(language, 'plugin_bridge', status=_plugin_status_label(language, str(plugin.get('status', 'installed'))))}")
+
+    _print_memory_provider_summary(steps, language)
+
+    menubar = steps.get("menubar")
+    if isinstance(menubar, dict) and str(menubar.get("status", "not_requested")) != "not_requested":
+        status = str(menubar.get("status", "unknown"))
+        print(f"  {tr(language, 'menubar_helper', status=_menubar_status_label(language, status))}")
+
+    if str(operator_summary.get("mcp_mode", "none")) == "bridge_requested":
+        print(f"  {tr(language, 'setup_mcp_mode', mode=mcp_mode_label)}")
+
+    team_profiles = payload.get("team_profiles")
+    if isinstance(team_profiles, list) and team_profiles:
+        print(f"  {tr(language, 'team_activated', count=len(team_profiles))}")
+
+    print(_color(tr(language, "next"), "1;32", use_color))
+    if dry_run:
+        print(f"  {tr(language, 'setup_next_dry')}")
+    elif discovery_status == "not_registered_skip_apply":
+        print(f"  {tr(language, 'setup_next_connect')}")
+    else:
+        print(f"  {tr(language, 'setup_next_reload')}")
+        print(f"  {tr(language, 'setup_next_verify')}")
+    profiles = payload.get("hermes_profiles")
+    if not dry_run:
+        apply = steps.get("apply")
+        _print_display_release_lines(
+            apply if isinstance(apply, dict) else None,
+            [row for row in profiles if isinstance(row, dict)] if isinstance(profiles, list) else [],
+        )
+    if isinstance(profiles, list):
+        _print_hermes_profiles_line(profiles, language=language)
+        for row in profiles:
+            if isinstance(row, dict) and row.get("status") == "failed":
+                print(f"  {row.get('profile')}: {row.get('error')}; run `omh setup` after resolving this error.")
+        _print_omh_home_reclaims([row for row in profiles if isinstance(row, dict)])
+
+
+def _provider_summary_line(providers: dict[str, object], *, language: str) -> str:
+    """One line naming the providers routing counts, or why it counts none."""
+    status = str(providers.get("document_status", ""))
+    counted = providers.get("counted", [])
+    rows = [row for row in counted if isinstance(row, dict)] if isinstance(counted, list) else []
+    if status.startswith("invalid:"):
+        return tr(
+            language,
+            "setup_providers_invalid",
+            path=str(providers.get("document_path", "")),
+            status=status,
+            providers=", ".join(f"{row.get('id', '')} ({row.get('source', '')})" for row in rows) or "-",
+        )
+    if not rows:
+        return tr(language, "setup_providers_none")
+    return tr(
+        language,
+        "setup_providers_line_one" if len(rows) == 1 else "setup_providers_line",
+        providers=", ".join(f"{row.get('id', '')} ({row.get('source', '')})" for row in rows),
+    )
+
+
+def _print_doctor_summary(payload: dict[str, object], *, language: str = "en") -> None:
+    use_color = _use_color()
+    checks = payload.get("checks", [])
+    if not isinstance(checks, list):
+        checks = []
+    ok = bool(payload.get("ok", False))
+    summary = payload.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    passing = int(summary.get("passing", sum(1 for check in checks if isinstance(check, dict) and check.get("ok"))))
+    total = int(summary.get("total", len(checks)))
+    title_key = "doctor_complete" if ok else "doctor_needs_attention"
+    print(_color(tr(language, title_key), "1;36" if ok else "1;33", use_color))
+    print(_color(tr(language, "summary"), "1;32", use_color))
+    print(f"  {tr(language, 'doctor_status', status=tr(language, 'doctor_status_ok' if ok else 'doctor_status_needs_attention'))}")
+    print(f"  {tr(language, 'doctor_checks', passing=passing, total=total)}")
+    print(
+        f"  {tr(language, 'doctor_issue_counts', blocking=summary.get('blocking', 0), warnings=summary.get('warnings', 0))}"
+    )
+    build_identity = payload.get("build_identity", {})
+    if isinstance(build_identity, dict) and build_identity.get("summary"):
+        print(f"  {tr(language, 'doctor_build_identity', identity=build_identity['summary'])}")
+    groups = summary.get("groups", [])
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_key = "doctor_group_" + str(group.get("name", "unknown"))
+            status_key = "doctor_group_status_" + str(group.get("status", "ok"))
+            print(
+                f"  {tr(language, group_key)}: {tr(language, status_key)} "
+                f"({group.get('passing', 0)}/{group.get('total', 0)})"
+            )
+    observation_lines = _doctor_observation_boundary_lines(checks, language=language)
+    if observation_lines:
+        print(_color(tr(language, "doctor_observation_boundaries"), "1;32", use_color))
+        for line in observation_lines:
+            print(f"  {line}")
+    state_log = payload.get("state_log", {})
+    if isinstance(state_log, dict) and state_log.get("path") and state_log.get("entry"):
+        print(f"  {tr(language, 'state_log', path=state_log.get('path'), entry=state_log.get('entry'))}")
+    _print_doctor_privacy_controls(payload)
+    for check in checks:
+        if not isinstance(check, dict) or (check.get("ok") and check.get("severity") != "warning"):
+            continue
+        name = check.get("name", "unknown")
+        message = check.get("message", "")
+        remediation = check.get("remediation", "") or check.get("next_action", "")
+        print(f"  - {name}: {message}")
+        if remediation:
+            print(f"    {tr(language, 'doctor_fix')}: {remediation}")
+    _print_doctor_advice(payload, use_color=use_color)
+    next_action = str(payload.get("recommended_next_action", "")).strip()
+    print(_color(tr(language, "next"), "1;32", use_color))
+    if next_action:
+        print(f"  {_doctor_human_next_action(next_action, language=language)}")
+    print(f"  {tr(language, 'doctor_boundary')}")
+    print(f"  {tr(language, 'machine_readable')}")
+
+
+def _print_doctor_privacy_controls(payload: dict[str, object]) -> None:
+    """Say, under the summary, what a privacy control left unread or unwritten."""
+    controls = payload.get("privacy_controls")
+    if not isinstance(controls, dict):
+        return
+    if controls.get("state_write") == "disabled":
+        print("  State write: disabled (--no-state-write); runtime/state.json was not written and no write probe ran.")
+    if controls.get("personal_files") == "not_read":
+        print("  Personal files: not read (--no-personal-files); SOUL.md, memories/MEMORY.md and memories/USER.md were not opened.")
+
+
+def _print_doctor_advice(payload: dict[str, object], *, use_color: bool) -> None:
+    """Render the read-only Advice lane, separate from doctor checks.
+
+    Advice never affects the doctor status or exit code; it is a default-on,
+    plain-text section that surfaces the ``hermes_config_advice`` advisory lane.
+    A ``skipped`` entry is listed with its reason, so an inspector that did not
+    run is never mistaken for one that found nothing.
+    """
+    advisories = payload.get("advisories", {})
+    if not isinstance(advisories, dict):
+        return
+    entries = advisories.get("entries", [])
+    if not isinstance(entries, list):
+        return
+    actionable = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("status") == "advice"
+    ]
+    skipped = [entry for entry in entries if isinstance(entry, dict) and entry.get("status") == "skipped"]
+    if not actionable and not skipped:
+        return
+    print(_color("Advice (read-only; does not affect doctor status)", "1;36", use_color))
+    for entry in actionable:
+        check_id = entry.get("check_id", "unknown")
+        observed = entry.get("observed", "")
+        remediation = entry.get("remediation", "")
+        print(f"  - {check_id}: {observed}")
+        if remediation:
+            print(f"    Suggestion: {remediation}")
+    for entry in skipped:
+        print(f"  - {entry.get('check_id', 'unknown')}: skipped ({entry.get('reason', '')})")
+
+
+def _doctor_human_next_action(next_action: str, *, language: str) -> str:
+    if next_action == DEFAULT_DOCTOR_NEXT_ACTION:
+        return tr(language, "doctor_default_next_action")
+    if next_action == COMMAND_PATH_MISSING_NEXT_ACTION:
+        return tr(language, "command_path_missing_next")
+    return next_action
+
+
+def _doctor_observation_boundary_lines(checks: list[object], *, language: str) -> list[str]:
+    check_map = {str(check.get("name", "")): check for check in checks if isinstance(check, dict)}
+    lines: list[str] = []
+    plugin_bundle = check_map.get("plugin_bundle")
+    plugin_register = check_map.get("plugin_register_smoke")
+    plugin_loader = check_map.get("plugin_loader_observed")
+    plugin_runtime = check_map.get("plugin_runtime_observed")
+
+    if plugin_register:
+        if plugin_register.get("ok"):
+            lines.append(tr(language, "doctor_plugin_bridge_ready"))
+        else:
+            lines.append(tr(language, "doctor_plugin_bridge_needs_attention"))
+    elif plugin_bundle:
+        lines.append(tr(language, "doctor_plugin_bridge_not_installed"))
+
+    if plugin_loader:
+        lines.append(
+            tr(
+                language,
+                (
+                    "doctor_plugin_loader_observed"
+                    if plugin_loader.get("observed") and str(plugin_loader.get("severity", "")) == "ok"
+                    else "doctor_plugin_loader_not_observed"
+                ),
+            )
+        )
+
+    if plugin_runtime:
+        if plugin_runtime.get("observed") and str(plugin_runtime.get("severity", "")) == "ok":
+            lines.append(tr(language, "doctor_plugin_runtime_observed"))
+        elif plugin_runtime.get("observed"):
+            lines.append(tr(language, "doctor_plugin_runtime_historical"))
+        else:
+            lines.append(tr(language, "doctor_plugin_runtime_not_observed"))
+
+    structural = check_map.get("structural_search_tooling")
+    if structural:
+        lines.append(
+            tr(
+                language,
+                (
+                    "doctor_structural_search_present"
+                    if structural.get("observed") and "not on PATH" not in str(structural.get("message", ""))
+                    else "doctor_structural_search_absent"
+                ),
+            )
+        )
+
+    return lines
+
+
+def _print_uninstall_config_keys(payload: dict[str, object], *, language: str, dry_run: bool) -> None:
+    """Name every managed `config.yaml` key, including the ones left behind.
+
+    A key that stays is the part a person has to act on, so it is reported by
+    name rather than folded into a count: `memory.provider` still naming a
+    bundle that is gone makes Hermes fetch the plugin catalogue on every
+    agent start, and nobody can act on "1 key kept".
+    """
+    rows = payload.get("config_keys", [])
+    if not isinstance(rows, list) or not rows:
+        return
+    reversed_keys = [str(row.get("key", "")) for row in rows if isinstance(row, dict) and row.get("status") == "reversed"]
+    if reversed_keys:
+        key = "uninstall_config_would_reverse" if dry_run else "uninstall_config_reversed"
+        print(f"  {tr(language, key, keys=', '.join(reversed_keys))}")
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("status") == "kept":
+            print(f"  {tr(language, 'uninstall_config_kept', config_key=row.get('key', ''), detail=row.get('detail', ''))}")
+        elif row.get("status") == "unrecorded":
+            print(f"  {tr(language, 'uninstall_config_unrecorded', config_key=row.get('key', ''))}")
+        elif row.get("status") == "reversed" and row.get("kept"):
+            # A key reversed in part still left something with the person,
+            # and naming the key alone under "reversed" would say the
+            # opposite. The names lived only in the JSON before.
+            print(f"  {tr(language, 'uninstall_config_partial', config_key=row.get('key', ''), kept=row.get('kept', ''))}")
+
+
+def _print_uninstall_summary(payload: dict[str, object], *, language: str = "en") -> None:
+    use_color = _use_color()
+    dry_run = bool(payload.get("dry_run", False))
+    title = (
+        "OMH uninstall blocked; repair the reported failures before retrying."
+        if payload.get("status") in {"partial", "failed"}
+        else tr(language, "uninstall_preview_complete") if dry_run else tr(language, "uninstall_complete")
+    )
+    removed = payload.get("removed_paths", [])
+    would_remove = payload.get("would_remove", [])
+    kept = payload.get("kept_paths", [])
+    if not isinstance(removed, list):
+        removed = []
+    if not isinstance(would_remove, list):
+        would_remove = []
+    if not isinstance(kept, list):
+        kept = []
+    command_kept = payload.get("command_package_kept", [])
+    if not isinstance(command_kept, list):
+        command_kept = []
+    command_kept_paths = {
+        item.get("path", "")
+        for item in command_kept
+        if isinstance(item, dict)
+    }
+
+    print("")
+    print(_color(title, "1;36", use_color))
+    print(_color(tr(language, "summary"), "1;32", use_color))
+    print(f"  {tr(language, 'scope')}: {payload.get('scope', '')}")
+    config_message = _config_change_label(language, str(payload.get("config_message", "")))
+    print(f"  {tr(language, 'uninstall_config', message=config_message)}")
+    _print_uninstall_config_keys(payload, language=language, dry_run=dry_run)
+    if dry_run:
+        print(f"  {tr(language, 'uninstall_would_remove', count=len(would_remove))}")
+        for path in would_remove[:8]:
+            print(f"    - {path}")
+    else:
+        print(f"  {tr(language, 'uninstall_removed', count=len(removed))}")
+        for path in removed[:8]:
+            print(f"    - {path}")
+    if not removed and not would_remove:
+        print(f"  {tr(language, 'uninstall_none')}")
+    for item in kept:
+        if isinstance(item, dict):
+            if item.get("path", "") in command_kept_paths:
+                continue
+            print(f"  {tr(language, 'kept')}: {item.get('path', '')} ({item.get('reason', '')})")
+    for key in ("tui_widget", "skin"):
+        outcome = payload.get(key)
+        if isinstance(outcome, dict) and outcome.get("status") == "refused":
+            print(f"  {tr(language, 'kept')}: {outcome.get('path', '')} ({outcome.get('reason', '')})")
+
+    profiles = payload.get("hermes_profiles")
+    if isinstance(profiles, list) and profiles:
+        summary = ", ".join(
+            f"{entry.get('profile')} ({_PROFILE_STATUS_LABELS.get(str(entry.get('status')), str(entry.get('status')))})"
+            for entry in profiles
+            if isinstance(entry, dict)
+        )
+        print(f"  {tr(language, 'hermes_profiles_uninstalled', summary=summary)}")
+    print(_color(tr(language, "next"), "1;32", use_color))
+    command_removed = payload.get("command_package_removed_paths", [])
+    command_would_remove = payload.get("command_package_would_remove", [])
+    if not isinstance(command_removed, list):
+        command_removed = []
+    if not isinstance(command_would_remove, list):
+        command_would_remove = []
+    if dry_run and command_would_remove:
+        print(f"  {tr(language, 'uninstall_command_would_remove', count=len(command_would_remove))}")
+    elif command_removed:
+        print(f"  {tr(language, 'uninstall_command_removed', count=len(command_removed))}")
+    elif command_kept:
+        print(f"  {tr(language, 'uninstall_command_kept')}")
+        print(f"  {tr(language, 'uninstall_command_still_available')}")
+    print(f"  {tr(language, 'machine_readable')}")
+
+
+def _print_install_summary(payload: dict[str, object], *, command: str, language: str = "en") -> None:
+    use_color = _use_color()
+    skills = payload.get("skills", [])
+    if not isinstance(skills, list):
+        skills = []
+    dry_run = bool(payload.get("dry_run", False))
+    label = "update" if command == "update" else "install"
+    restoring = label == "update" and not dry_run and bool(os.environ.get(SELF_UPDATE_ROLLBACK_ENV))
+    if payload.get("status") in {"partial", "failed"}:
+        title = f"OMH {label} partially applied; required refreshes failed."
+    elif restoring:
+        title = tr(language, "update_rollback_complete")
+    else:
+        title = tr(language, "install_preview_complete", label=label) if dry_run else tr(language, "install_complete", label=label)
+    source = str(payload.get("source", "builtin"))
+    source_label = tr(language, "source_builtin") if source == "builtin" else source
+    print("")
+    print(_color(title, "1;36", use_color))
+    if label == "update":
+        _print_update_release_card(payload, source_label=source_label, language=language, use_color=use_color)
+        note = payload.get("update_change_note")
+        note_lines = update_change_note_lines(note, language=language) if isinstance(note, dict) else []
+        if note_lines:
+            print(_color(note_lines[0], "1;32", use_color))
+            for line in note_lines[1:]:
+                print(line)
+            print("")
+    print(_color(tr(language, "summary"), "1;32", use_color))
+    print(f"  {tr(language, 'skills_line', count=len(skills), path=payload.get('skills_dir', ''))}")
+    release_update = payload.get("release_update", {})
+    command_package = payload.get("command_package", {})
+    if isinstance(command_package, dict):
+        command_status = str(command_package.get("status", "")).strip()
+        if command_status == "updated":
+            change = _command_package_display_change(payload, release_update if isinstance(release_update, dict) else {})
+            print(_color(f"  {tr(language, 'command_package_update_line', change=change)}", "1;32", use_color))
+        elif label == "update" and source == "builtin" and not dry_run:
+            print(_color(f"  {tr(language, 'command_package_not_updated_line')}", "1;33", use_color))
+    print(f"  {tr(language, 'source', source=source_label)}")
+    channel = str(payload.get("release_channel", "")).strip()
+    package_url = str(payload.get("release_package_url", "")).strip()
+    if channel:
+        print(f"  {tr(language, 'release_channel', channel=channel)}")
+    if package_url and package_url != "local":
+        package_url_key = "recorded_package_url" if source == "builtin" else "package_url"
+        print(f"  {tr(language, package_url_key, url=package_url)}")
+    if isinstance(release_update, dict):
+        display = release_update.get("display", {})
+        if isinstance(display, dict):
+            version_change = str(display.get("version_change", "")).strip()
+            source_ref_change = str(display.get("source_ref_change", "")).strip()
+            if version_change and str(payload.get("release_channel", "")) == "stable":
+                print(f"  {tr(language, 'release_version_change', change=version_change)}")
+            if source_ref_change:
+                print(f"  {tr(language, 'release_source_ref_change', change=source_ref_change)}")
+        status = str(release_update.get("status", "")).strip()
+        if status:
+            print(f"  {tr(language, 'release_update_status', status=status)}")
+    state_path = str(payload.get("runtime_state_path", "")).strip()
+    state_key = str(payload.get("runtime_state_key", "")).strip()
+    if state_path and state_key:
+        print(f"  {tr(language, 'state_log', path=state_path, entry=state_key)}")
+    unreadable = payload.get("unreadable_ledgers")
+    ledger = "; ".join(map(str, unreadable)) if isinstance(unreadable, list) and unreadable else "-"
+    hermes_edited = payload.get("hermes_edited_skills")
+    for item in hermes_edited if isinstance(hermes_edited, list) else []:
+        if not isinstance(item, dict):
+            continue
+        copies = item.get("ledger_copy") if isinstance(item.get("ledger_copy"), list) else []
+        disposition = item.get("disposition")
+        if disposition == "left_behind":
+            key = "hermes_edit_left_behind_line"
+        elif disposition != "replaced":
+            key = "hermes_edit_kept_line"
+        else:
+            # Only a copy the ledger still stores is claimed recoverable; a row
+            # trimmed since the skill was kept takes its content with it.
+            key = "hermes_edit_replaced_line" if copies else "hermes_edit_replaced_unrecoverable_line"
+        detail = " ".join(str(item[field]) for field in ("actor", "action", "ts") if item.get(field))
+        line = tr(
+            language, key, name=item.get("name", ""), path=item.get("path", ""), detail=detail or "-",
+            files=", ".join(str(copy) for copy in copies),
+        )
+        print(_color(f"  {line}", "1;33", use_color))
+        discarded = item.get("discarded") if isinstance(item.get("discarded"), list) else []
+        if discarded:
+            line = tr(language, "hermes_edit_discarded_line", name=item.get("name", ""), files=", ".join(map(str, discarded)))
+            print(_color(f"  {line}", "1;33", use_color))
+    restored = payload.get("restored_skills")
+    for item in restored if isinstance(restored, list) else []:
+        if isinstance(item, dict):
+            key = "managed_skill_restored_line" if item.get("disposition") == "restored" else "managed_skill_not_restored_line"
+            print(_color(f"  {tr(language, key, name=item.get('name', ''), path=item.get('path', ''))}", "1;33", use_color))
+    prune_skipped = payload.get("prune_skipped_skills")
+    for item in prune_skipped if isinstance(prune_skipped, list) else []:
+        if isinstance(item, dict):
+            # One line per reason: a directory left because it is not OMH's and
+            # one left because it IS the render directory are opposite facts.
+            reason = str(item.get("reason", ""))
+            if reason == "not_rendered_by_omh" and item.get("newly_seen") is False:
+                # Said once, when the directory was first seen. The result
+                # still lists it; a person who keeps their own skills in the
+                # pack should not read the same line on every install.
+                continue
+            key = f"prune_skipped_{reason}_line" if reason in PRUNE_SKIP_REASONS else "prune_skipped_line"
+            line = tr(language, key, name=item.get("name", ""), path=item.get("path", ""), reason=reason, ledger=ledger)
+            print(_color(f"  {line}", "1;33", use_color))
+    force_pruned = payload.get("force_pruned_skills")
+    forced_paths = {
+        str(item.get("path", "")) for item in (force_pruned if isinstance(force_pruned, list) else []) if isinstance(item, dict)
+    }
+    # Every directory an install removes is named here, by its path: one
+    # retired name can sit in two directories, and a `--force` removal of
+    # either has its own lines below, with what it lost.
+    removed = payload.get("removed_skill_directories")
+    for item in removed if isinstance(removed, list) else []:
+        if not isinstance(item, dict) or str(item.get("path", "")) in forced_paths:
+            continue
+        kind = str(item.get("kind", ""))
+        key = {"flat_copy": "flat_layout_removed_line", "flat_copy_in_category": "flat_layout_payload_removed_line"}.get(
+            kind, "pruned_skill_line"
+        )
+        # What the rule that admitted the removal checked, and nothing more:
+        # a manifest from before marks cannot say who rendered the directory.
+        note = "removal_render_mark_note" if item.get("rule") == "render_mark" else "removal_earlier_manifest_note"
+        directory = str(item.get("path", "")).rsplit("/", 1)[0]
+        # Only what went: a category directory may have had no references/ to remove.
+        entries = item.get("removed_entries") if isinstance(item.get("removed_entries"), list) else ["SKILL.md"]
+        files = ", ".join(f"{directory}/{entry}" for entry in entries)
+        line = f"{tr(language, key, name=item.get('name', ''), directory=directory, files=files)} {tr(language, note)}"
+        print(_color(f"  {line}", "1;33", use_color))
+    for item in force_pruned if isinstance(force_pruned, list) else []:
+        if not isinstance(item, dict):
+            continue
+        copies = item.get("ledger_copy") if isinstance(item.get("ledger_copy"), list) else []
+        if item.get("reason") == "ledger_unreadable":
+            # Nothing is known about what the ledger holds, so nothing is claimed.
+            key = "retired_skill_force_removed_ledger_unreadable_line"
+        else:
+            key = "retired_skill_force_removed_line" if copies else "retired_skill_force_removed_unrecoverable_line"
+        line = tr(
+            language, key, name=item.get("name", ""), path=item.get("path", ""),
+            files=", ".join(str(copy) for copy in copies), ledger=ledger,
+        )
+        print(_color(f"  {line}", "1;33", use_color))
+        discarded = item.get("discarded") if isinstance(item.get("discarded"), list) else []
+        if discarded:
+            line = tr(language, "retired_skill_discarded_line", name=item.get("name", ""), files=", ".join(map(str, discarded)))
+            print(_color(f"  {line}", "1;33", use_color))
+    # A loss list built while a ledger could not be read is not complete. Said
+    # once, after every loss list, so the unread names are printed once.
+    partial = [
+        str(item.get("name", ""))
+        for item in [
+            *(hermes_edited if isinstance(hermes_edited, list) else []),
+            *(force_pruned if isinstance(force_pruned, list) else []),
+        ]
+        if isinstance(item, dict) and item.get(LEDGER_COPY_PARTIAL_KEY)
+    ]
+    if partial:
+        line = tr(language, "loss_list_ledger_unread_line", names=", ".join(partial), ledger=ledger)
+        print(_color(f"  {line}", "1;33", use_color))
+    profile_state = payload.get("skill_profile_state")
+    if isinstance(profile_state, dict) and profile_state.get("retained_exception"):
+        retained = profile_state.get("full_only_installed_skills", [])
+        retained_count = len(retained) if isinstance(retained, list) else 0
+        line = tr(language, "skill_profile_retained_line", count=retained_count, command=SKILL_PROFILE_RECONCILE_COMMAND)
+        print(_color(f"  {line}", "1;33", use_color))
+    print(_color(tr(language, "next"), "1;32", use_color))
+    if dry_run:
+        print(f"  {tr(language, 'install_next_dry')}")
+    elif label == "update":
+        print(f"  {tr(language, 'update_next')}")
+        if source == "builtin" and not (isinstance(command_package, dict) and command_package.get("updated")):
+            instruction = str(command_package.get("update_instruction", "")).strip()
+            if instruction:
+                print(f"  {tr(language, 'update_command_next', command=instruction)}")
+    else:
+        print(f"  {tr(language, 'install_next')}")
+    print(f"  {tr(language, 'machine_readable')}")
+
+
+def _print_update_release_card(
+    payload: dict[str, object], *, source_label: str, language: str, use_color: bool
+) -> None:
+    release_update = payload.get("release_update", {})
+    if not isinstance(release_update, dict):
+        release_update = {}
+    previous = release_update.get("previous", {})
+    if not isinstance(previous, dict):
+        previous = {}
+    current = release_update.get("current", {})
+    if not isinstance(current, dict):
+        current = {}
+    skills = payload.get("skills", [])
+    workflow_count = len(skills) if isinstance(skills, list) else 0
+    dry_run = bool(payload.get("dry_run", False))
+    command_package = payload.get("command_package", {})
+    command_updated = isinstance(command_package, dict) and bool(command_package.get("updated"))
+    command_key = (
+        "update_card_command_preview"
+        if dry_run
+        else "update_card_command_updated"
+        if command_updated
+        else "update_card_command_unchanged"
+    )
+    previous_release = _release_card_identity(previous, language=language)
+    current_release = _release_card_identity(current, language=language)
+    restoring = not dry_run and bool(os.environ.get(SELF_UPDATE_ROLLBACK_ENV))
+    current_label = (
+        "update_card_available_release"
+        if dry_run
+        else "update_card_restored_release"
+        if restoring
+        else "update_card_installed_release"
+    )
+    notes_label = "update_card_release_preview" if dry_run else "update_card_release_notes"
+    workflows_label = "update_card_workflows_to_refresh" if dry_run else "update_card_workflows_refreshed"
+    title = tr(language, "update_card_rollback_title" if restoring else "update_card_title")
+
+    print(_color("╔═══════════════════════════════════════════════════════════╗", "1;34", use_color))
+    print(_color(f"║{title:^59}║", "1;34", use_color))
+    print(_color("╚═══════════════════════════════════════════════════════════╝", "1;34", use_color))
+    print(f"  {tr(language, 'update_card_previous_release', release=previous_release)}")
+    print(f"  {tr(language, current_label, release=current_release)}")
+    print(f"  {tr(language, 'update_card_install_method', source=source_label)}")
+    print("")
+    print(f"  {tr(language, notes_label)}")
+    print(f"    - {tr(language, workflows_label, count=workflow_count)}")
+    print(f"    - {tr(language, command_key)}")
+    workflow_content = payload.get("workflow_content", {})
+    if isinstance(workflow_content, dict) and workflow_content.get("known"):
+        content_key = (
+            "update_card_workflow_content_changed"
+            if workflow_content.get("changed")
+            else "update_card_workflow_content_unchanged"
+        )
+        print(f"    - {tr(language, content_key)}")
+    if previous_release != current_release:
+        print(f"    - {tr(language, 'release_version_change', change=f'{previous_release} -> {current_release}')}")
+    print("")
+
+
+def _release_card_identity(release: dict[str, object], *, language: str) -> str:
+    version = _effective_release_version(release)
+    if version:
+        return version
+    source_ref = _string_value(release.get("release_source_ref") or release.get("source_ref"))
+    if source_ref:
+        return source_ref
+    return tr(language, "update_card_release_not_recorded")
+
+
+def _command_package_display_change(payload: dict[str, object], release_update: dict[str, object]) -> str:
+    display = release_update.get("display", {})
+    if not isinstance(display, dict):
+        display = {}
+    previous = release_update.get("previous", {})
+    if not isinstance(previous, dict):
+        previous = {}
+    current = release_update.get("current", {})
+    if not isinstance(current, dict):
+        current = {}
+    channel = str(payload.get("release_channel", "")).strip()
+    version_change = str(display.get("version_change", "")).strip()
+    source_ref_change = str(display.get("source_ref_change", "")).strip()
+    package_url_change = str(display.get("package_url_change", "")).strip()
+    previous_version = _effective_release_version(previous)
+    current_version = _effective_release_version(current)
+    previous_ref = str(previous.get("release_source_ref", "")).strip()
+    current_ref = str(current.get("release_source_ref", "")).strip()
+    previous_package_url = str(previous.get("release_package_url", "")).strip()
+    current_package_url = str(current.get("release_package_url", "")).strip()
+    version_changed = bool(current_version and previous_version != current_version)
+    source_ref_changed = bool(current_ref and previous_ref != current_ref)
+    package_url_changed = bool(current_package_url and previous_package_url != current_package_url)
+    # A real version move is the most useful thing to show on any channel. Preview
+    # installs track a branch, so without this they report `main -> main` and the
+    # upgrade is invisible.
+    if version_changed and version_change:
+        return version_change
+    if channel == "stable" and current_version and source_ref_changed and source_ref_change:
+        return f"{current_version} ({source_ref_change})"
+    if channel == "stable" and current_version and package_url_changed and package_url_change:
+        return f"{current_version} (package URL changed)"
+    if source_ref_changed and source_ref_change:
+        return source_ref_change
+    if package_url_changed and package_url_change:
+        return package_url_change
+    if current_version:
+        return f"{current_version} -> {current_version}" if previous_version == current_version else current_version
+    if current_ref:
+        return f"{current_ref} -> {current_ref}" if previous_ref == current_ref else current_ref
+    package_url = str(payload.get("release_package_url", "")).strip()
+    return package_url or "updated"
+
+
+def _print_apply_summary(payload: dict[str, object]) -> None:
+    use_color = _use_color()
+    dry_run = bool(payload.get("dry_run", False))
+    changed = bool(payload.get("changed", False))
+    title = "OMH apply preview complete." if dry_run else "OMH apply complete."
+    print(_color(title, "1;36", use_color))
+    print(_color("Summary", "1;32", use_color))
+    print(f"  Config: {payload.get('config', '')}")
+    print(f"  Managed skills: {payload.get('skills_dir', '')}")
+    if dry_run:
+        status = "would update Hermes registration" if changed else "registration already up to date"
+    else:
+        status = "updated Hermes registration" if changed else "registration already up to date"
+    message = str(payload.get("message", "")).strip()
+    print(f"  Status: {status}")
+    if message:
+        print(f"  Detail: {message}")
+    if not dry_run:
+        for line in _display_release_lines("Hermes display", payload.get("display_release")):
+            print(f"  {line}")
+    print(_color("Next", "1;32", use_color))
+    print("  Restart or reload Hermes Agent before expecting chat to see new skills.")
+    print(f"  {tr('en', 'machine_readable')}")
+
+
+def _print_list_summary(payload: dict[str, object], *, manifest_path: Path, skills_dir: Path) -> None:
+    use_color = _use_color()
+    skills = payload.get("skills", [])
+    if not isinstance(skills, list):
+        skills = []
+    print(_color("OMH managed skills", "1;36", use_color))
+    print(_color("Summary", "1;32", use_color))
+    if not skills:
+        print("  Status: not installed")
+        print(f"  Manifest: {manifest_path}")
+        print(f"  Managed skills: {skills_dir}")
+        print(_color("Next", "1;32", use_color))
+        print("  Run `omh setup` to install managed Hermes skills.")
+        print(f"  {tr('en', 'machine_readable')}")
+        return
+    package = str(payload.get("package", "oh-my-hermes"))
+    installed_at = str(payload.get("installed_at", ""))
+    print(f"  Package: {package}")
+    print(f"  Skills: {len(skills)} managed skill(s) at {skills_dir}")
+    if installed_at:
+        print(f"  Installed at: {installed_at}")
+    print(f"  Manifest: {manifest_path}")
+    names = [str(skill.get("name", "")) for skill in skills if isinstance(skill, dict) and skill.get("name")]
+    shown = names[:12]
+    if shown:
+        print("  Names: " + ", ".join(shown) + (" ..." if len(names) > len(shown) else ""))
+    catalog = payload.get("catalog_context")
+    if isinstance(catalog, dict):
+        lanes = catalog.get("lanes", [])
+        if isinstance(lanes, list) and lanes:
+            print(_color("Workflow lanes", "1;32", use_color))
+            for lane in lanes[:6]:
+                if not isinstance(lane, dict):
+                    continue
+                lane_skills = lane.get("primary_skills", [])
+                if not isinstance(lane_skills, list):
+                    lane_skills = []
+                skill_names = ", ".join(str(skill) for skill in lane_skills[:5])
+                overflow = f" +{len(lane_skills) - 5}" if len(lane_skills) > 5 else ""
+                label = str(lane.get("label") or lane.get("id") or "workflow lane")
+                use_for = _short_summary(str(lane.get("use_for", "")), limit=96)
+                print(f"  - {label}: {skill_names}{overflow}")
+                if use_for:
+                    print(f"    Use for: {use_for}")
+    print(_color("Next", "1;32", use_color))
+    print("  Run `omh doctor` to verify Hermes registration.")
+    if skills:
+        print("  In chat, ask Hermes what OMH can do or type `./omh` to open the workflow picker.")
+    print(f"  {tr('en', 'machine_readable')}")
+
+
+def _print_recommend_summary(payload: dict[str, object]) -> None:
+    use_color = _use_color()
+    recommendations = payload.get("recommendations", [])
+    if not isinstance(recommendations, list):
+        recommendations = []
+    print(_color("OMH recommendation", "1;36", use_color))
+    print(f"Query: {payload.get('query', '')}")
+    if not recommendations:
+        print("No recommendations.")
+        print(f"  {tr('en', 'machine_readable')}")
+        return
+    for index, recommendation in enumerate(recommendations, start=1):
+        if not isinstance(recommendation, dict):
+            continue
+        name = str(recommendation.get("skill", "unknown"))
+        confidence = str(recommendation.get("confidence", "unknown"))
+        print(f"{index}. {name} [{confidence}]")
+        description = _short_summary(str(recommendation.get("description", "")), limit=120)
+        if description:
+            print(f"   {description}")
+        next_action = str(recommendation.get("next_action", "")).strip()
+        if next_action:
+            print(f"   Next action: {_action_label(next_action)}")
+        why = _short_summary(str(recommendation.get("why", "")), limit=120)
+        if why:
+            print(f"   Why: {why}")
+    workflow_route_plan = payload.get("workflow_route_plan")
+    if isinstance(workflow_route_plan, dict):
+        steps = workflow_route_plan.get("steps", [])
+        if isinstance(steps, list) and steps:
+            path = " -> ".join(str(step.get("skill", "")) for step in steps if isinstance(step, dict))
+            if path:
+                print(_color("Workflow path", "1;35", use_color))
+                print(f"  {path}")
+    route = payload.get("route")
+    if isinstance(route, dict):
+        route_skill = route.get("selected_skill") or route.get("candidate_skill") or "none"
+        print(f"route: {route.get('action', 'unknown')} -> {route_skill}")
+    print(_color("Boundary", "1;32", use_color))
+    print("  A recommendation is routing guidance, not execution or verification evidence.")
+    print(f"  {tr('en', 'machine_readable')}")
+
+
+def _print_profile_list_summary(payload: dict[str, object]) -> None:
+    use_color = _use_color()
+    packs = payload.get("packs", [])
+    if not isinstance(packs, list):
+        packs = []
+    models = payload.get("operating_models", [])
+    if not isinstance(models, list):
+        models = []
+    print(_color("OMH profile packs", "1;36", use_color))
+    print(_color("Summary", "1;32", use_color))
+    print(f"  Default install: {payload.get('default_install', 'none')}")
+    print(f"  Operating models: {len(models)}")
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_id = str(model.get("id", "unknown"))
+        title = str(model.get("title", model_id))
+        summary = _short_summary(str(model.get("summary", "")), limit=110)
+        print(f"  - {model_id}: {title}")
+        if summary:
+            print(f"    {summary}")
+    print(f"  Available packs: {len(packs)}")
+    for pack in packs:
+        if not isinstance(pack, dict):
+            continue
+        pack_id = str(pack.get("id", "unknown"))
+        title = str(pack.get("title", pack_id))
+        summary = _short_summary(str(pack.get("summary", "")), limit=110)
+        print(f"  - {pack_id}: {title}")
+        if summary:
+            print(f"    {summary}")
+    print(_color("Next", "1;32", use_color))
+    print("  Inspect a model or pack with `omh profile inspect <id>`.")
+    print("  Install one with `omh setup --profile-pack <id>`.")
+    print(f"  {tr('en', 'machine_readable')}")
+
+
+def _print_profile_inspect_summary(payload: dict[str, object]) -> None:
+    use_color = _use_color()
+    if "model" in payload:
+        model = payload.get("model", {})
+        if not isinstance(model, dict):
+            model = {}
+        model_id = str(model.get("id", "unknown"))
+        print(_color(f"OMH operating model: {model.get('title', model_id)}", "1;36", use_color))
+        print(_color("Summary", "1;32", use_color))
+        print(f"  ID: {model_id}")
+        summary = str(model.get("summary", "")).strip()
+        use_when = str(model.get("use_when", "")).strip()
+        if summary:
+            print(f"  Summary: {summary}")
+        if use_when:
+            print(f"  Use when: {use_when}")
+        print(f"  Default executor: {model.get('default_executor', 'choose')}")
+        packs = model.get("recommended_profile_packs", [])
+        if isinstance(packs, list) and packs:
+            print(f"  Recommended profile packs: {', '.join(str(item) for item in packs)}")
+        guidance = model.get("runtime_guidance", [])
+        if isinstance(guidance, list) and guidance:
+            print(_color("Runtime guidance", "1;32", use_color))
+            for item in guidance:
+                print(f"  - {item}")
+        print(_color("Next", "1;32", use_color))
+        print(f"  {model.get('setup_command', f'omh setup --operating-model {model_id}')}")
+        boundary = str(model.get("claim_boundary", "")).strip()
+        if boundary:
+            print(_color("Boundary", "1;32", use_color))
+            print(f"  {boundary}")
+        print(f"  {tr('en', 'machine_readable')}")
+        return
+    pack = payload.get("pack", {})
+    if not isinstance(pack, dict):
+        pack = {}
+    roles = pack.get("roles", [])
+    if not isinstance(roles, list):
+        roles = []
+    pack_id = str(pack.get("id", "unknown"))
+    print(_color(f"OMH profile pack: {pack.get('title', pack_id)}", "1;36", use_color))
+    print(_color("Summary", "1;32", use_color))
+    print(f"  ID: {pack_id}")
+    summary = str(pack.get("summary", "")).strip()
+    use_when = str(pack.get("use_when", "")).strip()
+    if summary:
+        print(f"  Summary: {summary}")
+    if use_when:
+        print(f"  Use when: {use_when}")
+    print(f"  Roles: {len(roles)}")
+    for role in roles:
+        if not isinstance(role, dict):
+            continue
+        role_id = str(role.get("id", "unknown"))
+        title = str(role.get("title", role_id))
+        purpose = _short_summary(str(role.get("purpose", "")), limit=120)
+        print(f"  - {role_id}: {title}")
+        if purpose:
+            print(f"    {purpose}")
+    install_command = str(pack.get("install_command", "")).strip()
+    if install_command:
+        print(_color("Next", "1;32", use_color))
+        print(f"  {install_command}")
+    boundary = str(pack.get("claim_boundary", "")).strip()
+    if boundary:
+        print(_color("Boundary", "1;32", use_color))
+        print(f"  {boundary}")
+    print(f"  {tr('en', 'machine_readable')}")
+
+
+def _print_probe_summary(payload: dict[str, object]) -> None:
+    use_color = _use_color()
+    capabilities = payload.get("capabilities", [])
+    if not isinstance(capabilities, list):
+        capabilities = []
+    counts = {status: 0 for status in ("available", "missing", "unknown", "unverified")}
+    for capability in capabilities:
+        if isinstance(capability, dict):
+            status = str(capability.get("status", "unknown"))
+            counts[status] = counts.get(status, 0) + 1
+    print(_color("OMH capability probe", "1;36", use_color))
+    print(_color("Summary", "1;32", use_color))
+    print(f"  OMH home: {payload.get('omh_home', '')}")
+    print(f"  Hermes home: {payload.get('hermes_home', '')}")
+    print(
+        "  Capabilities: "
+        f"{counts.get('available', 0)} available, "
+        f"{counts.get('missing', 0)} missing, "
+        f"{counts.get('unknown', 0)} unknown, "
+        f"{counts.get('unverified', 0)} unverified"
+    )
+    topology = payload.get("target_topology", {})
+    if isinstance(topology, dict):
+        print(
+            "  Target topology: "
+            f"{topology.get('mode', 'unknown')} "
+            f"({topology.get('known_target_count', 0)} known target(s))"
+        )
+    print(f"  Plugin distribution ready: {payload.get('plugin_distribution_ready', False)}")
+    print(f"  Native integration claim ready: {payload.get('native_integration_claim_ready', False)}")
+    print(_color("Details", "1;32", use_color))
+    for capability in capabilities:
+        if not isinstance(capability, dict):
+            continue
+        status = str(capability.get("status", "unknown"))
+        name = str(capability.get("name", "unknown"))
+        message = _short_summary(str(capability.get("message", "")), limit=120)
+        print(f"  - {name}: {status}")
+        if message:
+            print(f"    {message}")
+    boundary = str(payload.get("claim_boundary", "")).strip()
+    if boundary:
+        print(_color("Boundary", "1;32", use_color))
+        print(f"  {boundary}")
+    parity = payload.get("parity_matrix")
+    if isinstance(parity, dict):
+        _print_probe_parity_summary(parity, use_color=use_color)
+    roadmap = payload.get("capability_gap_roadmap")
+    if isinstance(roadmap, dict):
+        _print_probe_roadmap_summary(roadmap, use_color=use_color)
+    print(f"  {tr('en', 'machine_readable')}")
+
+
+def _print_probe_parity_summary(payload: dict[str, object], *, use_color: bool) -> None:
+    summary = payload.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    print(_color("Parity matrix", "1;32", use_color))
+    print(
+        "  Common oh-my runtime axes: "
+        f"{summary.get('available', 0)} available, "
+        f"{summary.get('partial', 0)} partial, "
+        f"{summary.get('planned', 0)} planned, "
+        f"{summary.get('deferred', 0)} deferred"
+    )
+    capabilities = payload.get("capabilities", [])
+    if not isinstance(capabilities, list):
+        capabilities = []
+    for capability in capabilities:
+        if not isinstance(capability, dict):
+            continue
+        title = str(capability.get("title", "unknown"))
+        status = str(capability.get("status", "unknown"))
+        missing = _short_summary(str(capability.get("missing_piece", "")), limit=108)
+        print(f"  - {title}: {status}")
+        if missing:
+            print(f"    Gap: {missing}")
+    boundary = str(payload.get("claim_boundary", "")).strip()
+    if boundary:
+        print(_color("Parity boundary", "1;32", use_color))
+        print(f"  {_short_summary(boundary, limit=132)}")
+
+
+def _print_probe_roadmap_summary(payload: dict[str, object], *, use_color: bool) -> None:
+    summary = payload.get("summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    print(_color("Capability roadmap", "1;32", use_color))
+    print(
+        "  Gaps: "
+        f"{summary.get('baseline_product_gaps', 0)} product setup, "
+        f"{summary.get('evidence_gaps', 0)} evidence, "
+        f"{summary.get('optional_or_host_unknowns', 0)} optional/host unknown"
+    )
+    actions = payload.get("next_actions", [])
+    if not isinstance(actions, list):
+        actions = []
+    for action in actions[:3]:
+        if not isinstance(action, dict):
+            continue
+        label = str(action.get("label", "Next action"))
+        kind = str(action.get("kind", "unknown"))
+        next_step = _short_summary(_roadmap_next_step(action), limit=100)
+        print(f"  - {label} ({kind})")
+        if next_step:
+            print(f"    Next: {next_step}")
+    boundary = str(payload.get("claim_boundary", "")).strip()
+    if boundary:
+        print(f"  Boundary: {_short_summary(boundary, limit=132)}")
+
+
+def _roadmap_next_step(action: dict[str, object]) -> str:
+    command = str(action.get("command", "")).strip()
+    if command:
+        return command
+    return str(action.get("operator_instruction", "")).strip()
+
+
+def _short_summary(value: str, *, limit: int) -> str:
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _config_change_label(language: str, message: str) -> str:
+    key = "config_" + message.replace(".", "_").replace(" ", "_").replace("-", "_")
+    translated = tr(language, key)
+    return translated if translated != key else message
+
+
+def _executor_summary(language: str, executor: str) -> str:
+    labels = {
+        "en": {
+            "choose": "Ask every time",
+            "codex": "Codex",
+            "claude-code": "Claude Code",
+            "generic": "Other coding agent",
+            "hermes": "Hermes",
+            "omx-runtime": "Oh-my runtime",
+            "pi-family-runtime": "Oh-my runtime",
+            "omc-runtime": "Oh-my runtime",
+        },
+        "ko": {
+            "choose": "매번 물어보기",
+            "codex": "Codex",
+            "claude-code": "Claude Code",
+            "generic": "기타 코딩 에이전트",
+            "hermes": "Hermes",
+            "omx-runtime": "Oh-my 런타임",
+            "pi-family-runtime": "Oh-my 런타임",
+            "omc-runtime": "Oh-my 런타임",
+        },
+        "ja": {
+            "choose": "毎回確認",
+            "codex": "Codex",
+            "claude-code": "Claude Code",
+            "generic": "その他のコーディングエージェント",
+            "hermes": "Hermes",
+            "omx-runtime": "Oh-my ランタイム",
+            "pi-family-runtime": "Oh-my ランタイム",
+            "omc-runtime": "Oh-my ランタイム",
+        },
+        "zh": {
+            "choose": "每次询问",
+            "codex": "Codex",
+            "claude-code": "Claude Code",
+            "generic": "其他编码代理",
+            "hermes": "Hermes",
+            "omx-runtime": "Oh-my 运行时",
+            "pi-family-runtime": "Oh-my 运行时",
+            "omc-runtime": "Oh-my 运行时",
+        },
+    }
+    code = normalize_language(language)
+    return labels.get(code, labels["en"]).get(executor, labels.get(code, labels["en"])["choose"])
+
+
+def _plugin_status_label(language: str, status: str) -> str:
+    code = normalize_language(language)
+    labels = {
+        "en": {
+            "installed": "ready",
+            "would_install": "would be installed",
+            "unchanged": "ready",
+            "updated": "updated",
+            "host_managed": "managed by Hermes; update with `hermes plugins update omh`",
+        },
+        "ko": {
+            "installed": "준비됨",
+            "would_install": "설치 예정",
+            "unchanged": "준비됨",
+            "updated": "업데이트됨",
+            "host_managed": "Hermes가 관리함; `hermes plugins update omh`로 업데이트",
+        },
+        "ja": {
+            "installed": "準備完了",
+            "would_install": "インストール予定",
+            "unchanged": "準備完了",
+            "updated": "更新済み",
+            "host_managed": "Hermes が管理; `hermes plugins update omh` で更新",
+        },
+        "zh": {
+            "installed": "已就绪",
+            "would_install": "将安装",
+            "unchanged": "已就绪",
+            "updated": "已更新",
+            "host_managed": "由 Hermes 管理; 使用 `hermes plugins update omh` 更新",
+        },
+    }
+    return labels.get(code, labels["en"]).get(status, status)
+
+
+def _menubar_status_label(language: str, status: str) -> str:
+    code = normalize_language(language)
+    labels = {
+        "en": {
+            "running": "started",
+            "installed": "installed",
+            "installed_start_failed": "installed; start failed",
+            "dry_run": "would install",
+            "skipped": "skipped",
+            "failed": "failed",
+            "not_requested": "not started",
+        },
+        "ko": {
+            "running": "시작됨",
+            "installed": "설치됨",
+            "installed_start_failed": "설치됨; 시작 실패",
+            "dry_run": "설치 예정",
+            "skipped": "건너뜀",
+            "failed": "실패",
+            "not_requested": "시작 안 함",
+        },
+        "ja": {
+            "running": "起動済み",
+            "installed": "インストール済み",
+            "installed_start_failed": "インストール済み; 起動失敗",
+            "dry_run": "インストール予定",
+            "skipped": "スキップ",
+            "failed": "失敗",
+            "not_requested": "未起動",
+        },
+        "zh": {
+            "running": "已启动",
+            "installed": "已安装",
+            "installed_start_failed": "已安装；启动失败",
+            "dry_run": "将安装",
+            "skipped": "已跳过",
+            "failed": "失败",
+            "not_requested": "未启动",
+        },
+    }
+    return labels.get(code, labels["en"]).get(status, status)
+
+
+def _mcp_status_label(language: str, status: str) -> str:
+    code = normalize_language(language)
+    labels = {
+        "en": {
+            "bridge_requested": "preference recorded",
+            "host_config_written": "host config written",
+            "host_config_unchanged": "host config already ready",
+            "host_config_planned": "host config planned",
+            "not_requested": "not enabled",
+        },
+        "ko": {
+            "bridge_requested": "선호 기록됨",
+            "host_config_written": "호스트 설정 작성됨",
+            "host_config_unchanged": "호스트 설정 이미 준비됨",
+            "host_config_planned": "호스트 설정 예정",
+            "not_requested": "사용 안 함",
+        },
+        "ja": {
+            "bridge_requested": "設定を記録済み",
+            "host_config_written": "ホスト設定を書き込み済み",
+            "host_config_unchanged": "ホスト設定は準備済み",
+            "host_config_planned": "ホスト設定を予定",
+            "not_requested": "無効",
+        },
+        "zh": {
+            "bridge_requested": "偏好已记录",
+            "host_config_written": "已写入 host 配置",
+            "host_config_unchanged": "host 配置已就绪",
+            "host_config_planned": "将写入 host 配置",
+            "not_requested": "未启用",
+        },
+    }
+    return labels.get(code, labels["en"]).get(status, status)
+
+
+def _print_memory_provider_summary(steps: dict[str, object], language: str) -> None:
+    """Say, in one line, that memory is on -- or why it is not.
+
+    A capability nobody is told about is one nobody uses. This is the summary a
+    normal user actually reads, so it names the outcome rather than the config
+    key, and it stays silent when the slot is simply free and unclaimed.
+    """
+    apply_step = steps.get("apply")
+    if not isinstance(apply_step, dict):
+        return
+    provider = apply_step.get("memory_provider")
+    if not isinstance(provider, dict):
+        return
+    selected = str(provider.get("selected", "") or "")
+    if selected == MEMORY_PROVIDER_NAME:
+        print(f"  {tr(language, 'memory_provider_on')}")
+    elif selected:
+        print(f"  {tr(language, 'memory_provider_other', provider=selected)}")
+
+
+def _plugin_setup_result(args: argparse.Namespace, paths) -> dict[str, object]:
+    try:
+        result = install_plugin_bundle(paths, force=args.force, dry_run=args.dry_run)
+    except PluginPackError as exc:
+        raise OmhError(_friendly_plugin_error(paths, str(exc))) from exc
+    if not args.dry_run:
+        update_state(paths, {"last_plugin_distribution": result})
+    return result
+
+
+def _seed_model_chains_result(paths, *, dry_run: bool) -> dict[str, object]:
+    """Materialize the editable mixture-chain override document once.
+
+    Seeded empty on purpose: an empty ``categories`` object means the shipped
+    default chains apply and keep updating with `omh update`; a category the
+    user writes into the file replaces that chain until they remove it.
+    Seeding the full defaults instead would silently pin every user to the
+    chains of their install day.
+    """
+    from ..plugin_bundle.omh.hermes_delegation import (
+        MIXTURE_CHAIN_OVERRIDES_SCHEMA_VERSION,
+        mixture_chain_overrides_path,
+    )
+
+    path = mixture_chain_overrides_path(paths.omh_home)
+    payload: dict[str, object] = {
+        "schema_version": "model_chain_seed/v1",
+        "path": str(path),
+        "dry_run": bool(dry_run),
+    }
+    if path.exists():
+        payload["status"] = "already_present"
+        return payload
+    if dry_run:
+        payload["status"] = "dry_run"
+        return payload
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {
+        "schema_version": MIXTURE_CHAIN_OVERRIDES_SCHEMA_VERSION,
+        "categories": {},
+    }
+    atomic_write_text(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    payload["status"] = "seeded"
+    return payload
+
+
+def _menubar_setup_result(args: argparse.Namespace, paths) -> dict[str, object]:
+    try:
+        result = setup_menubar_app(paths, dry_run=bool(args.dry_run), start=True, force=bool(args.force))
+    except RuntimeError as exc:
+        result = {
+            "schema_version": "menubar_app/v1",
+            "status": "failed",
+            "supported": sys.platform == "darwin",
+            "dry_run": bool(args.dry_run),
+            "reason": str(exc),
+        }
+    if not args.dry_run:
+        update_state(paths, {"last_menubar_app": result})
+    return result
+
+
+def _friendly_plugin_error(paths, message: str) -> str:
+    if "unmanaged plugin entries" in message:
+        return f"{message}. Inspect {paths.hermes_plugin_dir} before choosing `omh setup --force`."
+    if "exists without an OMH plugin manifest" in message:
+        return (
+            "OMH status helper location already exists, but it does not look like an OMH-managed install: "
+            f"{paths.hermes_plugin_dir}. Run `omh setup --force` to replace only the OMH status helper files."
+        )
+    if "managed plugin files changed" in message:
+        return (
+            "OMH status helper files were changed outside OMH. Run `omh setup --force` to refresh the helper, "
+            "or inspect the plugin directory before replacing it."
+        )
+    return message
+
+
+def _durable_mcp_host_config_record(mcp_setup: object) -> dict[str, object] | None:
+    if not isinstance(mcp_setup, dict):
+        return None
+    host_config = mcp_setup.get("host_config")
+    if not isinstance(host_config, dict):
+        return None
+    status = str(host_config.get("status", ""))
+    path = str(host_config.get("path", "")).strip()
+    host = str(host_config.get("host", "generic"))
+    if host == "generic" or status not in {"updated", "unchanged"} or not path:
+        return None
+    return {**host_config, "durable_state_key": "last_mcp_host_config_install"}
+
+
+def _mcp_setup_result(args: argparse.Namespace, paths) -> dict[str, object]:
+    requested = bool(getattr(args, "with_mcp", False))
+    host = str(getattr(args, "mcp_host", "") or "generic")
+    command = str(getattr(args, "mcp_command", "") or "omh")
+    config_path = getattr(args, "mcp_config_path", None)
+    host_config: dict[str, object] = {
+        "schema_version": "omh_mcp_host_config_install/v1",
+        "host": host,
+        "status": "not_requested",
+        "changed": False,
+        "written": False,
+        "dry_run": bool(args.dry_run),
+        "path": str(config_path or ""),
+    }
+    if requested:
+        try:
+            host_config = install_mcp_host_config(
+                paths,
+                host=host,
+                command=command,
+                config_path=config_path,
+                scope=_setup_scope(args),
+                dry_run=bool(args.dry_run),
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise OmhError(f"Could not prepare MCP host config: {exc}") from exc
+        host_config_status = str(host_config.get("status", "skipped"))
+        if host_config_status == "updated":
+            status = "host_config_written"
+        elif host_config_status == "unchanged":
+            status = "host_config_unchanged"
+        elif host_config_status.startswith("dry_run"):
+            status = "host_config_planned"
+        else:
+            status = "bridge_requested"
+        mode = "bridge_requested"
+    else:
+        status = "not_requested"
+        mode = "none"
+    return {
+        "schema_version": MCP_SETUP_SCHEMA_VERSION,
+        "mode": mode,
+        "host": host,
+        "requested": requested,
+        "status": status,
+        "dry_run": bool(args.dry_run),
+        "observed": False,
+        "host_config": host_config,
+        "scope": _setup_scope(args),
+        "paths": {
+            "omh_home": str(paths.omh_home),
+            "runtime_state_path": str(paths.runtime_state_path),
+        },
+        "bridge": {
+            "manifest_command": "omh mcp manifest",
+            "host_config_recipes_command": "omh mcp config-recipe --host <host>",
+            "known_recipe_hosts": ["generic", "claude-code", "codex", "opencode", "cursor"],
+            "server_command": "omh mcp serve",
+            "server_command_configured": f"{command} mcp serve",
+            "host_observation_command": (
+                f"{command} mcp observe-host --host <host> --session <session-id> "
+                "--event host_load --evidence-ref <host-log-or-session-ref>"
+            ),
+            "transport": "stdio",
+            "tools": ["omh_status", "omh_recommend", "omh_probe"],
+        },
+        "claim_boundary": (
+            "OMH setup records the operator MCP bridge preference and may write a local host config entry; "
+            "it does not prove an MCP host loaded OMH, called a tool, or observed runtime evidence."
+        ),
+        "next_action": (
+            "Use Hermes skills as the normal surface. If a concrete MCP host config was written, restart or reload "
+            "that host and record a concrete load or tool-call event with `omh mcp observe-host`. If the host is generic, "
+            "export `omh mcp manifest` or `omh mcp config-recipe --host <host>` and wire the stdio bridge manually."
+        ),
+    }
+
+
+def _setup_profile_result(args: argparse.Namespace, paths) -> dict[str, object]:
+    default_executor = str(getattr(args, "default_executor", "") or "") or None
+    operating_model = str(getattr(args, "operating_model", "") or "") or None
+    memory_mode = str(getattr(args, "memory_mode", "") or "") or None
+    if args.dry_run:
+        profile = build_setup_profile(args.profile, default_executor=default_executor, operating_model=operating_model, memory_mode=memory_mode)
+        return {**profile, "dry_run": True, "written": False, "path": str(paths.setup_profile_path)}
+    profile = write_setup_profile(paths, args.profile, default_executor=default_executor, operating_model=operating_model, memory_mode=memory_mode)
+    return {**profile, "dry_run": False, "written": True, "path": str(paths.setup_profile_path)}
+
+
+def _team_profile_setup_result(args: argparse.Namespace, paths) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    for pack_id in args.profile_pack:
+        try:
+            result = install_team_profile_pack(paths, pack_id, force=args.force, dry_run=args.dry_run)
+        except TeamProfileError as exc:
+            raise OmhError(str(exc)) from exc
+        results.append(result)
+    if not args.dry_run:
+        update_state(paths, {"last_team_profile_install": results})
+    return results
+
+
+def cmd_profile_list(args: argparse.Namespace) -> int:
+    payload = list_team_profile_packs()
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        _print_profile_list_summary(payload)
+    return 0
+
+
+def cmd_profile_inspect(args: argparse.Namespace) -> int:
+    try:
+        payload = inspect_team_profile_pack(args.id)
+    except TeamProfileError as exc:
+        try:
+            payload = inspect_operating_model(args.id)
+        except TeamProfileError:
+            raise OmhError(str(exc)) from exc
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        _print_profile_inspect_summary(payload)
+    return 0
+
+
+def cmd_recommend(args: argparse.Namespace) -> int:
+    if args.limit < 1:
+        raise OmhError("recommend --limit must be at least 1")
+    query = " ".join(args.task).strip()
+    if not query:
+        raise OmhError("recommend requires a task description")
+    full_recommendations = recommend_skills(query, limit=max(args.limit, 8))
+    payload = {"query": query, "recommendations": full_recommendations[: args.limit]}
+    selected_skill = str(full_recommendations[0].get("skill", "oh-my-hermes")) if full_recommendations else "oh-my-hermes"
+    top_score = int(full_recommendations[0].get("score", 0)) if full_recommendations else 0
+    workflow_route_plan = compact_workflow_route_plan(
+        build_workflow_route_plan(
+            query,
+            full_recommendations,
+            selected_skill=selected_skill,
+            action="dispatch" if top_score > 0 else "fallback",
+        )
+    )
+    if workflow_route_plan:
+        payload["workflow_route_plan"] = workflow_route_plan
+    payload["route"] = recommend_route_summary(query)
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        _print_recommend_summary(payload)
+    return 0
+
+
+def cmd_snippet(args: argparse.Namespace) -> int:
+    if args.dry_run or not args.output:
+        print(WORKSPACE_SNIPPET.rstrip())
+        return 0
+    output = Path(args.output).expanduser().resolve()
+    atomic_write_text(output, WORKSPACE_SNIPPET)
+    payload = {"written": str(output)}
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        print(f"OMH workspace snippet written: {output}")
+        print(f"  {tr('en', 'machine_readable')}")
+    return 0
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    payload = probe_capabilities(
+        _paths(args),
+        include_parity=bool(getattr(args, "parity", False)),
+        include_roadmap=bool(getattr(args, "roadmap", False)),
+    )
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        _print_probe_summary(payload)
+    return 0
+
+
+def _add_common_install_options(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--from-skills-dir", default=None, help="Import skills from a local skill directory.")
+    p.add_argument("--source", default=None, help="Mockable local source directory for install/update.")
+    p.add_argument(
+        "--channel",
+        choices=RELEASE_CHANNELS,
+        default=None,
+        help="Release channel metadata for this install/update; defaults to what the installed package records, else preview.",
+    )
+    p.add_argument("--version", default="", help=f"Stable release version such as {__version__} or v{__version__}.")
+    p.add_argument("--package-url", default="", help="Explicit release archive URL for support and audit metadata.")
+    p.add_argument("--source-ref", default="", help="Release source ref metadata such as main, main@sha, or v1.0.1.")
+    p.add_argument("--command-package-updated", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--language", default=None, help=f"Human output language for setup/install/update ({', '.join(LANGUAGE_CODES)}).")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Install every packaged skill. This is already the default for a "
+            "fresh install; the flag remains to upgrade an existing core "
+            "install and for script compatibility."
+        ),
+    )
+    p.add_argument(
+        "--core",
+        action="store_true",
+        help=(
+            "Install only the lightweight core profile (chat/plan/status/"
+            "handoff essentials plus the doctor health floor) instead of the "
+            "full default. Every installed skill adds an index line to every "
+            "request and about 8k chars per body load, which stays in history "
+            "until compaction; core keeps that footprint minimal at the cost "
+            "of the ULW engines and most workflow skills."
+        ),
+    )
+
+
+def _add_top_level_commands(sub) -> None:
+    setup = sub.add_parser("setup", help="Connect OMH workflows to the target Hermes profile.")
+    _add_common_install_options(setup)
+    setup.add_argument(
+        "--scope",
+        choices=("user", "project"),
+        default=argparse.SUPPRESS,
+        help="Install to user-wide ~/.omh/~/.hermes or project-local ./.omh/./.hermes paths.",
+    )
+    setup.add_argument("--json", action="store_true", help="Print the full machine-readable setup payload.")
+    setup.add_argument("--yes", action="store_true", help="Use default setup choices without interactive prompts.")
+    setup.add_argument("--interactive", action="store_true", help="Force the interactive setup wizard.")
+    setup.add_argument("--no-interactive", action="store_true", help="Disable the interactive setup wizard.")
+    setup.add_argument(
+        "--no-omh-tui",
+        action="store_true",
+        help=(
+            "Accepted for compatibility and ignored: OMH writes no Hermes display key, "
+            "and this run still takes back any an earlier version wrote."
+        ),
+    )
+    setup.add_argument("--skip-apply", action="store_true", help="Install skills without registering them in Hermes config.")
+    setup.add_argument(
+        "--model-setup",
+        action="store_true",
+        help="Inspect local model metadata and guide explicit Hermes model-alias activation.",
+    )
+    setup.add_argument(
+        "--import-category-overrides",
+        action="store_true",
+        help="Import category model preferences from the pi-family runtime's home config.",
+    )
+    # The flag's old spelling, for scripts written against an older release.
+    setup.add_argument(
+        f"--import-{RUNTIME_SHORT_NAME}-category-overrides",
+        dest="import_category_overrides",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    setup.add_argument(
+        "--confirm-model",
+        action="append",
+        default=[],
+        metavar="PROVIDER/MODEL",
+        help="Confirm one locally available model as active. Repeat for multiple models.",
+    )
+    setup.add_argument(
+        "--model-alias",
+        action="append",
+        default=[],
+        metavar="ALIAS=MODEL",
+        help="Preview one editable Hermes model alias. Repeat for multiple aliases.",
+    )
+    setup.add_argument(
+        "--apply-model-config",
+        action="store_true",
+        help="Apply the model-alias preview after explicit confirmation and digest binding.",
+    )
+    setup.add_argument(
+        "--model-config-digest",
+        default="",
+        help="Expected Hermes config digest printed by the model-alias preview.",
+    )
+    setup.add_argument(
+        "--allow-model-alias-collision",
+        action="store_true",
+        help="Explicitly allow replacing an existing Hermes model alias in the preview.",
+    )
+    setup.add_argument("--star", action="store_true", help="Star the oh-my-hermes GitHub repo via gh after setup (opt-in; never prompted).")
+    setup.add_argument(
+        "--profile",
+        action="append",
+        default=[],
+        help="Setup profile category to record by number or id. Repeat for multiple categories; choices are listed in setup output.",
+    )
+    setup.add_argument(
+        "--default-executor",
+        type=canonical_executor_profile,
+        choices=CODING_EXECUTOR_TARGETS,
+        default=None,
+        help="Durable coding-owner preference for automation and scripted installs. Interactive setup never asks; by default Hermes asks at the first coding request.",
+    )
+    setup.add_argument(
+        "--operating-model",
+        choices=operating_model_ids(),
+        default=None,
+        help="Advanced: record a Hermes-facing operating model for this profile; normal setup lets Hermes choose per request.",
+    )
+    setup.add_argument(
+        "--memory-mode",
+        choices=PROJECT_MEMORY_MODES,
+        default=None,
+        help="Configure OMH project memory: off, review-first, or auto-safe. Defaults to auto-safe; only a mode passed here is pinned.",
+    )
+    setup.add_argument(
+        "--with-plugin",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    setup.add_argument(
+        "--with-menubar",
+        action="store_true",
+        help="Install and start the native macOS OMH menu bar helper when supported.",
+    )
+    setup.add_argument(
+        "--no-menubar",
+        action="store_true",
+        help="Do not start the native macOS OMH menu bar helper during setup.",
+    )
+    setup.add_argument(
+        "--with-mcp",
+        action="store_true",
+        help="Prepare the optional OMH MCP bridge. Use --mcp-host to also write a supported host config.",
+    )
+    setup.add_argument(
+        "--mcp-host",
+        choices=MCP_HOST_CONFIG_RECIPE_HOSTS,
+        default="generic",
+        help="MCP host config to prepare when --with-mcp is set. generic keeps recipe-only output.",
+    )
+    setup.add_argument(
+        "--mcp-config-path",
+        default=None,
+        help="Explicit host config path to update for --with-mcp --mcp-host.",
+    )
+    setup.add_argument(
+        "--mcp-command",
+        default="omh",
+        help="Command path the MCP host should launch. Use an absolute installed omh path when needed.",
+    )
+    setup.add_argument(
+        "--profile-pack",
+        action="append",
+        default=[],
+        help="Advanced: install optional visible Hermes role/profile files such as startup-delivery, engineering-delivery, research-strategy, or cto-loop.",
+    )
+    setup.set_defaults(func=cmd_setup)
+
+    install = sub.add_parser("install", help="Refresh the managed OMH skill pack without changing Hermes registration.")
+    _add_common_install_options(install)
+    install.add_argument("--target", choices=("hermes", "agents"), default="hermes", help="Generate managed Hermes skills or the portable Agent Skills projection.")
+    from ..skills.host_adapters import HOST_ADAPTERS
+
+    install.add_argument("--host", choices=tuple(adapter.host for adapter in HOST_ADAPTERS), help="Install only this host's catalog target; defaults to repo scope in the current project directory.")
+    install.add_argument("--scope", dest="agents_scope", choices=("repo", "user"), help="Agent Skills scope. With --host: current directory or user home. Without: git-root or user-home .agents/skills plus a .claude/skills copy.")
+    install.add_argument("--status", action="store_true", help="Inspect Agent Skills freshness and local modifications without writing.")
+    install.add_argument("--json", action="store_true", help="Print the full machine-readable install payload.")
+    install.set_defaults(func=cmd_install)
+
+    update = sub.add_parser("update", help="Refresh OMH from a preview, stable, local, or explicit package source.")
+    _add_common_install_options(update)
+    update.add_argument("--json", action="store_true", help="Print the full machine-readable update payload.")
+    update.add_argument("--yes", action="store_true", help="Accepted for compatibility; update asks nothing.")
+    update.add_argument("--interactive", action="store_true", help="Accepted for compatibility; update asks nothing.")
+    update.add_argument("--no-interactive", action="store_true", help="Accepted for compatibility; update asks nothing.")
+    update.add_argument("--recover-known-good", action="store_true", help="Atomically restore the retained known-good installer generation.")
+    update.add_argument(
+        "--no-omh-tui",
+        action="store_true",
+        help=(
+            "Accepted for compatibility and ignored: OMH writes no Hermes display key, "
+            "and this run still takes back any an earlier version wrote."
+        ),
+    )
+    update.set_defaults(func=cmd_update)
+
+    convert = sub.add_parser("convert", help="Import a local skills directory into the managed OMH skill pack.")
+    convert.add_argument("--from-skills-dir", required=True)
+    convert.add_argument("--force", action="store_true")
+    convert.add_argument("--dry-run", action="store_true")
+    convert.add_argument("--json", action="store_true", help="Print the full machine-readable convert payload.")
+    convert.set_defaults(func=cmd_convert)
+
+    apply = sub.add_parser("apply", help="Register the managed OMH skills directory in Hermes config.")
+    apply.add_argument("--dry-run", action="store_true")
+    apply.add_argument("--json", action="store_true", help="Print the machine-readable apply payload.")
+    apply.set_defaults(func=cmd_apply)
+
+    uninstall = sub.add_parser("uninstall", help="Remove OMH-managed registration, local files, and optional command package.")
+    uninstall.add_argument("--registration-only", action="store_true", help="Only remove the OMH skills.external_dirs registration from Hermes config.")
+    uninstall.add_argument("--remove-files", action="store_true", help="Legacy mode: remove Hermes registration and the managed OMH home directory.")
+    uninstall.add_argument("--all", action="store_true", help="Remove all OMH-managed local state, plugin bundle, and generated team role files.")
+    uninstall.add_argument("--purge", action="store_true", help="Alias for --all.")
+    uninstall.add_argument("--keep-command", action="store_true", help="Keep the installer-managed omh command venv/shim during full cleanup.")
+    uninstall.add_argument("--force", action="store_true", help="Also remove an unmanaged ~/.hermes/plugins/omh directory when using --all.")
+    uninstall.add_argument("--dry-run", action="store_true")
+    uninstall.add_argument("--json", action="store_true", help="Print the machine-readable uninstall payload.")
+    uninstall.add_argument("--language", default=None, help=f"Human output language ({', '.join(LANGUAGE_CODES)}).")
+    uninstall.set_defaults(func=cmd_uninstall)
+
+    list_cmd = sub.add_parser("list", help="Show the installed managed skill manifest.")
+    list_cmd.add_argument("--json", action="store_true", help="Print the full machine-readable manifest.")
+    list_cmd.set_defaults(func=cmd_list)
+
+    skill_profile = sub.add_parser(
+        "skill-profile",
+        help="Inspect or explicitly reconcile the installed core/full skill profile.",
+    )
+    skill_profile_sub = skill_profile.add_subparsers(dest="skill_profile_command", required=True)
+    skill_profile_status = skill_profile_sub.add_parser(
+        "status",
+        help="Show the requested profile, the effective installed profile, and retained exceptions.",
+    )
+    skill_profile_status.add_argument("--json", action="store_true", help="Print the full machine-readable profile state.")
+    skill_profile_status.set_defaults(func=cmd_skill_profile_status)
+    skill_profile_reconcile = skill_profile_sub.add_parser(
+        "reconcile",
+        help=(
+            "Explicitly shrink an existing install to the core profile by removing unmodified "
+            "managed full-only skills. setup/install/update never do this."
+        ),
+    )
+    skill_profile_reconcile.add_argument(
+        "--to",
+        choices=("core",),
+        default="core",
+        help="Target profile to reconcile down to. Only core shrinks an install.",
+    )
+    skill_profile_reconcile.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the removals and retained exceptions without deleting anything.",
+    )
+    skill_profile_reconcile.add_argument("--json", action="store_true", help="Print the full machine-readable reconcile payload.")
+    skill_profile_reconcile.set_defaults(func=cmd_skill_profile_reconcile)
+
+    # Same deferred-import reason as `capability_policy` below.
+    from .setup_profile_pack import add_setup_profile_commands
+
+    add_setup_profile_commands(sub)
+
+    # Imported here rather than at module scope: `capability_policy` is a
+    # command module like the ones `main` imports from here, so a top-level
+    # import would close a cycle through this module's own parser wiring.
+    from .capability_policy import (
+        cmd_capability_policy_disable,
+        cmd_capability_policy_enable,
+        cmd_capability_policy_status,
+    )
+
+    capability_policy = sub.add_parser(
+        "capability-policy",
+        help="Show or change which OMH capability families this install offers.",
+    )
+    capability_policy_sub = capability_policy.add_subparsers(dest="capability_policy_command", required=True)
+    capability_policy_status = capability_policy_sub.add_parser(
+        "status",
+        help="Show each capability family, whether it is offered, and the command that flips it.",
+    )
+    capability_policy_status.add_argument("--json", action="store_true", help="Print the full machine-readable policy report.")
+    capability_policy_status.set_defaults(func=cmd_capability_policy_status)
+    capability_policy_disable = capability_policy_sub.add_parser(
+        "disable",
+        help="Stop offering one capability family. Core skills are never removed and the change is reversible.",
+    )
+    capability_policy_disable.add_argument("family", help="Capability family id, label, or short alias (for example memory).")
+    capability_policy_disable.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the affected workflows without writing the policy.",
+    )
+    capability_policy_disable.add_argument("--json", action="store_true", help="Print the full machine-readable change payload.")
+    capability_policy_disable.set_defaults(func=cmd_capability_policy_disable)
+    capability_policy_enable = capability_policy_sub.add_parser(
+        "enable",
+        help="Offer one capability family again.",
+    )
+    capability_policy_enable.add_argument("family", help="Capability family id, label, or short alias (for example memory).")
+    capability_policy_enable.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the affected workflows without writing the policy.",
+    )
+    capability_policy_enable.add_argument("--json", action="store_true", help="Print the full machine-readable change payload.")
+    capability_policy_enable.set_defaults(func=cmd_capability_policy_enable)
+
+    doctor = sub.add_parser("doctor", help="Check local OMH install health and Hermes skill registration.")
+    doctor.add_argument("--json", action="store_true", help="Print the full machine-readable doctor payload.")
+    doctor.add_argument("--language", default=None, help=f"Human output language ({', '.join(LANGUAGE_CODES)}).")
+    doctor.add_argument(
+        "--no-personal-files",
+        action="store_true",
+        help=(
+            "Do not open Hermes personal files (SOUL.md, memories/MEMORY.md, memories/USER.md); "
+            "the checks that need them are reported as skipped."
+        ),
+    )
+    doctor.add_argument(
+        "--no-state-write",
+        action="store_true",
+        help=(
+            "Write nothing under the OMH home: no runtime/state.json `last_doctor` entry and no write probes; "
+            "writability is then checked from permissions and reported as not probed."
+        ),
+    )
+    add_doctor_profile_isolation_argument(doctor)
+    doctor.set_defaults(func=cmd_doctor)
+
+    recommend = sub.add_parser("recommend", help="Map a task description to likely OMH workflow skills.")
+    recommend.add_argument("task", nargs="+", help="Task description to map to OMH workflow skills.")
+    recommend.add_argument("--limit", type=int, default=5, help="Maximum recommendations to return.")
+    recommend.add_argument("--json", action="store_true", help="Print the full machine-readable recommendation payload.")
+    recommend.set_defaults(func=cmd_recommend)
+
+    snippet = sub.add_parser("snippet", help="Print or write the workspace guidance snippet for agents.")
+    snippet.add_argument("--dry-run", action="store_true")
+    snippet.add_argument("--output", default=None)
+    snippet.add_argument("--json", action="store_true", help="Print machine-readable output when writing to --output.")
+    snippet.set_defaults(func=cmd_snippet)
+
+    probe = sub.add_parser("probe", help="Inspect observable OMH/Hermes capability surfaces.")
+    probe.add_argument(
+        "--parity",
+        action="store_true",
+        help="Include the OMH parity matrix for common oh-my agent runtime capability axes.",
+    )
+    probe.add_argument(
+        "--roadmap",
+        action="store_true",
+        help="Include next actions that separate product setup gaps from missing host/runtime evidence.",
+    )
+    probe.add_argument("--json", action="store_true", help="Print the full machine-readable capability payload.")
+    probe.set_defaults(func=cmd_probe)
+
+    profile = sub.add_parser("profile", help="List or inspect optional visible team role/profile packs.")
+    profile_sub = profile.add_subparsers(dest="profile_command", required=True)
+    profile_list = profile_sub.add_parser("list")
+    profile_list.add_argument("--json", action="store_true", help="Print the full machine-readable profile pack catalog.")
+    profile_list.set_defaults(func=cmd_profile_list)
+    profile_inspect = profile_sub.add_parser("inspect")
+    profile_inspect.add_argument("id")
+    profile_inspect.add_argument("--json", action="store_true", help="Print the full machine-readable profile pack payload.")
+    profile_inspect.set_defaults(func=cmd_profile_inspect)

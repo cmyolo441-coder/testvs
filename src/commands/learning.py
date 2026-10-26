@@ -1,0 +1,1005 @@
+from __future__ import annotations
+
+import argparse
+import json
+
+from ..coding.executors import canonical_executor_profile
+from ..ingress import CHAT_SOURCES, extract_message_text
+from ..installer import OmhError
+from ..quality.routing_log_calibration import (
+    build_routing_log_calibration,
+    format_routing_log_calibration,
+)
+from ..routing.chat import CONFIDENCE_LEVELS
+from ..workflow_learning import (
+    WorkflowLearningError,
+    attach_learning_trace_ref_to_interaction,
+    build_improvement_candidate,
+    build_improvement_patch_proposal,
+    build_self_improvement_store_routing,
+    build_self_improvement_store_route_record,
+    build_workflow_learning_review_queue,
+    build_workflow_learning_audit,
+    build_routing_quality_metrics,
+    build_learning_export_bundle,
+    build_regression_case_from_trace,
+    build_runtime_run_learning_record,
+    build_trace_from_chat_interaction,
+    build_workflow_eval_result,
+    check_learning_index,
+    learning_export_ref,
+    learning_export_path,
+    learning_trace_ref,
+    latest_workflow_eval_result,
+    list_learning_traces,
+    rebuild_learning_index,
+    record_missed_route,
+    replay_regression_cases,
+    review_improvement_candidate,
+    review_self_improvement_store_route,
+    self_improvement_store_route_ref,
+    list_self_improvement_store_routes,
+    show_improvement_candidate,
+    show_learning_trace,
+    write_improvement_candidate,
+    write_improvement_patch_proposal,
+    write_learning_export,
+    write_learning_trace,
+    write_regression_case,
+    write_self_improvement_store_route,
+    write_workflow_eval,
+)
+from ..workflows.runtime_learning_recap import (
+    build_runtime_learning_recap,
+    list_runtime_learning_recaps,
+    runtime_learning_recap_ref,
+    show_runtime_learning_recap,
+    write_runtime_learning_recap,
+)
+from ..workflows.skill_draft import (
+    build_skill_draft,
+    check_skill_draft_generated_output,
+    list_skill_drafts,
+    review_skill_draft,
+    show_skill_draft,
+    skill_draft_is_active,
+    skill_draft_ref,
+    write_skill_draft,
+)
+from ..local_store import utc_now
+from ..wrapper.contract import INTERACTION_MODES, build_chat_interaction_payload
+from .browser_skill_promotion import add_skill_promotion_commands
+from .common import _chat_input_and_metadata, _explicit_source_metadata, _paths, _print_json, _wants_json
+
+
+def cmd_learning_route_signal(args: argparse.Namespace) -> int:
+    try:
+        event_or_message, source_metadata = _chat_input_and_metadata(args)
+        signal_text = extract_message_text(event_or_message) if isinstance(event_or_message, dict) else str(event_or_message)
+        source_kind = args.source_kind or source_metadata.get("source", "") or args.source or "operator_feedback"
+        routing = build_self_improvement_store_routing(signal_text, source_kind=source_kind)
+        payload: dict[str, object] = {
+            "schema_version": "learning_store_route_result/v1",
+            "recorded": False,
+            "routing": routing,
+            "claim_boundary": (
+                "Store routing is a metadata-only preview. It does not write memory, patch skills, update wiki notes, "
+                "create automation, or record retrospectives."
+            ),
+        }
+        if args.record:
+            source_ref = args.source_ref or args.source_event_id or source_metadata.get("source_event_id", "")
+            record = write_self_improvement_store_route(
+                _paths(args),
+                build_self_improvement_store_route_record(routing, source_ref=source_ref, title=args.title or ""),
+            )
+            payload.update(
+                {
+                    "recorded": True,
+                    "store_route_ref": self_improvement_store_route_ref(str(record["route_id"])),
+                    "store_route": record,
+                    "claim_boundary": (
+                        "Store routing was recorded as metadata-only review state. It still does not write memory, "
+                        "patch skills, update wiki notes, create automation, or record retrospectives."
+                    ),
+                }
+            )
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 0
+
+
+def cmd_learning_record(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        if args.from_runtime_run:
+            record = build_runtime_run_learning_record(
+                paths,
+                args.from_runtime_run,
+                outcome=args.outcome,
+                feedback_summary=args.feedback_summary or "",
+            )
+            trace = record["trace"]
+            recap = record["recap"]
+            write_learning_trace(paths, trace)
+            write_runtime_learning_recap(paths, recap)
+            payload: dict[str, object] = {
+                "schema_version": "learning_record_result/v1",
+                "source_kind": "runtime_run",
+                "learning_trace_ref": learning_trace_ref(str(trace["trace_id"])),
+                "runtime_learning_recap_ref": runtime_learning_recap_ref(str(recap["recap_id"])),
+                "trace": trace,
+                "runtime_learning_recap": recap,
+                "claim_boundary": (
+                    "The trace records existing runtime metadata only; it does not add execution evidence. "
+                    "The recap separates the supplied operator outcome from observed completion evidence."
+                ),
+            }
+        else:
+            event_or_message, source_metadata = _chat_input_and_metadata(args)
+            interaction = build_chat_interaction_payload(
+                event_or_message,
+                source=args.source,
+                mode=args.mode,
+                limit=args.limit,
+                min_confidence=args.min_confidence,
+                include_message=False,
+                source_metadata={**source_metadata, **_explicit_source_metadata(args)},
+                executor_target=args.executor,
+            )
+            trace = build_trace_from_chat_interaction(
+                interaction,
+                source_ref=args.source_ref or args.source_event_id or "",
+                outcome=args.outcome,
+                feedback_summary=args.feedback_summary or "",
+            )
+            write_learning_trace(paths, trace)
+            payload = {
+                "schema_version": "learning_record_result/v1",
+                "source_kind": "chat_interaction",
+                "learning_trace_ref": learning_trace_ref(str(trace["trace_id"])),
+                "trace": trace,
+                "interaction": attach_learning_trace_ref_to_interaction(interaction, trace),
+                "claim_boundary": "The learning ref is exposed only after the trace is written; it is not execution evidence.",
+            }
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 0
+
+
+def cmd_learning_recap_build(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        recap = build_runtime_learning_recap(
+            paths,
+            args.run_id,
+            operator_outcome=args.outcome,
+            operator_feedback_summary=args.feedback_summary or "",
+        )
+        if not args.dry_run:
+            write_runtime_learning_recap(paths, recap)
+    except FileNotFoundError as exc:
+        raise OmhError(f"runtime run not found: {args.run_id}") from exc
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "learning_recap_result/v1",
+            "recorded": not args.dry_run,
+            "runtime_learning_recap_ref": runtime_learning_recap_ref(str(recap["recap_id"])),
+            "runtime_learning_recap": recap,
+            "claim_boundary": (
+                "Building a recap reads stored runtime observations only. It runs nothing, "
+                "patches no skill, writes no memory, and approves no candidate."
+            ),
+        }
+    )
+    return 0
+
+
+def cmd_learning_recap_list(args: argparse.Namespace) -> int:
+    try:
+        recaps = list_runtime_learning_recaps(_paths(args), run_id=args.run_id or "", limit=args.limit)
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "runtime_learning_recap_list/v1",
+            "recaps": recaps,
+            "claim_boundary": (
+                "Each row lists one stored revision. Operator outcome and observed completion "
+                "are separate columns and neither one sets the other."
+            ),
+        }
+    )
+    return 0
+
+
+def cmd_learning_recap_show(args: argparse.Namespace) -> int:
+    try:
+        recap = show_runtime_learning_recap(_paths(args), args.recap_id)
+    except FileNotFoundError as exc:
+        raise OmhError(f"runtime learning recap not found: {args.recap_id}") from exc
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(recap)
+    return 0
+
+
+def cmd_learning_missed_route(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        event_or_message, source_metadata = _chat_input_and_metadata(args)
+        interaction = build_chat_interaction_payload(
+            event_or_message,
+            source=args.source,
+            mode=args.mode,
+            limit=args.limit,
+            min_confidence=args.min_confidence,
+            include_message=False,
+            source_metadata={**source_metadata, **_explicit_source_metadata(args)},
+            executor_target=args.executor,
+        )
+        payload = record_missed_route(
+            paths,
+            interaction,
+            source_ref=args.source_ref or args.source_event_id or "",
+            expected_workflow=args.expected_workflow or None,
+            expected_harness=args.expected_harness or None,
+            expected_next_action=args.expected_next_action or None,
+            fixture_message=args.fixture_message or args.redacted_message or "",
+            rubric_id=args.rubric,
+            target_type=args.target_type,
+            title=args.title or "Review missed OMH workflow route",
+            dry_run=args.dry_run,
+        )
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 0
+
+
+def cmd_learning_list(args: argparse.Namespace) -> int:
+    try:
+        traces = list_learning_traces(_paths(args), limit=args.limit)
+    except (OSError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "learning_trace_list/v1",
+            "traces": traces,
+            "claim_boundary": "Trace lists summarize local learning records only; they do not prove workflow execution.",
+        }
+    )
+    return 0
+
+
+def cmd_learning_show(args: argparse.Namespace) -> int:
+    try:
+        trace = show_learning_trace(_paths(args), args.trace_id)
+    except FileNotFoundError as exc:
+        raise OmhError(f"learning trace not found: {args.trace_id}") from exc
+    except (OSError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(trace)
+    return 0
+
+
+def cmd_learning_eval(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        trace = show_learning_trace(paths, args.trace_id)
+        result = build_workflow_eval_result(trace, rubric_id=args.rubric)
+        if not args.dry_run:
+            write_workflow_eval(paths, result)
+    except FileNotFoundError as exc:
+        raise OmhError(f"learning trace not found: {args.trace_id}") from exc
+    except (OSError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "learning_eval_result/v1",
+            "recorded": not args.dry_run,
+            "eval": result,
+        }
+    )
+    return 0
+
+
+def cmd_learning_candidate(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        trace = show_learning_trace(paths, args.trace_id)
+        existing_eval = latest_workflow_eval_result(paths, args.trace_id, rubric_id=args.rubric)
+        eval_result = existing_eval or build_workflow_eval_result(
+            trace,
+            rubric_id=args.rubric,
+        )
+        candidate = build_improvement_candidate(trace, eval_result, target_type=args.target_type, title=args.title or "")
+        if not args.dry_run:
+            if existing_eval is None:
+                write_workflow_eval(paths, eval_result)
+            write_improvement_candidate(paths, candidate)
+    except FileNotFoundError as exc:
+        raise OmhError(f"learning trace not found: {args.trace_id}") from exc
+    except (OSError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "learning_candidate_result/v1",
+            "recorded": not args.dry_run,
+            "eval": eval_result,
+            "candidate": candidate,
+        }
+    )
+    return 0
+
+
+def cmd_learning_proposal(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        candidate = show_improvement_candidate(paths, args.candidate_id)
+        proposal = build_improvement_patch_proposal(paths, candidate)
+        recorded = False
+        if not args.dry_run:
+            write_improvement_patch_proposal(paths, proposal)
+            recorded = True
+    except FileNotFoundError as exc:
+        raise OmhError(f"improvement candidate not found: {args.candidate_id}") from exc
+    except (OSError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "learning_patch_proposal_result/v1",
+            "recorded": recorded,
+            "dry_run": args.dry_run,
+            "proposal": proposal,
+            "claim_boundary": (
+                "The patch proposal is handoff material only. OMH did not edit source files, "
+                "run tests, pass review, or prove future behavior changed."
+            ),
+        }
+    )
+    return 0
+
+
+def cmd_learning_review(args: argparse.Namespace) -> int:
+    try:
+        payload = build_workflow_learning_review_queue(_paths(args), limit=None if args.all else args.limit)
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 0
+
+
+def cmd_learning_store_routes(args: argparse.Namespace) -> int:
+    try:
+        payload = list_self_improvement_store_routes(
+            _paths(args),
+            limit=None if args.all else args.limit,
+            include_resolved=args.include_resolved,
+        )
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 1 if payload.get("status") == "blocked" else 0
+
+
+def cmd_learning_review_route(args: argparse.Namespace) -> int:
+    try:
+        route = review_self_improvement_store_route(
+            _paths(args),
+            args.route_id,
+            decision=args.decision,
+            destination=args.destination or "",
+            reviewer_ref=args.reviewer_ref or "operator",
+            review_note=args.review_note or "",
+        )
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "learning_store_route_review_result/v1",
+            "recorded": True,
+            "decision": args.decision,
+            "store_route_ref": self_improvement_store_route_ref(str(route["route_id"])),
+            "store_route": route,
+            "claim_boundary": (
+                "The store route review records a destination decision only. OMH did not write memory, "
+                "patch skills, update wiki notes, create automation, accept a retrospective, run CI, or merge."
+            ),
+        }
+    )
+    return 0
+
+
+def cmd_learning_review_candidate(args: argparse.Namespace) -> int:
+    try:
+        candidate = review_improvement_candidate(
+            _paths(args),
+            args.candidate_id,
+            decision=args.decision,
+            reviewer_ref=args.reviewer_ref or "operator",
+            review_note=args.review_note or "",
+        )
+    except FileNotFoundError as exc:
+        raise OmhError(f"improvement candidate not found: {args.candidate_id}") from exc
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "learning_candidate_review_result/v1",
+            "recorded": True,
+            "decision": args.decision,
+            "candidate": candidate,
+            "next_action": f"omh learning proposal {args.candidate_id}" if args.decision == "approve" else "review_improvement",
+            "claim_boundary": (
+                "The candidate review records a human gate decision only. OMH did not apply source edits, "
+                "run tests, pass CI, or prove future behavior changed."
+            ),
+        }
+    )
+    return 0
+
+
+def cmd_learning_regression_add(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        trace = show_learning_trace(paths, args.trace_id)
+        case = build_regression_case_from_trace(
+            trace,
+            redacted_message=args.fixture_message or args.redacted_message or "",
+            expected_workflow=args.expected_workflow or None,
+            expected_harness=args.expected_harness or None,
+            expected_next_action=args.expected_next_action or None,
+        )
+        write_regression_case(paths, case)
+    except FileNotFoundError as exc:
+        raise OmhError(f"learning trace not found: {args.trace_id}") from exc
+    except (OSError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "learning_regression_case_result/v1",
+            "regression_case": case,
+            "claim_boundary": (
+                "The case stores only operator-provided minimized fixture text when provided; "
+                "OMH cannot prove redaction and does not treat the fixture as observed workflow execution."
+            ),
+        }
+    )
+    return 0
+
+
+def cmd_learning_regression_replay(args: argparse.Namespace) -> int:
+    try:
+        payload = replay_regression_cases(_paths(args), limit=args.limit)
+    except (OSError, WorkflowLearningError, ValueError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 0
+
+
+def cmd_learning_index_check(args: argparse.Namespace) -> int:
+    try:
+        payload = check_learning_index(_paths(args))
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 0 if payload.get("ok") else 1
+
+
+def cmd_learning_index_rebuild(args: argparse.Namespace) -> int:
+    try:
+        payload = rebuild_learning_index(_paths(args), dry_run=args.dry_run)
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 0 if payload.get("status") in {"rebuilt", "dry_run"} else 1
+
+
+def cmd_learning_export(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        limit = None if args.all else args.limit
+        bundle = build_learning_export_bundle(paths, trace_ids=args.trace_id or [], limit=limit)
+        export_path = learning_export_path(paths, str(bundle["export_id"]))
+        recorded = False
+        if not args.dry_run and bundle.get("status") == "ready":
+            write_learning_export(paths, bundle)
+            recorded = True
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "learning_export_result/v1",
+            "recorded": recorded,
+            "dry_run": args.dry_run,
+            "learning_export_ref": learning_export_ref(str(bundle["export_id"])),
+            "export_path": str(export_path),
+            "export": bundle,
+            "claim_boundary": (
+                "The export is a metadata-only review bundle. It is not model training, "
+                "automatic skill improvement, workflow execution, or observed runtime evidence."
+            ),
+        }
+    )
+    return 0
+
+
+def cmd_learning_audit(args: argparse.Namespace) -> int:
+    try:
+        payload = build_workflow_learning_audit(_paths(args), limit=None if args.all else args.limit)
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 0 if payload.get("status") in {"ready", "no_records", "needs_attention"} else 1
+
+
+def cmd_learning_metrics(args: argparse.Namespace) -> int:
+    try:
+        payload = build_routing_quality_metrics(_paths(args), limit=args.limit)
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(payload)
+    return 0
+
+
+def cmd_learning_route_calibration(args: argparse.Namespace) -> int:
+    """Compare the hand-written routing corpus against locally recorded decisions."""
+    paths = _paths(args)
+    since = None if args.since is None else str(args.since)
+    payload = build_routing_log_calibration(paths.runtime_runs_dir, since=since)
+    if _wants_json(args):
+        _print_json(payload)
+    else:
+        print(format_routing_log_calibration(payload))
+    return 0
+
+
+SKILL_DRAFT_CLAIM_BOUNDARY_NOTE = (
+    "A skill draft is review material stored under .omh/learning/skill-drafts/. OMH did not install a skill, "
+    "write anything under skills/, register catalog data, run the workflow, pass review, run CI, or merge."
+)
+
+
+def _declared_inputs(values: list[str]) -> list[dict[str, str]]:
+    inputs: list[dict[str, str]] = []
+    for value in values:
+        name, separator, description = value.partition("=")
+        if not separator or not name.strip() or not description.strip():
+            raise OmhError(f"--input must be given as name=description, got: {value}")
+        inputs.append({"name": name.strip(), "description": description.strip()})
+    return inputs
+
+
+def cmd_learning_skill_draft_new(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        event_or_message, _ = _chat_input_and_metadata(args)
+        message = extract_message_text(event_or_message) if isinstance(event_or_message, dict) else str(event_or_message)
+        draft = build_skill_draft(
+            message,
+            source_runs=args.source_run,
+            proposed_skill_name=args.name,
+            fixed_instructions=args.instruction,
+            declared_inputs=_declared_inputs(args.input),
+            preconditions=args.precondition,
+            stop_conditions=args.stop_condition,
+            verification_steps=args.verification,
+            created_at=utc_now(),
+        )
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    if draft is None:
+        # AC1: no explicit teach-this-workflow request, no draft. Passive
+        # activity has no other way into this command.
+        _print_json(
+            {
+                "schema_version": "skill_draft_result/v1",
+                "status": "no_explicit_learning_signal",
+                "recorded": False,
+                "claim_boundary": (
+                    "OMH records a skill draft only from an explicit user request such as "
+                    "\"turn this into a skill\". Nothing was captured or converted."
+                ),
+            }
+        )
+        return 1
+    try:
+        checks = check_skill_draft_generated_output(draft)
+        if not args.dry_run:
+            write_skill_draft(paths, draft)
+    except (OSError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "skill_draft_result/v1",
+            "status": "drafted",
+            "recorded": not args.dry_run,
+            "dry_run": args.dry_run,
+            "skill_draft_ref": skill_draft_ref(str(draft["draft_id"])),
+            "draft": draft,
+            "generated_output_check": checks,
+            "next_command": f"omh learning skill-draft review {draft['draft_id']} --decision approve",
+            "claim_boundary": SKILL_DRAFT_CLAIM_BOUNDARY_NOTE,
+        }
+    )
+    return 0
+
+
+def cmd_learning_skill_draft_list(args: argparse.Namespace) -> int:
+    try:
+        drafts = list_skill_drafts(_paths(args), limit=args.limit)
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "skill_draft_list/v1",
+            "drafts": drafts,
+            "claim_boundary": SKILL_DRAFT_CLAIM_BOUNDARY_NOTE,
+        }
+    )
+    return 0
+
+
+def cmd_learning_skill_draft_show(args: argparse.Namespace) -> int:
+    try:
+        draft = show_skill_draft(_paths(args), args.draft_id)
+        checks = check_skill_draft_generated_output(draft)
+    except FileNotFoundError as exc:
+        raise OmhError(f"skill draft not found: {args.draft_id}") from exc
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "skill_draft_show/v1",
+            "draft": draft,
+            "active": skill_draft_is_active(draft),
+            "generated_output_check": checks,
+            "activation_blockers": list(checks["errors"]),
+            "claim_boundary": SKILL_DRAFT_CLAIM_BOUNDARY_NOTE,
+        }
+    )
+    return 0
+
+
+def cmd_learning_skill_draft_review(args: argparse.Namespace) -> int:
+    try:
+        paths = _paths(args)
+        reviewed = review_skill_draft(
+            show_skill_draft(paths, args.draft_id),
+            decision=args.decision,
+            reviewer_ref=args.reviewer_ref or "operator",
+            reviewed_at=utc_now(),
+            review_note=args.review_note or "",
+        )
+        write_skill_draft(paths, reviewed)
+    except FileNotFoundError as exc:
+        raise OmhError(f"skill draft not found: {args.draft_id}") from exc
+    except (OSError, json.JSONDecodeError, ValueError, WorkflowLearningError) as exc:
+        raise OmhError(str(exc)) from exc
+    _print_json(
+        {
+            "schema_version": "skill_draft_review_result/v1",
+            "recorded": True,
+            "decision": args.decision,
+            "activated": skill_draft_is_active(reviewed),
+            "skill_draft_ref": skill_draft_ref(str(reviewed["draft_id"])),
+            "draft": reviewed,
+            "claim_boundary": SKILL_DRAFT_CLAIM_BOUNDARY_NOTE,
+        }
+    )
+    return 0
+
+
+def _add_skill_draft_commands(learning_sub) -> None:
+    skill_draft = learning_sub.add_parser(
+        "skill-draft",
+        help="Turn an explicitly identified proven workflow into an inactive, reviewable skill draft.",
+    )
+    skill_draft_sub = skill_draft.add_subparsers(dest="skill_draft_command", required=True)
+
+    new = skill_draft_sub.add_parser(
+        "new",
+        help="Draft a skill proposal from an explicit teach-this-workflow request and user-selected runs.",
+    )
+    new.add_argument("message", nargs="*", help="The explicit user request, for example 'turn this into a skill: ...'.")
+    new.add_argument("--source", choices=CHAT_SOURCES, default="generic")
+    new.add_argument("--stdin", action="store_true")
+    new.add_argument("--event-json", default=None)
+    new.add_argument("--source-event-id", default="")
+    new.add_argument("--channel-ref", default="")
+    new.add_argument("--user-ref", default="")
+    new.add_argument("--name", required=True, help="Proposed skill name as a lowercase-hyphen slug.")
+    new.add_argument("--source-run", action="append", default=[], help="User-selected source run id; repeat per run.")
+    new.add_argument("--instruction", action="append", default=[], help="One fixed instruction; repeat in order.")
+    new.add_argument("--input", action="append", default=[], help="One variable input as name=description; repeat per input.")
+    new.add_argument("--precondition", action="append", default=[], help="One precondition; repeat per condition.")
+    new.add_argument("--stop-condition", action="append", default=[], help="One stop condition; repeat per condition.")
+    new.add_argument("--verification", action="append", default=[], help="One required verification step; repeat per step.")
+    new.add_argument("--dry-run", action="store_true")
+    new.set_defaults(func=cmd_learning_skill_draft_new)
+
+    list_drafts = skill_draft_sub.add_parser("list", help="List local skill drafts and their review state.")
+    list_drafts.add_argument("--limit", type=int, default=None)
+    list_drafts.set_defaults(func=cmd_learning_skill_draft_list)
+
+    show = skill_draft_sub.add_parser("show", help="Show one skill draft with its current generated-output checks.")
+    show.add_argument("draft_id")
+    show.set_defaults(func=cmd_learning_skill_draft_show)
+
+    review = skill_draft_sub.add_parser(
+        "review",
+        help="Record an explicit review decision. Approval activates the draft only when the generated-output checks pass.",
+    )
+    review.add_argument("draft_id")
+    review.add_argument("--decision", choices=("approve", "revise", "reject"), required=True)
+    review.add_argument("--reviewer-ref", default="operator")
+    review.add_argument(
+        "--review-note",
+        default="",
+        help="Optional reviewer note; OMH stores only its hash and length, not the note text.",
+    )
+    review.set_defaults(func=cmd_learning_skill_draft_review)
+
+
+def _add_learning_commands(sub) -> None:
+    learning = sub.add_parser(
+        "learning",
+        help="Record workflow learning traces, evals, improvement candidates, and regression cases.",
+    )
+    learning_sub = learning.add_subparsers(dest="learning_command", required=True)
+
+    route_signal = learning_sub.add_parser(
+        "route-signal",
+        help="Classify a self-improvement signal before any memory, skill, wiki, retrospective, or automation write.",
+    )
+    route_signal.add_argument("message", nargs="*", help="Self-improvement signal to classify.")
+    route_signal.add_argument("--source", choices=CHAT_SOURCES, default="generic")
+    route_signal.add_argument("--stdin", action="store_true")
+    route_signal.add_argument("--event-json", default=None)
+    route_signal.add_argument("--source-kind", default="operator_feedback")
+    route_signal.add_argument("--source-event-id", default="")
+    route_signal.add_argument("--channel-ref", default="")
+    route_signal.add_argument("--user-ref", default="")
+    route_signal.add_argument("--source-ref", default="")
+    route_signal.add_argument("--title", default="")
+    route_signal.add_argument("--record", action="store_true")
+    route_signal.set_defaults(func=cmd_learning_route_signal)
+
+    record = learning_sub.add_parser("record", help="Persist a metadata-only learning trace from chat or runtime evidence.")
+    record.add_argument("message", nargs="*", help="Chat message to route and record as a learning trace.")
+    record.add_argument("--source", choices=CHAT_SOURCES, default="generic")
+    record.add_argument("--mode", choices=INTERACTION_MODES, default="auto")
+    record.add_argument("--limit", type=int, default=3)
+    record.add_argument("--min-confidence", choices=CONFIDENCE_LEVELS, default="high")
+    record.add_argument("--stdin", action="store_true")
+    record.add_argument("--event-json", default=None)
+    record.add_argument("--executor", type=canonical_executor_profile, default="choose")
+    record.add_argument("--source-ref", default="")
+    record.add_argument("--source-event-id", default="")
+    record.add_argument("--channel-ref", default="")
+    record.add_argument("--user-ref", default="")
+    record.add_argument("--from-runtime-run", default="")
+    record.add_argument("--outcome", choices=("unknown", "useful", "not_useful", "blocked", "failed"), default="unknown")
+    record.add_argument("--feedback-summary", default="")
+    record.set_defaults(func=cmd_learning_record)
+
+    recap = learning_sub.add_parser(
+        "recap",
+        help="Build, list, or show the bounded completion recap for one stored runtime run.",
+    )
+    recap_sub = recap.add_subparsers(dest="recap_command", required=True)
+
+    recap_build = recap_sub.add_parser(
+        "build",
+        help="Project one stored runtime run into runtime_learning_recap/v1 for its current revision.",
+    )
+    recap_build.add_argument("run_id")
+    recap_build.add_argument(
+        "--outcome",
+        choices=("unknown", "useful", "not_useful", "blocked", "failed"),
+        default="unknown",
+        help="Operator assessment. Recorded as supplied assessment; it never sets an evidence cell.",
+    )
+    recap_build.add_argument("--feedback-summary", default="")
+    recap_build.add_argument("--dry-run", action="store_true")
+    recap_build.set_defaults(func=cmd_learning_recap_build)
+
+    recap_list = recap_sub.add_parser("list", help="List stored runtime learning recap revisions.")
+    recap_list.add_argument("--run-id", default="")
+    recap_list.add_argument("--limit", type=int, default=None)
+    recap_list.set_defaults(func=cmd_learning_recap_list)
+
+    recap_show = recap_sub.add_parser("show", help="Show one stored runtime learning recap revision.")
+    recap_show.add_argument("recap_id")
+    recap_show.set_defaults(func=cmd_learning_recap_show)
+
+    missed_route = learning_sub.add_parser(
+        "missed-route",
+        help="Capture a reported missed OMH workflow route as trace, eval, regression, and review material.",
+    )
+    missed_route.add_argument("message", nargs="*", help="Chat message to route and record as a missed-route signal.")
+    missed_route.add_argument("--source", choices=CHAT_SOURCES, default="generic")
+    missed_route.add_argument("--mode", choices=INTERACTION_MODES, default="auto")
+    missed_route.add_argument("--limit", type=int, default=3)
+    missed_route.add_argument("--min-confidence", choices=CONFIDENCE_LEVELS, default="high")
+    missed_route.add_argument("--stdin", action="store_true")
+    missed_route.add_argument("--event-json", default=None)
+    missed_route.add_argument("--executor", type=canonical_executor_profile, default="choose")
+    missed_route.add_argument("--source-ref", default="")
+    missed_route.add_argument("--source-event-id", default="")
+    missed_route.add_argument("--channel-ref", default="")
+    missed_route.add_argument("--user-ref", default="")
+    missed_route.add_argument("--expected-workflow", default="")
+    missed_route.add_argument("--expected-harness", default="")
+    missed_route.add_argument("--expected-next-action", default="")
+    missed_route.add_argument(
+        "--fixture-message",
+        default="",
+        help="Operator-minimized replay fixture text. Omit it to create a non-replayable placeholder.",
+    )
+    missed_route.add_argument(
+        "--redacted-message",
+        default="",
+        help="Deprecated alias for --fixture-message; caller is responsible for minimizing private content.",
+    )
+    missed_route.add_argument("--rubric", default="missed-route")
+    missed_route.add_argument("--target-type", default="routing")
+    missed_route.add_argument("--title", default="")
+    missed_route.add_argument("--dry-run", action="store_true")
+    missed_route.set_defaults(func=cmd_learning_missed_route)
+
+    list_cmd = learning_sub.add_parser("list", help="List local workflow learning traces.")
+    list_cmd.add_argument("--limit", type=int, default=None)
+    list_cmd.set_defaults(func=cmd_learning_list)
+
+    show_cmd = learning_sub.add_parser("show", help="Show one workflow learning trace.")
+    show_cmd.add_argument("trace_id")
+    show_cmd.set_defaults(func=cmd_learning_show)
+
+    eval_cmd = learning_sub.add_parser("eval", help="Evaluate one learning trace against deterministic rubrics.")
+    eval_cmd.add_argument("trace_id")
+    eval_cmd.add_argument("--rubric", default="default")
+    eval_cmd.add_argument("--dry-run", action="store_true")
+    eval_cmd.set_defaults(func=cmd_learning_eval)
+
+    candidate = learning_sub.add_parser("candidate", help="Create a review-only improvement candidate from a trace eval.")
+    candidate.add_argument("trace_id")
+    candidate.add_argument("--rubric", default="default")
+    candidate.add_argument("--target-type", default="workflow_rubric")
+    candidate.add_argument("--title", default="")
+    candidate.add_argument("--dry-run", action="store_true")
+    candidate.set_defaults(func=cmd_learning_candidate)
+
+    proposal = learning_sub.add_parser(
+        "proposal",
+        help="Create a non-applying patch proposal from an approved improvement candidate.",
+    )
+    proposal.add_argument("candidate_id")
+    proposal.add_argument("--dry-run", action="store_true")
+    proposal.set_defaults(func=cmd_learning_proposal)
+
+    review = learning_sub.add_parser("review", help="Show the local workflow learning human-review queue.")
+    review.add_argument("--limit", type=int, default=20, help="Maximum review queue entries to return.")
+    review.add_argument("--all", action="store_true", help="Return the full review queue.")
+    review.set_defaults(func=cmd_learning_review)
+
+    store_routes = learning_sub.add_parser(
+        "store-routes",
+        help="List metadata-only self-improvement store-route records awaiting review.",
+    )
+    store_routes.add_argument("--limit", type=int, default=20, help="Maximum store routes to return.")
+    store_routes.add_argument("--all", action="store_true", help="Return all matching store routes.")
+    store_routes.add_argument("--include-resolved", action="store_true", help="Include approved, changed, and discarded routes.")
+    store_routes.set_defaults(func=cmd_learning_store_routes)
+
+    review_route = learning_sub.add_parser(
+        "review-route",
+        help="Record a metadata-only destination review decision for a store-route record.",
+    )
+    review_route.add_argument("route_id")
+    review_route.add_argument(
+        "--decision",
+        choices=("approve_destination", "change_destination", "discard"),
+        required=True,
+    )
+    review_route.add_argument("--destination", default="")
+    review_route.add_argument("--reviewer-ref", default="operator")
+    review_route.add_argument(
+        "--review-note",
+        default="",
+        help="Optional operator note; OMH stores only its hash and length, not the note text.",
+    )
+    review_route.set_defaults(func=cmd_learning_review_route)
+
+    review_candidate = learning_sub.add_parser(
+        "review-candidate",
+        help="Record a human review decision for an improvement candidate.",
+    )
+    review_candidate.add_argument("candidate_id")
+    review_candidate.add_argument("--decision", choices=("approve", "revise", "reject"), required=True)
+    review_candidate.add_argument("--reviewer-ref", default="operator")
+    review_candidate.add_argument(
+        "--review-note",
+        default="",
+        help="Optional operator note; OMH stores only its hash and length, not the note text.",
+    )
+    review_candidate.set_defaults(func=cmd_learning_review_candidate)
+
+    export = learning_sub.add_parser("export", help="Create a redacted workflow learning review bundle.")
+    export.add_argument("--trace-id", action="append", default=[], help="Trace id to include; may be repeated.")
+    export.add_argument("--limit", type=int, default=20, help="Maximum recent traces to include when no trace id is provided.")
+    export.add_argument("--all", action="store_true", help="Include all traces when no trace id is provided.")
+    export.add_argument("--dry-run", action="store_true")
+    export.set_defaults(func=cmd_learning_export)
+
+    audit = learning_sub.add_parser("audit", help="Audit local workflow learning readiness without mutating records.")
+    audit.add_argument("--limit", type=int, default=20, help="Maximum recent traces to summarize.")
+    audit.add_argument("--all", action="store_true", help="Audit and summarize all traces.")
+    audit.set_defaults(func=cmd_learning_audit)
+
+    metrics = learning_sub.add_parser(
+        "metrics",
+        help="Aggregate privacy-safe routing quality metrics from local learning traces.",
+    )
+    metrics.add_argument("--limit", type=int, default=None, help="Use only the newest N learning traces.")
+    metrics.set_defaults(func=cmd_learning_metrics)
+
+    calibration = learning_sub.add_parser(
+        "route-calibration",
+        help=(
+            "Compare the hand-written routing corpus against locally recorded routing decisions "
+            "(no network, no model, no message text)."
+        ),
+    )
+    calibration.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "ISO-8601 lower bound on the recorded timestamp. Defaults to the modification time of "
+            "src/routing/chat.py, so the report covers decisions made by the current router; pass "
+            "an empty string to read every record."
+        ),
+    )
+    calibration.add_argument("--json", action="store_true", help="Print the full machine-readable payload.")
+    calibration.set_defaults(func=cmd_learning_route_calibration)
+
+    regression = learning_sub.add_parser("regression", help="Manage deterministic workflow regression cases.")
+    regression_sub = regression.add_subparsers(dest="regression_command", required=True)
+
+    regression_add = regression_sub.add_parser("add", help="Create a regression case from a learning trace.")
+    regression_add.add_argument("trace_id")
+    regression_add.add_argument("--fixture-message", default="", help="Operator-minimized replay fixture text.")
+    regression_add.add_argument(
+        "--redacted-message",
+        default="",
+        help="Deprecated alias for --fixture-message; caller is responsible for minimizing private content.",
+    )
+    regression_add.add_argument("--expected-workflow", default="")
+    regression_add.add_argument("--expected-harness", default="")
+    regression_add.add_argument("--expected-next-action", default="")
+    regression_add.set_defaults(func=cmd_learning_regression_add)
+
+    regression_replay = regression_sub.add_parser("replay", help="Replay local workflow regression cases.")
+    regression_replay.add_argument("--limit", type=int, default=None)
+    regression_replay.set_defaults(func=cmd_learning_regression_replay)
+
+    index = learning_sub.add_parser("index", help="Check or rebuild the local workflow learning index.")
+    index_sub = index.add_subparsers(dest="index_command", required=True)
+
+    index_check = index_sub.add_parser("check", help="Validate learning_index.json against local learning records.")
+    index_check.set_defaults(func=cmd_learning_index_check)
+
+    index_rebuild = index_sub.add_parser("rebuild", help="Rebuild learning_index.json from local learning records.")
+    index_rebuild.add_argument("--dry-run", action="store_true")
+    index_rebuild.set_defaults(func=cmd_learning_index_rebuild)
+
+    _add_skill_draft_commands(learning_sub)
+    # #1571: the promotion lifecycle a reviewed draft needs already ships under
+    # `omh web-qa promotion`. This is the same registration, mounted where a
+    # draft author is already standing -- not a second implementation of it.
+    add_skill_promotion_commands(learning_sub)

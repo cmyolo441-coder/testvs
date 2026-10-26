@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,6 +13,7 @@ from omh.config import (
     ConfigError,
     ModelProfile,
     ProviderConfig,
+    config_from_dict,
     default_config,
     load_config,
 )
@@ -147,22 +148,21 @@ class LoadTest(unittest.TestCase):
             os.environ, {"OMH_HOME": tmp}, clear=True
         ):
             root = Path(tmp)
-            Path(tmp, "config.json").write_text(
-                json.dumps(
-                    {
-                        "theme": "amber",
-                        "providers": {"local": {"base_url": "http://localhost:1/v1"}},
-                        "models": [{"id": "m1", "provider": "local"}],
-                    }
-                ),
+            (root / "config.toml").write_text(
+                'theme = "amber"\n'
+                "[providers.local]\n"
+                'base_url = "http://localhost:1/v1"\n'
+                "[[models]]\n"
+                'id = "m1"\n'
+                'provider = "local"\n',
                 encoding="utf-8",
             )
             project = root / "project"
             project.mkdir()
-            (project / ".omh.json").write_text(
-                json.dumps(
-                    {"theme": "mono", "providers": {"local": {"requires_key": False}}}
-                ),
+            (project / ".omh.toml").write_text(
+                'theme = "mono"\n'
+                "[providers.local]\n"
+                "requires_key = false\n",
                 encoding="utf-8",
             )
             config = load_config(cwd=project)
@@ -172,21 +172,60 @@ class LoadTest(unittest.TestCase):
             self.assertFalse(local.requires_key)
             self.assertEqual([model.id for model in config.models], ["m1"])
 
-    def test_invalid_json_reports_line(self) -> None:
+    def test_keys_and_models_can_live_in_toml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
             os.environ, {"OMH_HOME": tmp}, clear=True
         ):
-            Path(tmp, "config.json").write_text("{ nope", encoding="utf-8")
+            Path(tmp, "config.toml").write_text(
+                'model = "custom-1"\n'
+                "[providers.custom]\n"
+                'base_url = "http://localhost:7/v1"\n'
+                'api_key = "secret-key"\n'
+                "[[models]]\n"
+                'id = "custom-1"\n'
+                'provider = "custom"\n'
+                "weight = 3.0\n",
+                encoding="utf-8",
+            )
+            config = load_config(cwd=Path(tmp))
+            self.assertEqual(config.model, "custom-1")
+            self.assertEqual(config.providers["custom"].resolved_key(), "secret-key")
+            self.assertEqual([p.id for p in config.enabled_profiles()], ["custom-1"])
+            self.assertEqual(config.models[0].weight, 3.0)
+
+    def test_api_key_can_reference_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"OMH_HOME": tmp, "MY_SECRET": "expanded"}, clear=True
+        ):
+            Path(tmp, "config.toml").write_text(
+                "[providers.custom]\n"
+                'base_url = "http://localhost:7/v1"\n'
+                'api_key = "${MY_SECRET}"\n'
+                "[[models]]\n"
+                'id = "m"\n'
+                'provider = "custom"\n',
+                encoding="utf-8",
+            )
+            config = load_config(cwd=Path(tmp))
+            self.assertEqual(config.providers["custom"].resolved_key(), "expanded")
+
+    def test_invalid_toml_reports_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"OMH_HOME": tmp}, clear=True
+        ):
+            Path(tmp, "config.toml").write_text("[router\nstrategy = ", encoding="utf-8")
             with self.assertRaises(ConfigError) as caught:
                 load_config(cwd=Path(tmp))
-            self.assertIn("not valid JSON", caught.exception.message)
+            self.assertIn("not valid TOML", caught.exception.message)
 
     def test_unknown_provider_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
             os.environ, {"OMH_HOME": tmp}, clear=True
         ):
-            Path(tmp, "config.json").write_text(
-                json.dumps({"models": [{"id": "x", "provider": "ghost"}]}),
+            Path(tmp, ".omh.toml").write_text(
+                "[[models]]\n"
+                'id = "x"\n'
+                'provider = "ghost"\n',
                 encoding="utf-8",
             )
             with self.assertRaises(ConfigError):
@@ -196,8 +235,8 @@ class LoadTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
             os.environ, {"OMH_HOME": tmp}, clear=True
         ):
-            Path(tmp, "config.json").write_text(
-                json.dumps({"approval_mode": "yolo"}), encoding="utf-8"
+            Path(tmp, "config.toml").write_text(
+                'approval_mode = "yolo"\n', encoding="utf-8"
             )
             with self.assertRaises(ConfigError):
                 load_config(cwd=Path(tmp))
@@ -209,10 +248,17 @@ class RoundTripTest(unittest.TestCase):
             config = make_config(tmp)
             config.model = "model-a"
             config.router.strategy = "round_robin"
-            target = config.save(Path(tmp) / "config.json")
-            raw = json.loads(target.read_text(encoding="utf-8"))
+            target = config.save(Path(tmp) / "config.toml")
+            raw = tomllib.loads(target.read_text(encoding="utf-8"))
             self.assertEqual(raw["model"], "model-a")
             self.assertEqual(raw["router"]["strategy"], "round_robin")
+            self.assertEqual(raw["models"][0]["id"], "model-a")
+
+            with mock.patch.dict(os.environ, {"OMH_HOME": tmp}, clear=True):
+                reloaded = load_config(path=str(target), cwd=Path(tmp))
+            self.assertEqual(reloaded.model, "model-a")
+            self.assertEqual(reloaded.router.strategy, "round_robin")
+            self.assertEqual(reloaded.providers["a"].resolved_key(), "test-key")
 
     def test_available_provider_custom_key(self) -> None:
         with mock.patch.dict(os.environ, {"MY_KEY": "secret"}, clear=True):
@@ -229,6 +275,24 @@ class RoundTripTest(unittest.TestCase):
         raw = config.to_dict()
         self.assertEqual(len(raw["models"]), 2)
         self.assertEqual(raw["providers"]["a"]["api_key_env"], "")
+
+    def test_toml_roundtrip_preserves_pool_and_router(self) -> None:
+        config = make_config("/tmp")
+        config.approval_mode = "auto"
+        config.router.hedge_delay_s = 0.75
+        parsed = config_from_dict(tomllib.loads(config.to_toml()))
+        self.assertEqual(parsed.approval_mode, "auto")
+        self.assertEqual(parsed.router.hedge_delay_s, 0.75)
+        self.assertEqual([m.id for m in parsed.models], ["model-a", "model-b"])
+        self.assertEqual(parsed.providers["a"].resolved_key(), "test-key")
+
+    def test_packaged_default_matches_root(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        packaged = root / "omh" / "default_config.toml"
+        self.assertTrue(packaged.is_file())
+        root_raw = tomllib.loads((root / "config.toml").read_text(encoding="utf-8"))
+        packaged_raw = tomllib.loads(packaged.read_text(encoding="utf-8"))
+        self.assertEqual(root_raw, packaged_raw)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,110 @@
+# OMH identity skin for Hermes Agent — crimson theme.
+#
+# Managed artifact: `omh setup` installs this file into $HERMES_HOME/skins/
+# and refreshes it on update; edits here are overwritten. Same OH-MY-HERMES
+# identity as `omh.yaml` — identical `branding`, spinner, and logo geometry —
+# recoloured onto a deep crimson register. Select it with
+# `omh theme use crimson`. Hermes' skin engine is the only consumer; OMH never
+# patches Hermes to apply any of this.
+name: omh-crimson
+description: OH-MY-HERMES — crimson ember orchestration identity
+
+colors:
+  # No `background` token on purpose: the classic banner paints text runs on
+  # it, and any value that differs from the user's actual terminal background
+  # renders every run as a lighter "selected-looking" box (observed on a real
+  # terminal). Omitting it inherits the default seed, which is what stock
+  # Hermes ships and what nobody reports boxes against.
+  #
+  # A red identity has one real hazard: the accent and the error colour land
+  # on the same hue, and an error message that reads as ordinary accent text
+  # is an error nobody sees. So the accent is pulled deliberately warm — an
+  # ember red-orange (#FF6A3D) — while `ui_error` is pushed the other way
+  # across the red point into a rose red (#FF3D6E). Orange-leaning chrome
+  # against pink-leaning failures stays separable even on a terminal that
+  # rounds colours to its own 256-colour cube.
+  banner_border: "#A32B18"
+  banner_title: "#FF9E7F"
+  banner_accent: "#FF6A3D"
+  banner_dim: "#8A4438"
+  banner_text: "#FFEDE6"
+  ui_accent: "#FF6A3D"
+  # Brighter than `banner_title` on purpose: `ui_label` paints the user's own
+  # prompt rows, and matching the title exactly makes them read as chrome.
+  ui_label: "#FFC7B3"
+  ui_ok: "#59C36A"
+  ui_error: "#FF3D6E"
+  ui_warn: "#FFB13D"
+  ui_tool: "#FF6A3D"
+  ui_thinking: "#8A4438"
+  prompt: "#FFEDE6"
+  input_rule: "#A32B18"
+  response_border: "#FF6A3D"
+  status_bar_bg: "#2A0D08"
+  status_bar_text: "#F8DCD2"
+  status_bar_strong: "#FF9E7F"
+  status_bar_dim: "#8A5A50"
+  status_bar_good: "#7FD6A0"
+  status_bar_warn: "#FF6A3D"
+  status_bar_bad: "#B0503E"
+  status_bar_critical: "#FF3D6E"
+  session_label: "#FF9E7F"
+  session_border: "#8A5A50"
+  completion_menu_bg: "#2A0D08"
+  completion_menu_current_bg: "#5A1E12"
+  selection_bg: "#7A2A18"
+  voice_status_bg: "#2A0D08"
+  syntax_string: "#FF6A3D"
+  syntax_number: "#FFEDE6"
+  syntax_keyword: "#FF9E7F"
+  syntax_comment: "#8A4438"
+  # Diff line underlays. The engine defaults are light pastels tuned for
+  # light terminals; on this dark identity palette they render as harsh
+  # full-brightness bands behind the text (owner report, 2026-08-18). The
+  # removed band is pulled toward plum rather than the theme's ember red for
+  # the same separability reason as `ui_error`: a red band on a red identity
+  # reads as chrome, not as a deletion.
+  diff_removed: "#3E1520"
+  diff_removed_word: "#FF8AA8"
+  diff_added: "#14332A"
+  diff_added_word: "#6FE0B8"
+
+spinner:
+  waiting_faces:
+    - "(◆)"
+    - "(≋)"
+    - "(∿)"
+    - "(◇)"
+  thinking_faces:
+    - "(◆)"
+    - "(◇)"
+    - "(≋)"
+    - "(⌁)"
+  thinking_verbs:
+    - "orchestrating"
+    - "routing skills"
+    - "weighing evidence"
+    - "preparing handoffs"
+    - "sequencing agents"
+    - "charting workflows"
+  wings:
+    - ["⟪◆", "◆⟫"]
+    - ["⟪≋", "≋⟫"]
+
+branding:
+  agent_name: "OH-MY-HERMES"
+  welcome: "Welcome to OH-MY-HERMES! Type your message or /help for commands."
+  goodbye: "Goodbye! ◆"
+  response_label: " ◆ OMH "
+  prompt_symbol: "❯"
+  help_header: "(◆) Commands"
+
+tool_prefix: "│"
+
+banner_logo: |-
+  [bold #FFC7B3] ██████╗ ██╗  ██╗      ███╗   ███╗██╗   ██╗      ██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗[/]
+  [bold #FF9E7F]██╔═══██╗██║  ██║      ████╗ ████║╚██╗ ██╔╝      ██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝[/]
+  [#FF8054]██║   ██║███████║█████╗██╔████╔██║ ╚████╔╝ █████╗███████║█████╗  ██████╔╝██╔████╔██║█████╗  ███████╗[/]
+  [#FF6A3D]██║   ██║██╔══██║╚════╝██║╚██╔╝██║  ╚██╔╝  ╚════╝██╔══██║██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══╝  ╚════██║[/]
+  [#D6431F]╚██████╔╝██║  ██║      ██║ ╚═╝ ██║   ██║         ██║  ██║███████╗██║  ██║██║ ╚═╝ ██║███████╗███████║[/]
+  [#A32B18] ╚═════╝ ╚═╝  ╚═╝      ╚═╝     ╚═╝   ╚═╝         ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝[/]

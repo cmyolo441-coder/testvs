@@ -14,10 +14,10 @@ No API key is needed for this demo: the router is serving the built-in \
 `mock` model, and the whole harness — streaming, tool calls, sessions — is \
 live. Ask me to **list the files** and I will call `list_dir` for real.
 
-To talk to a real model, set one of these and restart:
+To talk to a real model, set a key in `config.toml` or the environment:
 
-- `OPENAI_API_KEY` → `gpt-4o-mini`, `gpt-4o`
-- `ANTHROPIC_API_KEY` → `sonnet-4`, `haiku-3.5`
+- `OPENAI_API_KEY` (any OpenAI-compatible model in `config.toml`)
+- `ANTHROPIC_API_KEY`
 - `GROQ_API_KEY` / `DEEPSEEK_API_KEY` / `OPENROUTER_API_KEY`
 - run Ollama locally, or point `OMH_BASE_URL` at any OpenAI-compatible server
 

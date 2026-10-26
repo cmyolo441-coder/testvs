@@ -1,0 +1,198 @@
+# OMH configuration — models, providers, keys and routing all live here.
+#
+# Load order (later wins):
+#   1. built-in config.toml (this template in the checkout/package)
+#   2. ~/.omh/config.toml  (created by `omh --init`)
+#   3. ./.omh.toml  (project config; OMH_CONFIG=/path also works)
+#   4. OMH_* environment variables
+#   5. CLI flags
+#
+# Keep API keys out of version control. Prefer api_key_env, or set
+# api_key = "${MY_VAR}" and export MY_VAR. `omh --init` copies this file to
+# ~/.omh/config.toml so you can edit it without touching the checkout.
+
+# "" or "auto" load-balances across every ready model below.
+model = ""
+provider = ""
+approval_mode = "ask"   # ask | auto | deny
+theme = "hermes"        # hermes | amber | mono
+max_steps = 12
+temperature = 0.2
+max_tokens = 4096
+history_limit = 40
+max_tool_output = 20000
+tools_enabled = true
+# system_prompt = "You are a terse senior engineer."
+# session_dir = "~/.omh/sessions"
+# history_file = "~/.omh/history"
+
+[router]
+strategy = "balanced"      # balanced | round_robin | priority
+max_attempts = 3
+cooldown_s = 20.0
+hedge_delay_s = 0.0        # e.g. 0.8 starts a second lane after 800 ms
+max_parallel_tools = 4
+
+# ---------------------------------------------------------------------------
+# Providers: any OpenAI-compatible endpoint, Anthropic, or the offline demo.
+# Add a new provider by copying a block and referencing its name in [[models]].
+# ---------------------------------------------------------------------------
+
+[providers.openai]
+kind = "openai"
+label = "OpenAI"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+api_key = ""               # optional direct key; prefer the env var above
+requires_key = true
+timeout = 120.0
+
+[providers.anthropic]
+kind = "anthropic"
+label = "Anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+api_key = ""
+requires_key = true
+timeout = 120.0
+
+[providers.groq]
+kind = "openai"
+label = "Groq"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+api_key = ""
+requires_key = true
+timeout = 120.0
+
+[providers.openrouter]
+kind = "openai"
+label = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+api_key = ""
+requires_key = true
+timeout = 120.0
+headers = { "HTTP-Referer" = "https://github.com/rlaope/oh-my-hermes", "X-Title" = "omh" }
+
+[providers.deepseek]
+kind = "openai"
+label = "DeepSeek"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+api_key = ""
+requires_key = true
+timeout = 120.0
+
+# Local servers need no key. They join the pool only when selected with
+# `/provider ollama`, `model = "llama3.2"`, or a provider filter.
+[providers.ollama]
+kind = "openai"
+label = "Ollama (local)"
+base_url = "http://localhost:11434/v1"
+api_key_env = "OLLAMA_API_KEY"
+api_key = ""
+requires_key = false
+timeout = 120.0
+
+[providers.mock]
+kind = "mock"
+label = "Offline demo"
+requires_key = false
+
+# Any other OpenAI-compatible server (vLLM, LM Studio, Together, ...):
+# [providers.local]
+# kind = "openai"
+# base_url = "http://localhost:8000/v1"
+# api_key_env = "LOCAL_API_KEY"
+# api_key = ""
+# requires_key = false
+# timeout = 120.0
+
+# ---------------------------------------------------------------------------
+# Models: the router load-balances these by weight and measured latency.
+# Each entry must name a provider defined above. Add your own at the bottom.
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "gpt-4o-mini"
+provider = "openai"
+label = "gpt-4o-mini"
+weight = 2.0
+context = 128000
+input_cost = 0.15
+output_cost = 0.60
+
+[[models]]
+id = "gpt-4o"
+provider = "openai"
+label = "gpt-4o"
+weight = 1.0
+context = 128000
+input_cost = 2.50
+output_cost = 10.00
+
+[[models]]
+id = "claude-sonnet-4-20250514"
+provider = "anthropic"
+label = "sonnet-4"
+weight = 1.5
+context = 200000
+input_cost = 3.00
+output_cost = 15.00
+
+[[models]]
+id = "claude-3-5-haiku-latest"
+provider = "anthropic"
+label = "haiku-3.5"
+weight = 1.0
+context = 200000
+input_cost = 0.80
+output_cost = 4.00
+
+[[models]]
+id = "llama-3.3-70b-versatile"
+provider = "groq"
+label = "llama-3.3-70b"
+weight = 1.0
+context = 128000
+input_cost = 0.59
+output_cost = 0.79
+
+[[models]]
+id = "deepseek-chat"
+provider = "deepseek"
+label = "deepseek-chat"
+weight = 1.5
+context = 64000
+input_cost = 0.27
+output_cost = 1.10
+
+[[models]]
+id = "llama3.2"
+provider = "ollama"
+label = "llama3.2"
+weight = 1.0
+context = 128000
+input_cost = 0.0
+output_cost = 0.0
+
+[[models]]
+id = "mock-1"
+provider = "mock"
+label = "mock"
+weight = 1.0
+context = 32000
+input_cost = 0.0
+output_cost = 0.0
+
+# Example custom lane:
+# [[models]]
+# id = "qwen2.5-coder-32b"
+# provider = "local"
+# label = "qwen-coder"
+# weight = 2.0
+# context = 32768
+# input_cost = 0.0
+# output_cost = 0.0
+

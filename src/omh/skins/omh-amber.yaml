@@ -1,0 +1,105 @@
+# OMH identity skin for Hermes Agent — amber theme.
+#
+# Managed artifact: `omh setup` installs this file into $HERMES_HOME/skins/
+# and refreshes it on update; edits here are overwritten. Same OH-MY-HERMES
+# identity as `omh.yaml` — identical `branding`, spinner, and logo geometry —
+# recoloured onto a warm amber/gold register. Select it with
+# `omh theme use amber`. Hermes' skin engine is the only consumer; OMH never
+# patches Hermes to apply any of this.
+name: omh-amber
+description: OH-MY-HERMES — amber gold orchestration identity
+
+colors:
+  # No `background` token on purpose: the classic banner paints text runs on
+  # it, and any value that differs from the user's actual terminal background
+  # renders every run as a lighter "selected-looking" box (observed on a real
+  # terminal). Omitting it inherits the default seed, which is what stock
+  # Hermes ships and what nobody reports boxes against.
+  banner_border: "#9A7218"
+  banner_title: "#FFD86B"
+  banner_accent: "#FFB300"
+  banner_dim: "#8A7038"
+  banner_text: "#FFF6E0"
+  ui_accent: "#FFB300"
+  # Brighter than `banner_title` on purpose: `ui_label` paints the user's own
+  # prompt rows, and matching the title exactly makes them read as chrome.
+  ui_label: "#FFE9A8"
+  ui_ok: "#7CB342"
+  ui_error: "#EF5350"
+  # Warn shifts off the engine's amber (#ffa726) into deep orange on purpose:
+  # on this palette the stock warn colour is the accent, and a warning that
+  # reads as ordinary accent text is a warning nobody sees.
+  ui_warn: "#FF7043"
+  ui_tool: "#FFB300"
+  ui_thinking: "#8A7038"
+  prompt: "#FFF6E0"
+  input_rule: "#9A7218"
+  response_border: "#FFB300"
+  status_bar_bg: "#241A05"
+  status_bar_text: "#FBEACD"
+  status_bar_strong: "#FFD86B"
+  status_bar_dim: "#8A7038"
+  status_bar_good: "#B4CF6A"
+  status_bar_warn: "#FFB300"
+  status_bar_bad: "#B07A2A"
+  status_bar_critical: "#D94F4F"
+  session_label: "#FFD86B"
+  session_border: "#8A7038"
+  completion_menu_bg: "#241A05"
+  completion_menu_current_bg: "#4A3308"
+  selection_bg: "#6B4A0C"
+  voice_status_bg: "#241A05"
+  syntax_string: "#FFB300"
+  syntax_number: "#FFF6E0"
+  syntax_keyword: "#FFD86B"
+  syntax_comment: "#8A7038"
+  # Diff line underlays. The engine defaults are light pastels tuned for
+  # light terminals; on this dark identity palette they render as harsh
+  # full-brightness bands behind the text (owner report, 2026-08-18). These
+  # stay in the dark palette's register and keep the red/green semantic split
+  # even though the theme is warm: removed is a warm maroon band, added a deep
+  # olive one, so add/delete never collapses into the amber accent.
+  diff_removed: "#3A1D18"
+  diff_removed_word: "#FFA08A"
+  diff_added: "#22330F"
+  diff_added_word: "#C9E27A"
+
+spinner:
+  waiting_faces:
+    - "(◆)"
+    - "(≋)"
+    - "(∿)"
+    - "(◇)"
+  thinking_faces:
+    - "(◆)"
+    - "(◇)"
+    - "(≋)"
+    - "(⌁)"
+  thinking_verbs:
+    - "orchestrating"
+    - "routing skills"
+    - "weighing evidence"
+    - "preparing handoffs"
+    - "sequencing agents"
+    - "charting workflows"
+  wings:
+    - ["⟪◆", "◆⟫"]
+    - ["⟪≋", "≋⟫"]
+
+branding:
+  agent_name: "OH-MY-HERMES"
+  welcome: "Welcome to OH-MY-HERMES! Type your message or /help for commands."
+  goodbye: "Goodbye! ◆"
+  response_label: " ◆ OMH "
+  prompt_symbol: "❯"
+  help_header: "(◆) Commands"
+
+tool_prefix: "│"
+
+banner_logo: |-
+  [bold #FFE9A8] ██████╗ ██╗  ██╗      ███╗   ███╗██╗   ██╗      ██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗[/]
+  [bold #FFD86B]██╔═══██╗██║  ██║      ████╗ ████║╚██╗ ██╔╝      ██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝[/]
+  [#FFC233]██║   ██║███████║█████╗██╔████╔██║ ╚████╔╝ █████╗███████║█████╗  ██████╔╝██╔████╔██║█████╗  ███████╗[/]
+  [#FFB300]██║   ██║██╔══██║╚════╝██║╚██╔╝██║  ╚██╔╝  ╚════╝██╔══██║██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══╝  ╚════██║[/]
+  [#D99000]╚██████╔╝██║  ██║      ██║ ╚═╝ ██║   ██║         ██║  ██║███████╗██║  ██║██║ ╚═╝ ██║███████╗███████║[/]
+  [#A66C00] ╚═════╝ ╚═╝  ╚═╝      ╚═╝     ╚═╝   ╚═╝         ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝[/]

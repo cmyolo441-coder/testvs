@@ -167,7 +167,12 @@ class AnthropicTest(unittest.TestCase):
             ("message_stop", json.dumps({"type": "message_stop"})),
         ]
         provider = AnthropicProvider(
-            ProviderConfig(name="anthropic", kind="anthropic", api_key="k")
+            ProviderConfig(
+                name="anthropic",
+                kind="anthropic",
+                base_url="https://api.anthropic.com",
+                api_key="k",
+            )
         )
         with mock.patch("omh.providers.anthropic.post_sse", return_value=iter(frames)) as sent:
             chunks = list(provider.stream(model="claude", messages=[ChatMessage.user("hi")]))
@@ -184,7 +189,14 @@ class AnthropicTest(unittest.TestCase):
 
     def test_error_event_is_raised(self) -> None:
         frames = [("error", json.dumps({"type": "error", "error": {"message": "nope"}}))]
-        provider = AnthropicProvider(ProviderConfig(name="a", kind="anthropic", api_key="k"))
+        provider = AnthropicProvider(
+            ProviderConfig(
+                name="a",
+                kind="anthropic",
+                base_url="https://api.anthropic.com",
+                api_key="k",
+            )
+        )
         with mock.patch("omh.providers.anthropic.post_sse", return_value=iter(frames)):
             with self.assertRaises(ProviderError):
                 list(provider.stream(model="m", messages=[]))
