@@ -171,7 +171,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(_sessions_table(store_for(config), theme))
         return 0
 
-    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    interactive = sys.stdin.isatty()
     try:
         app = App(
             config,
@@ -228,7 +228,9 @@ class App:
         self.router = ModelRouter(config, build_providers(config))
         self.registry = self._build_registry()
         self._refresh_completion()
-        self._session_notice = bool(session_id or resume)
+        self._session_notice = bool(session_id) or (
+            resume and bool(self.session.messages)
+        )
 
     # -- setup -----------------------------------------------------------
     def _open_session(self, session_id: Optional[str], resume: bool) -> Session:

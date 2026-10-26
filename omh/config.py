@@ -461,6 +461,9 @@ def _apply_env(config: Config) -> Config:
             provider.base_url = base_url.rstrip("/")
         if api_key:
             provider.api_key = api_key
+        elif base_url:
+            # A bare custom endpoint is usually a local server with no auth.
+            provider.requires_key = False
         if env("OMH_MODEL") and config.resolve_model_name(env("OMH_MODEL")) is None:
             # A custom endpoint usually serves a model we do not ship in the
             # default pool, so register it on the fly.

@@ -127,6 +127,21 @@ class LoadTest(unittest.TestCase):
                 [p.id for p in config.enabled_profiles()], ["my-custom-model"]
             )
 
+    def test_custom_endpoint_without_key_is_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                "OMH_HOME": tmp,
+                "OMH_BASE_URL": "http://localhost:8000/v1",
+                "OMH_MODEL": "local-llm",
+            },
+            clear=True,
+        ):
+            config = load_config(cwd=Path(tmp))
+            self.assertFalse(config.providers["openai"].requires_key)
+            self.assertTrue(config.providers["openai"].available())
+            self.assertEqual([p.id for p in config.enabled_profiles()], ["local-llm"])
+
     def test_project_config_beats_global_and_deep_merges(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
             os.environ, {"OMH_HOME": tmp}, clear=True
