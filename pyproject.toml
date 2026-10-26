@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omh-cli"
+version = "1.0.0"
+description = "A fast, dependency-free terminal AI agent with a load-balanced model pool."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "oh-my-hermes contributors" }]
+keywords = ["agent", "cli", "terminal", "llm", "load-balancing", "tools"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Software Development",
+]
+dependencies = []
+
+[project.scripts]
+omh = "omh.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rlaope/oh-my-hermes"
+Source = "https://github.com/rlaope/oh-my-hermes"
+
+[tool.setuptools]
+packages = ["omh", "omh.providers", "omh.tools"]
