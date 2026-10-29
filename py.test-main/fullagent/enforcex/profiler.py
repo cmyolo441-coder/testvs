@@ -9,9 +9,8 @@ import contextlib
 import math
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Iterator, List, Sequence
+from typing import Any, Dict, Iterator, List, Sequence
 
 __all__ = [
     "SpanRecord",

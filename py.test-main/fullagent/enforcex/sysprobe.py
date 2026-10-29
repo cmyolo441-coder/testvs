@@ -280,13 +280,69 @@ def _decode_proc_ip(hex_ip: str, ipv6: bool = False) -> str:
     return "0.0.0.0"
 
 
+def _fallback_listening_sockets(max_entries: int = 64) -> List[SocketEntry]:
+    """Best-effort listening sockets via ss/netstat when /proc/net is absent.
+
+    Every subprocess call is timeout-bounded (never hangs) and any failure
+    (missing command, permission, timeout, unparsable output) yields [].
+    """
+    out: List[SocketEntry] = []
+    if max_entries <= 0:
+        return out
+    try:
+        import subprocess
+    except Exception:
+        return out
+    for argv in (["ss", "-H", "-ltn"], ["netstat", "-ltn"]):
+        try:
+            cp = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                argv, capture_output=True, text=True, timeout=2.0, check=False,
+            )
+        except Exception:
+            continue
+        if getattr(cp, "returncode", 1) != 0:
+            continue
+        parsed_any = False
+        for line in str(getattr(cp, "stdout", "") or "").splitlines()[:256]:
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            addr = cols[-2] if len(cols) >= 5 else cols[-1]
+            ip, _, port = addr.rpartition(":")
+            if not port.isdigit():
+                continue
+            parsed_any = True
+            entry = SocketEntry(
+                local_ip=ip.strip("[]") or "0.0.0.0",
+                local_port=int(port),
+                state="LISTEN",
+                ipv6=":" in ip,
+            )
+            if entry not in out:
+                out.append(entry)
+                if len(out) >= max_entries:
+                    return out
+        if parsed_any:
+            return out
+    return out
+
+
 def probe_listening_sockets(max_entries: int = 64) -> List[SocketEntry]:
+    try:
+        max_entries = int(max_entries)
+    except (TypeError, ValueError, OverflowError):
+        max_entries = 64
+    max_entries = max(0, min(1024, max_entries))
+    if max_entries == 0:
+        return []
     out: List[SocketEntry] = []
     seen = set()
+    proc_read = False
     for path, is_v6 in (("/proc/net/tcp", False), ("/proc/net/tcp6", True)):
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 lines = fh.read().splitlines()[1:]
+            proc_read = True
         except OSError:
             continue
         for line in lines:
@@ -308,10 +364,51 @@ def probe_listening_sockets(max_entries: int = 64) -> List[SocketEntry]:
                 out.append(SocketEntry(local_ip=ip_str, local_port=port, state="LISTEN", ipv6=is_v6))
                 if len(out) >= max_entries:
                     return out
+    if not proc_read:
+        # /proc unavailable (non-Linux, container, restricted): best-effort CLI.
+        out.extend(_fallback_listening_sockets(max_entries - len(out)))
     return out
 
 
-_SENSITIVE_ENV_RE_KEYS = ("SECRET", "PASSWORD", "PRIVATE_KEY", "TOKEN", "API_KEY", "AWS_SECRET")
+_SENSITIVE_ENV_RE_KEYS = (
+    "SECRET", "PASSWORD", "PRIVATE_KEY", "TOKEN", "API_KEY", "APIKEY",
+    "AWS_SECRET", "ACCESS_KEY", "CREDENTIAL", "AUTH",
+)
+_SECRET_VALUE_PREFIXES = ("AKIA", "ASIA", "ghp_", "gho_", "xox", "-----BEGIN")
+_MAX_PATH_ENTRIES = 64
+
+
+def _audit_path_hygiene(env: Optional[Dict[str, str]] = None) -> List[HygieneFinding]:
+    """Bounded check: world-writable directories on PATH are privilege risks."""
+    findings: List[HygieneFinding] = []
+    source = env if env is not None else os.environ
+    try:
+        raw_path = str(dict(source).get("PATH", "") or "")
+    except Exception:
+        return findings
+    bad: List[str] = []
+    for entry in raw_path.split(os.pathsep)[:_MAX_PATH_ENTRIES]:
+        candidate = entry if entry else "."
+        try:
+            st = os.stat(candidate)
+        except (OSError, ValueError, TypeError):
+            continue
+        try:
+            if stat.S_ISDIR(st.st_mode) and (st.st_mode & stat.S_IWOTH):
+                bad.append(candidate)
+        except Exception:
+            continue
+    if bad:
+        findings.append(
+            HygieneFinding(
+                code="HYG-PATH-WORLD-WRITABLE",
+                severity="medium",
+                message=f"{len(bad)} world-writable PATH entr(ies) allow binary hijacking",
+                evidence=", ".join(bad[:6]),
+                remediation="Remove world-writable dirs from PATH or chmod 755 them.",
+            )
+        )
+    return findings
 
 
 def audit_environment_hygiene(
@@ -320,12 +417,30 @@ def audit_environment_hygiene(
 ) -> List[HygieneFinding]:
     findings: List[HygieneFinding] = []
     env = environ if environ is not None else dict(os.environ)
+    try:
+        items = list(env.items())[:512]
+    except Exception:
+        items = []
 
     exposed_keys = []
-    for k, v in env.items():
+    leaked_values = []
+    for k, v in items:
         ku = str(k).upper()
-        if any(tok in ku for tok in _SENSITIVE_ENV_RE_KEYS) and v and len(str(v)) >= 8:
+        sv = str(v)[:1024] if v is not None else ""
+        if any(tok in ku for tok in _SENSITIVE_ENV_RE_KEYS) and v and len(sv) >= 8:
             exposed_keys.append(str(k))
+        elif sv.startswith(_SECRET_VALUE_PREFIXES) or "PRIVATE KEY" in sv.upper():
+            leaked_values.append(str(k))
+    if leaked_values:
+        findings.append(
+            HygieneFinding(
+                code="HYG-ENV-SECRET-VALUES",
+                severity="medium",
+                message=f"{len(leaked_values)} env var(s) carry credential-shaped values",
+                evidence=", ".join(sorted(leaked_values)[:6]),
+                remediation="Load secrets from a vault at runtime instead of the environment.",
+            )
+        )
     if exposed_keys:
         findings.append(
             HygieneFinding(
@@ -353,7 +468,7 @@ def audit_environment_hygiene(
             pass
 
     try:
-        st = os.stat(cwd or ".")
+        st = os.stat(str(cwd) if cwd else ".")
         mode = st.st_mode
         if (mode & stat.S_IWOTH) and not (mode & stat.S_ISVTX):
             findings.append(
@@ -365,7 +480,7 @@ def audit_environment_hygiene(
                     remediation="Restrict directory permissions with chmod 755 or 700.",
                 )
             )
-    except OSError:
+    except Exception:
         pass
 
     for sock in probe_listening_sockets():
@@ -379,6 +494,11 @@ def audit_environment_hygiene(
                     remediation="Bind local agent/webhook services to 127.0.0.1.",
                 )
             )
+
+    try:
+        findings.extend(_audit_path_hygiene(env if environ is not None else None))
+    except Exception:
+        pass
     return findings
 
 
@@ -457,6 +577,33 @@ def _self_test() -> int:
         os.chmod(tmp, 0o777)
         hyg2 = audit_environment_hygiene(tmp, environ={})
         assert any(f.code == "HYG-WORLD-WRITABLE-CWD" for f in hyg2)
+
+    # adversarial: malformed/hostile inputs must degrade, never raise
+    rep_none = collect_system_health(None)  # type: ignore[arg-type]
+    assert rep_none.status in ("healthy", "degraded", "critical")
+    assert rep_none.process.pid == os.getpid()
+    assert 0.0 <= rep_none.health_score <= 100.0
+    deep = collect_system_health("/nonexistent/__nope__/" + "x" * 9_000)
+    assert deep.disk.total_gb == 0.0 and isinstance(deep.to_dict(), dict)
+    assert audit_environment_hygiene(None, environ=None) is not None
+    assert audit_environment_hygiene(".", environ={"WEIRD": None, 7: "x" * 5000}) is not None  # type: ignore[dict-item]
+    assert probe_listening_sockets(0) == []
+    assert probe_listening_sockets(-5) == []
+    assert isinstance(probe_listening_sockets("bogus"), list)  # type: ignore[arg-type]
+    assert isinstance(probe_listening_sockets(10 ** 9), list)
+
+    # credential-shaped values leak even with innocuous key names
+    hyg3 = audit_environment_hygiene(".", environ={"ODD_NAME": "AKIAIOSFODNN7EXAMPLE"})
+    assert any(f.code == "HYG-ENV-SECRET-VALUES" for f in hyg3), hyg3
+
+    # world-writable PATH directory is flagged (bounded)
+    with tempfile.TemporaryDirectory() as tmp2:
+        os.chmod(tmp2, 0o777)
+        hyg4 = audit_environment_hygiene(
+            ".", environ={"PATH": tmp2 + os.pathsep + "/usr/bin"})
+        assert any(f.code == "HYG-PATH-WORLD-WRITABLE" for f in hyg4), hyg4
+        hyg5 = audit_environment_hygiene(".", environ={"PATH": ""})
+        assert not any(f.code == "HYG-PATH-WORLD-WRITABLE" for f in hyg5)
 
     print("sysprobe._self_test: OK PASS (memory, disk, process, sockets, hygiene)")
     return 0

@@ -297,12 +297,10 @@ def _coerce_cnf_clauses(clauses: Any) -> List[CNFClause]:
     for idx, raw in enumerate(iterator):
         try:
             if isinstance(raw, dict):
-                literals = raw.get("literals", ())
                 weight = raw.get("weight", 1.0)
                 hard = raw.get("hard", True)
                 desc = raw.get("description", "")
             else:
-                literals = getattr(raw, "literals", ())
                 weight = getattr(raw, "weight", 1.0)
                 hard = getattr(raw, "hard", True)
                 desc = getattr(raw, "description", "")

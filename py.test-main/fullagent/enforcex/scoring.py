@@ -412,8 +412,6 @@ def score_violations(violations: Iterable[Any], rules: Optional[Any] = None) -> 
         total_score = min(total_score, 60.0)
     elif has_high:
         total_score = min(total_score, 74.0)
-    elif total_score < 75.0 and (gross_penalty > 1e9 or not math.isfinite(gross_penalty)):
-        total_score = 0.0
 
     category_scores: Dict[str, float] = {}
     for cat in sorted(set(per_category) | {v["category"] for v in normalized}):
@@ -847,6 +845,41 @@ def _self_test() -> None:  # pragma: no cover
     assert math.isfinite(score_violations([huge]).total)
     assert merge_history([{"total": float("nan"), "grade": "A"},
                           {"total": 80.5, "grade": "B"}])["count"] == 1
+
+    # ── adversarial additions (weights / aliases / fail-closed) ──────
+    # aliases normalize severity so phrasing cannot water down a verdict
+    assert normalize_violation({"severity": "fatal"})["severity"] == "critical"
+    assert normalize_violation({"severity": "minor"})["severity"] == "low"
+    assert normalize_violation({"severity": "MODERATE "})["severity"] == "medium"
+    # previously under-weighted sub-signals now carry explicit weights
+    assert CATEGORY_WEIGHTS["quality"] > CATEGORY_WEIGHTS["other"]
+    assert CATEGORY_WEIGHTS["hint"] >= CATEGORY_WEIGHTS["leak"] * 0.5
+    q_pen = score_violations([{"category": "quality", "severity": "medium"}]).total
+    o_pen = score_violations([{"category": "other", "severity": "medium"}]).total
+    assert q_pen < o_pen, (q_pen, o_pen)
+    # category aliasing: same violation, different spelling, same score
+    s_plain = score_violations([{"category": "content_policy",
+                                 "severity": "medium"}]).total
+    s_alias = score_violations([{"category": "Content-Policy ",
+                                 "severity": "medium"}]).total
+    assert abs(s_plain - s_alias) < 1e-9, (s_plain, s_alias)
+    # fail-closed: even a 0.1-confidence critical can never look like a
+    # pass; capped at <= 60 and verdict fail (threshold edges are strict)
+    low_conf_crit = score_violations([
+        {"category": "security", "severity": "critical", "confidence": 0.1}])
+    assert low_conf_crit.total <= 60.0 and low_conf_crit.verdict == "fail", low_conf_crit
+    high_only = score_violations([
+        {"category": "tone", "severity": "high", "confidence": 0.1}])
+    assert high_only.total < 75.0 and high_only.verdict == "warn", high_only
+    # threshold edges: info alone beats low alone; empty is perfect
+    assert (score_violations([{"category": "tone", "severity": "info"}]).total
+            > score_violations([{"category": "tone", "severity": "low"}]).total)
+    assert score_violations([]).total == 100.0
+    # unicode-obfuscated severity (fullwidth) still collapses to a
+    # bounded, finite verdict instead of poisoning the score
+    uni = normalize_violation({"category": "ｓｅｃｕｒｉｔｙ", "severity": "сritical"})
+    su = score_violations([uni])
+    assert math.isfinite(su.total) and su.verdict in ("pass", "warn", "fail")
 
     print("scoring._self_test: OK")
 

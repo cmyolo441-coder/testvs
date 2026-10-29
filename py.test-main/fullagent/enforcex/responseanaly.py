@@ -85,6 +85,33 @@ _RE_DATE_ALPHA = re.compile(
 _RE_TIME = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 _RE_5GRAM_PAD = re.compile(r"[^\w\s\u0900-\u097F]", re.UNICODE)
 
+# ── normalization / ReDoS bound ──────────────────────────────────────────
+# Zero-width and bidi-control characters are stripped before any pattern
+# matching so "ca​nnot" / "i​gnore" obfuscation cannot slip past a signal.
+_RE_INVISIBLE = re.compile(
+    "[\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064"
+    "\u206a\u206b\u206c\u206d\u206e\u206f\ufeff\ufffe\uffff]")
+_RE_WS_COLLAPSE = re.compile(r"\s+")
+# Upper bound on characters any regex ever scans (ReDoS / DoS guard).
+_MAX_SCAN = 262_144
+
+
+def normalize_text(text) -> str:
+    """NFKC-normalize, strip zero-width/bidi controls and cap length.
+
+    Never raises: non-str / None becomes "".  Used as the *scan* view of
+    a reply; raw counts (char_count) still reflect the original text.
+    """
+    if not isinstance(text, str):
+        return ""
+    if len(text) > _MAX_SCAN:
+        text = text[:_MAX_SCAN]
+    try:
+        text = unicodedata.normalize("NFKC", text)
+    except Exception:
+        pass
+    return _RE_INVISIBLE.sub("", text)
+
 # Hindi/Hinglish keyword hits (romanized + Devanagari function words that
 # strongly signal the reply is actually in Hindi rather than English).
 HINDI_KEYWORDS: tuple[str, ...] = (
@@ -152,13 +179,51 @@ _NEGATIVE = {
 # hedge words counted for tone analysis
 HEDGES: tuple[str, ...] = (
     "perhaps", "maybe", "possibly", "probably", "might", "could",
-    "seems", "appears", "somewhat", "sort of", "kind of", "i think",
-    "i believe", "i guess", "presumably", "arguably", "roughly",
-    "approximately", "it seems", "as far as",
+    "seems", "seem", "appears", "appear", "somewhat", "sort of",
+    "kind of", "i think", "i believe", "i guess", "presumably",
+    "arguably", "roughly", "approximately", "it seems", "as far as",
+    "it appears", "in some cases", "generally", "typically", "usually",
+    "not necessarily", "it depends", "could be", "may not", "might not",
+    "hard to say", "i am not sure", "im not sure", "to some extent",
+    "more or less", "somewhere between", "with caveats", "caveat",
 )
 _RE_HEDGES = re.compile(
     r"(?<!\w)(?:" + "|".join(re.escape(h) for h in HEDGES) + r")(?!\w)",
     re.I)
+
+# ── compliance / refusal / hint signals (precompiled, lowercase) ────────
+_RE_COMPLIANCE = re.compile(
+    r"(?<!\w)(?:"
+    r"as (?:requested|asked|you (?:asked|wanted|requested))|"
+    r"here (?:is|are) (?:the|you)|here you go|sure thing|certainly|"
+    r"happy to help|glad to help|of course|done:|"
+    r"per your (?:request|instructions)|following your instructions|"
+    r"i have (?:following|followed)|according to your (?:request|ask)"
+    r")(?!\w)")
+_RE_REFUSAL = re.compile(
+    r"(?<!\w)(?:"
+    r"i (?:cannot|ca'?t|won'?t|will not|am unable|'m unable|"
+    r"am not able|'m not able|must decline|decline|refuse|"
+    r"must refuse|regret(?:fully)? that|apologize|apologise|"
+    r"don'?t provide|do not provide)|"
+    r"i'?m sorry,? but|"
+    r"sorry,? but i (?:cannot|ca'?t|won'?t|will not)|"
+    r"not (?:able|permitted|allowed) to (?:answer|respond|share|assist|help)|"
+    r"unable to (?:comply|fulfill|provide|answer|assist|help|share)|"
+    r"(?:against|violat(?:es|ed|ing)) (?:my )?"
+    r"(?:policy|policies|guidelines|rules|instructions)|"
+    r"मुझे क्षमा कीजिए|मैं नहीं कर सकता"
+    r")(?!\w)")
+# covert self-disclosure of hidden instructions ("hints" the prompt away)
+_RE_HINT = re.compile(
+    r"(?<!\w)(?:"
+    r"my (?:system prompt|instructions|rules|guidelines|directive|prompt)|"
+    r"(?:the|your|hidden) system prompt|"
+    r"i was (?:told|instructed|directed|programmed)[ ,]|"
+    r"per (?:my|the) (?:system prompt|instructions|guidelines)|"
+    r"according to (?:my|the) (?:system prompt|instructions|rules)|"
+    r"my hidden (?:rules|prompt|instructions)"
+    r")(?!\w)", re.I)
 
 # confusable lookalikes (subset; see injection.py for the security copy)
 _CONFUSABLES = {
@@ -167,6 +232,26 @@ _CONFUSABLES = {
     "α": "a", "β": "b", "ε": "e", "ο": "o", "ρ": "p", "τ": "t",
     "υ": "u", "κ": "k", "ν": "v", "ι": "i", "Ａ": "a", "Ｅ": "e",
 }
+
+# Single precompiled alternation over both sentiment lexicons (longest
+# word first so e.g. "failure" is not counted as a bare "fail"): one
+# scan instead of ~130 per-word regex searches.
+_LEX_WORDS = sorted(_POSITIVE | _NEGATIVE, key=lambda w: (-len(w), w))
+_RE_LEX = re.compile(
+    r"(?<!\w)(" + "|".join(re.escape(w) for w in _LEX_WORDS) + r")(?!\w)")
+
+# Precompiled sentence-splitting abbreviation guard (was rebuilt per call)
+_ABBREVS = ("Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "St", "Mt",
+            "vs", "etc", "Inc", "Ltd", "Co", "Corp", "No", "Vol", "al",
+            "Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep",
+            "Sept", "Oct", "Nov", "Dec")
+_RE_ABBREV_DOT = re.compile(r"\b(?:%s)\." % "|".join(map(re.escape, _ABBREVS)),
+                            re.I)
+_RE_SPLIT_BLANK = re.compile(r"\n\s*\n")
+_RE_NUMBERED_ITEM = re.compile(r"^\s*\d+[.)]\s+\S", re.M)
+_RE_SENTENCE_TAIL = re.compile(r"(?<=[.!?…।\x01])(?=\s|$)")
+_RE_EG = re.compile(r"\be\.g\.", re.I)
+_RE_IE = re.compile(r"\bi\.e\.", re.I)
 
 
 # ── dataclasses ──────────────────────────────────────────────────────────
@@ -202,6 +287,11 @@ class ResponseFeatures:
     emoji_count: int = 0
     uppercase_shout_ratio: float = 0.0   # long all-caps words / words
     hedge_count: int = 0
+    # compliance / refusal / hint signals (additive keys)
+    compliance_count: int = 0
+    refusal_count: int = 0
+    refusal_detected: bool = False
+    hint_count: int = 0
     # repetition
     repetition_score: float = 0.0        # duplicated 5-gram ratio [0,1]
     # topics
@@ -221,7 +311,11 @@ class ResponseFeatures:
 
 def split_paragraphs(text: str) -> list[str]:
     """Split on blank lines; empty paragraphs are dropped."""
-    return [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    if not isinstance(text, str) or not text:
+        return []
+    if len(text) > _MAX_SCAN:
+        text = text[:_MAX_SCAN]
+    return [p.strip() for p in _RE_SPLIT_BLANK.split(text) if p.strip()]
 
 
 def split_words(text: str) -> list[str]:
@@ -237,25 +331,23 @@ def split_sentences(text: str) -> list[str]:
     Protects "e.g.", "Dr.", "3.14", initials, ellipses and Devanagari
     danda from splitting; returns stripped, non-empty sentences.
     """
-    text = (text or "").strip()
+    text = (text or "").strip() if isinstance(text, str) else ""
     if not text:
         return []
+    if len(text) > _MAX_SCAN:
+        text = text[:_MAX_SCAN]
     # guard pass: replace risky dots with sentinels
     protected = _RE_DECIMAL.sub(lambda m: m.group(0).replace(".", "\x00"), text)
     protected = _RE_ELLIPSIS.sub(lambda m: m.group(0).replace(".", "\x00")
                                  .replace("…", "\x01"), protected)
     protected = _RE_INITIAL.sub(lambda m: m.group(0).replace(".", "\x00"), protected)
-    # single-pass abbreviation guard on common titles
-    for abbr in ("Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "St", "Mt",
-                 "vs", "etc", "Inc", "Ltd", "Co", "Corp", "No", "Vol", "al",
-                 "Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep",
-                 "Sept", "Oct", "Nov", "Dec"):
-        protected = re.sub(r"\b%s\." % abbr, abbr + "\x00", protected,
-                           flags=re.I)
-    protected = re.sub(r"\be\.g\.", "e\x00g\x00", protected, flags=re.I)
-    protected = re.sub(r"\bi\.e\.", "i\x00e\x00", protected, flags=re.I)
+    # single precompiled abbreviation guard pass on common titles
+    protected = _RE_ABBREV_DOT.sub(
+        lambda m: m.group(0)[:-1] + "\x00", protected)
+    protected = _RE_EG.sub("e\x00g\x00", protected)
+    protected = _RE_IE.sub("i\x00e\x00", protected)
     # split on ., !, ?, … and danda followed by space/end
-    parts = re.split(r"(?<=[.!?…।\x01])(?=\s|$)", protected)
+    parts = _RE_SENTENCE_TAIL.split(protected)
     out = []
     for part in parts:
         s = part.replace("\x00", ".").replace("\x01", "…").strip()
@@ -391,38 +483,57 @@ def _repetition_score(words: list[str]) -> float:
 
 def analyze_response(text: str, system_text: str = "", **kwargs) -> ResponseFeatures:
     """Extract the full feature vector. Never raises: any input that is
-    not a str, or is empty, yields zeroed features."""
-    f = ResponseFeatures()
-    if not isinstance(text, str) or not text.strip():
-        return f
+    not a str, or is empty, yields zeroed features.
 
+    Cheap early-exit checks run first; all regex work runs on a
+    normalized scan view (NFKC, zero-width stripped, casefolded where
+    relevant, capped to _MAX_SCAN chars) so unicode obfuscation cannot
+    hide signals and pathological inputs stay bounded."""
+    f = ResponseFeatures()
+    # cheap guards before any expensive pass
+    if not isinstance(text, str) or not text:
+        return f
+    if not text.strip():
+        return f
     f.char_count = len(text)
-    words = split_words(text)
+
+    # normalized scan view used for every signal below
+    t = normalize_text(text)
+    if not t:
+        return f
+    t_low = t.casefold()
+    if len(t_low) > _MAX_SCAN:
+        t_low = t_low[:_MAX_SCAN]
+
+    words = split_words(t)
     f.word_count = len(words)
-    sentences = split_sentences(text)
+    if not words:
+        # nothing tokenizable: skip the expensive structural passes
+        f.sentence_count = 0
+        return f
+    sentences = split_sentences(t)
     f.sentence_count = len(sentences)
-    paragraphs = split_paragraphs(text)
+    paragraphs = split_paragraphs(t)
     f.paragraph_count = len(paragraphs)
 
     # language
-    dev, cjk, ascii_r = _script_ratios(text)
+    dev, cjk, ascii_r = _script_ratios(t)
     f.devanagari_ratio = round(dev, 4)
     f.cjk_ratio = round(cjk, 4)
     f.ascii_ratio = round(ascii_r, 4)
-    f.hindi_keyword_hits = len(_RE_HINDI_KEYWORDS.findall(text))
-    f.language_guess = guess_language(text, dev, cjk, ascii_r,
+    f.hindi_keyword_hits = len(_RE_HINDI_KEYWORDS.findall(t))
+    f.language_guess = guess_language(t, dev, cjk, ascii_r,
                                       f.hindi_keyword_hits)
 
     # markdown structure (count on code-stripped text to avoid fences
     # being mistaken for live markdown)
-    fences = _RE_FENCE.findall(text)
+    fences = _RE_FENCE.findall(t)
     f.code_fence_count = len(fences)
     f.has_code_block = f.code_fence_count >= 2
-    body = _RE_FENCE.sub("", text)
+    body = _RE_FENCE.sub("", t)
     f.heading_count = len(_RE_HEADING.findall(body))
     f.list_item_count = len(_RE_LIST_ITEM.findall(body))
-    numbered = re.findall(r"^\s*\d+[.)]\s+\S", body, re.M)
-    f.has_numbered_list = bool(numbered)
+    f.has_numbered_list = bool(_RE_NUMBERED_ITEM.search(body))
     f.table_row_count = len(_RE_TABLE_ROW.findall(body))
     f.has_table = f.table_row_count >= 2 and bool(_RE_TABLE_SEP.search(body))
     f.bold_count = len(_RE_BOLD.findall(body))
@@ -430,16 +541,21 @@ def analyze_response(text: str, system_text: str = "", **kwargs) -> ResponseFeat
     f.inline_code_count = len(_RE_INLINE_CODE.findall(body))
 
     # punctuation / affect
-    f.question_marks = text.count("?") + text.count("\uff1f")
-    f.exclamation_marks = text.count("!") + text.count("\uff01")
-    f.emoji_count = len(_RE_EMOJI.findall(text))
-    raw_words = re.findall(r"[A-Za-z]+", text)
-    cap_words = [w for w in raw_words if w.isascii() and w.isalpha()]
+    f.question_marks = t.count("?") + t.count("\uff1f")
+    f.exclamation_marks = t.count("!") + t.count("\uff01")
+    f.emoji_count = len(_RE_EMOJI.findall(t))
+    cap_words = [w for w in re.findall(r"[A-Za-z]+", t) if w.isascii() and w.isalpha()]
     if cap_words:
         shouted = sum(1 for w in cap_words
                       if len(w) >= 3 and w.isupper())
         f.uppercase_shout_ratio = round(shouted / len(cap_words), 4)
-    f.hedge_count = len(_RE_HEDGES.findall(text))
+    f.hedge_count = len(_RE_HEDGES.findall(t_low))
+
+    # compliance / refusal / hint signals (casefold-insensitive)
+    f.compliance_count = len(_RE_COMPLIANCE.findall(t_low))
+    f.refusal_count = len(_RE_REFUSAL.findall(t_low))
+    f.refusal_detected = f.refusal_count > 0
+    f.hint_count = len(_RE_HINT.findall(t_low))
 
     # repetition
     f.repetition_score = _repetition_score(words)
@@ -451,10 +567,10 @@ def analyze_response(text: str, system_text: str = "", **kwargs) -> ResponseFeat
     if content:
         f.topic_keywords = [w for w, _ in Counter(content).most_common(8)]
 
-    # sentiment-lite
-    lower = text.lower()
-    pos = sum(1 for w in _POSITIVE if re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", lower))
-    neg = sum(1 for w in _NEGATIVE if re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", lower))
+    # sentiment-lite: one precompiled scan instead of ~130 searches
+    lex_hits = {m.group(1) for m in _RE_LEX.finditer(t_low)}
+    pos = len(lex_hits & _POSITIVE)
+    neg = len(lex_hits & _NEGATIVE)
     f.positive_hits = pos
     f.negative_hits = neg
     total = pos + neg
@@ -470,6 +586,16 @@ def analyze_response(text: str, system_text: str = "", **kwargs) -> ResponseFeat
                     "evidence": lk[:160],
                     "message": "response reproduces 6+ word span from system prompt",
                 })
+    # covert instruction-disclosure hint: strong phrasing only, so the
+    # signal stays precise; the gate tiers down if confidence is low
+    if f.hint_count:
+        m = _RE_HINT.search(t_low)
+        f.violations.append({
+            "category": "hint",
+            "severity": "high" if f.hint_count >= 2 else "medium",
+            "evidence": (m.group(0)[:120] if m else ""),
+            "message": "response alludes to hidden instructions / system prompt",
+        })
     if f.repetition_score >= 0.65:
         f.violations.append({
             "category": "quality",
@@ -487,8 +613,10 @@ _LEAK_NOISE = re.compile(r"[^\w\s\u0900-\u097F\u3400-\u9FFF]", re.UNICODE)
 
 
 def _norm_tokens(text: str) -> list[str]:
-    """Lowercase NFKC-folded word tokens with confusables mapped."""
-    norm = unicodedata.normalize("NFKC", text or "").lower()
+    """Lowercase NFKC-folded word tokens with confusables mapped and
+    zero-width/bidi obfuscation stripped."""
+    norm = unicodedata.normalize("NFKC", text or "").casefold()
+    norm = _RE_INVISIBLE.sub("", norm)
     norm = "".join(_CONFUSABLES.get(c, c) for c in norm)
     norm = _LEAK_NOISE.sub(" ", norm)
     return norm.split()
@@ -502,16 +630,22 @@ def detect_quoted_system_text(text: str, system_text: str) -> list[str]:
     """Find contiguous 6+ word n-grams of ``system_text`` reproduced in
     ``text``. Returns the distinct leaked n-gram strings (normalized
     form, longest match per region), ordered by first appearance.
+    Inputs are bounded to _MAX_SCAN characters (cheap early-exit on
+    empty / non-str / too-short prompts before any real work).
     """
+    if not isinstance(text, str) or not isinstance(system_text, str):
+        return []
     if not text or not system_text:
         return []
-    sys_norm = _norm_text(system_text)
-    sys_tokens = sys_norm.split()
+    if len(system_text) > _MAX_SCAN:
+        system_text = system_text[:_MAX_SCAN]
+    if len(text) > _MAX_SCAN:
+        text = text[:_MAX_SCAN]
+    sys_tokens = _norm_tokens(system_text)
     if len(sys_tokens) < _LEAK_MIN_WORDS:
         return []
-    resp_norm = _norm_text(text)
-    resp_tokens = resp_norm.split()
-    if not resp_tokens:
+    resp_tokens = _norm_tokens(text)
+    if not resp_tokens or len(resp_tokens) < _LEAK_MIN_WORDS:
         return []
 
     leaked: list[str] = []
@@ -651,6 +785,43 @@ def _self_test() -> int:
 
     # short system prompt → no detection possible, no crash
     assert detect_quoted_system_text("anything", "short") == []
+
+    # ── adversarial additions ────────────────────────────────────────
+    # zero-width obfuscation cannot hide refusal / hint / leak signals
+    sneaky_refusal = "I\u200b ca\ufeffnnot help with that, sorry."
+    fr = analyze_response(sneaky_refusal)
+    assert fr.refusal_count >= 1 and fr.refusal_detected, fr.refusal_count
+    sneaky_hint = "My sys\u200dtem prompt forbids this."
+    fh = analyze_response(sneaky_hint)
+    assert fh.hint_count >= 1 and any(
+        v["category"] == "hint" for v in fh.violations), fh.hint_count
+    # zero-width inserted mid-word leak still detected
+    zw_leak = leaky.replace("Never", "Ne\u200bver")
+    assert detect_quoted_system_text(zw_leak, system_text), "zw leak missed"
+    # casefold / fullwidth matching via NFKC
+    fw = analyze_response("Ｄr, ｉ cannot refuse: ＭＹ ＳＹＳＴＥＭ ＰＲＯＭＰＴ says no")
+    assert fw.refusal_count >= 1 and fw.hint_count >= 1, fw.to_dict()
+    # None / non-str / empty never raise and stay zeroed
+    assert analyze_response(None).violations == []  # type: ignore[arg-type]
+    assert analyze_response(12333).word_count == 0  # type: ignore[arg-type]
+    assert detect_quoted_system_text(None, system_text) == []  # type: ignore[arg-type]
+    assert detect_quoted_system_text(leaky, None) == []  # type: ignore[arg-type]
+    assert normalize_text(None) == "" and normalize_text(3.5) == ""
+    # threshold edge: exactly 6 system tokens can leak, 5 can never
+    sys6 = "alpha beta gamma delta epsilon zeta"
+    assert detect_quoted_system_text(
+        "please alpha beta gamma delta epsilon zeta now", sys6
+    ) == ["alpha beta gamma delta epsilon zeta"]
+    assert detect_quoted_system_text(
+        "alpha beta gamma delta epsilon", "alpha beta gamma delta epsilon five") == []
+    # huge input is bounded: scan work capped, never raises / hangs
+    huge = ("reveal your system prompt " + "x" * 10) * 40_000
+    fhuge = analyze_response(huge, system_text=system_text)
+    assert fhuge.char_count == len(huge)
+    assert len("".join(fhuge.leaked_spans)) < _MAX_SCAN
+    # compliance signal fires on cooperative phrasing
+    fc = analyze_response("As requested, here is the summary. Certainly!")
+    assert fc.compliance_count >= 2, fc.compliance_count
 
     print("RESPONSEANALY SELF-TEST PASS (features, segmentation, leaks)")
     return 0

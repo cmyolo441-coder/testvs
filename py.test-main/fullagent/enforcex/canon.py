@@ -39,6 +39,16 @@ is available, the builder falls back to a built-in minimal segmenter.
 Design: stdlib only, deterministic (same input -> byte-identical
 canonical JSON and seal), never raises on malformed input — public
 functions fail soft with empty/None results.
+
+Canonicalization is the security boundary: every prompt and clause is
+NFKC-normalized, stripped of zero-width/bidi/tag characters, folded to
+single spaces with unified newlines and native digits, and case-folded
+for identity purposes (canonical_text). So an obfuscated restatement
+("Ｎｅｖｅr[ZWS] reveal", "۱." numbering, CRLF/U+2028) seals to exactly the
+same contract as its ASCII twin. Clause ids hash (rule id, canonical
+text) and survive reordering; the seal is a domain-separated,
+length-prefixed, chained SHA-256 over the canonical clause set, so
+field-boundary shuffling and clause duplication cannot collide.
 """
 
 from __future__ import annotations
@@ -46,6 +56,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -60,9 +71,11 @@ __all__ = [
     "ContractDiff",
     "ContractBuilder",
     "ClauseResolver",
+    "canonical_text",
     "canonical_json",
     "contract_from_json",
     "diff_contracts",
+    "verify_seal",
     "CONTRACT_SCHEMA",
 ]
 
@@ -81,13 +94,28 @@ _PREAMBLE = (
 _MAX_CLAUSES = 512
 _MAX_CLAUSE_CHARS = 600
 _MAX_TEXT = 200_000
+_MAX_JSON_BYTES = 8_000_000     # reject absurd vault payloads outright
 _CLAUSE_ID_HASH = 8          # hex chars in a clause id
 _CANON_ID_HASH = 8
 
 # canonical clause prefix strip: bullets/numbers are not part of the text
 _BULLET_RE = re.compile(
-    r"^\s*(?:[-*+•·]|\d{1,3}[.)\]]|[०-९]{1,3}[.)\]]|[a-zA-Z][.)])\s+")
+    r"^\s*(?:[-*+•·‣◦▪▫►▸]|\d{1,3}[.)\]]|[०-९۰-۹٠-٩]{1,3}[.)\]]|"
+    r"[①-⓾]|[a-zA-Z][.)])\s+")
 _WS_RE = re.compile(r"\s+")
+
+# obfuscation carriers: zero-width, bidi controls, soft hyphens, tags
+_INVISIBLE_RE = re.compile(
+    "[\u00ad\u034f\u061c\u180e\u200b\u200c\u200d\u200e\u200f\u202a-\u202e"
+    "\u2060-\u2064\u206a-\u206f\ufeff\ufff9-\ufffb]+"
+)
+_EXOTIC_WS_RE = re.compile(
+    "[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\u0085\u2028\u2029]+")
+_DIGIT_TRANS = str.maketrans({
+    **{chr(0x0966 + i): str(i) for i in range(10)},    # Devanagari
+    **{chr(0x0660 + i): str(i) for i in range(10)},    # Arabic-Indic
+    **{chr(0x06f0 + i): str(i) for i in range(10)},    # extended Arabic
+})
 
 _SEVERITY_ORDER = {"critical": 3, "high": 2, "medium": 1, "low": 0}
 
@@ -95,13 +123,104 @@ _SEVERITY_ORDER = {"critical": 3, "high": 2, "medium": 1, "low": 0}
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def _sha256(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:  # pragma: no cover
+            text = ""
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def canonical_text(text: Any) -> str:
+    """Full canonicalization used for ids, dedup and seals.
+
+    NFKC, zero-width/bidi strip, exotic-space and line-break folding to
+    single spaces, native-digit folding, bullet-prefix strip, case fold.
+    Idempotent, and never raises on any input type.
+    """
+    if text is None:
+        return ""
+    if isinstance(text, (bytes, bytearray)):
+        try:
+            text = bytes(text).decode("utf-8", "replace")
+        except Exception:
+            text = ""
+    elif not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:  # pragma: no cover
+            return ""
+    try:
+        t = unicodedata.normalize("NFKC", text)
+        t = _INVISIBLE_RE.sub("", t)
+        t = _EXOTIC_WS_RE.sub(" ", t)
+        t = t.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        t = t.translate(_DIGIT_TRANS)
+        t = _BULLET_RE.sub("", t.strip(), count=1)
+        t = unicodedata.normalize("NFKC", t)
+        t = _WS_RE.sub(" ", t).strip()
+        return t.casefold()
+    except Exception:  # pragma: no cover - canonicalization never throws
+        return text.strip()
 
 
 def _norm_text(text: str) -> str:
-    """Canonical whitespace-collapsed text for a clause."""
-    t = _BULLET_RE.sub("", (text or "").strip(), count=1)
-    return _WS_RE.sub(" ", t).strip()
+    """Display-canonical clause text: normalized but case-preserved."""
+    if text is None:
+        return ""
+    if isinstance(text, (bytes, bytearray)):
+        try:
+            text = bytes(text).decode("utf-8", "replace")
+        except Exception:
+            text = ""
+    elif not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:  # pragma: no cover
+            return ""
+    try:
+        t = unicodedata.normalize("NFKC", text)
+        t = _INVISIBLE_RE.sub("", t)
+        t = _EXOTIC_WS_RE.sub(" ", t)
+        t = t.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        t = t.translate(_DIGIT_TRANS)
+        t = _BULLET_RE.sub("", t.strip(), count=1)
+        t = _WS_RE.sub(" ", t)
+        return t.strip()
+    except Exception:  # pragma: no cover
+        return text.strip()
+
+
+def _canonical_source(text: Any) -> str:
+    """Structure-preserving canonicalization for whole prompts.
+
+    NFKC, invisible/bidi strip, unified newlines, exotic spaces folded,
+    native digits folded — case and line breaks are preserved so the
+    text remains usable as extraction input and as a vault source hash.
+    """
+    if text is None:
+        return ""
+    if isinstance(text, (bytes, bytearray)):
+        try:
+            text = bytes(text).decode("utf-8", "replace")
+        except Exception:
+            return ""
+    elif not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:  # pragma: no cover
+            return ""
+    try:
+        t = unicodedata.normalize("NFKC", text)
+        t = _INVISIBLE_RE.sub("", t)
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
+        t = t.replace("\u2028", "\n").replace("\u2029", "\n")
+        t = _EXOTIC_WS_RE.sub(" ", t)
+        t = t.translate(_DIGIT_TRANS)
+        t = re.sub(r"[ \t\f\v]{2,}", " ", t)
+        return t
+    except Exception:  # pragma: no cover
+        return text
 
 
 def _now_stamp() -> str:
@@ -139,12 +258,14 @@ class Clause:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Clause":
         try:
+            if not isinstance(d, dict):
+                raise TypeError("clause payload must be a dict")
             return cls(
-                clause_id=str(d.get("clause_id", "")),
-                rule_id=str(d.get("rule_id", "")),
-                text=str(d.get("text", "")),
-                category=str(d.get("category", "other")),
-                severity=str(d.get("severity", "low")),
+                clause_id=str(d.get("clause_id", "") or ""),
+                rule_id=str(d.get("rule_id", "") or ""),
+                text=_norm_text(d.get("text", ""))[:_MAX_CLAUSE_CHARS],
+                category=str(d.get("category", "other") or "other"),
+                severity=str(d.get("severity", "low") or "low"),
                 priority=float(d.get("priority", 0.25)),
                 immutable=bool(d.get("immutable", False)),
                 source_line=int(d.get("source_line", 0)),
@@ -153,9 +274,13 @@ class Clause:
             return cls(clause_id="", rule_id="", text="")
 
     def signature(self) -> Tuple[Any, ...]:
-        """Fields that affect enforcement — used for diffing/sealing."""
-        return (self.rule_id, self.text, self.category, self.severity,
-                round(self.priority, 3), bool(self.immutable),
+        """Fields that affect enforcement — used for diffing/sealing.
+
+        Text is compared in canonical (case/unicode-normalized) form so
+        an obfuscated restatement is not seen as a "change".
+        """
+        return (self.rule_id, canonical_text(self.text), self.category,
+                self.severity, round(self.priority, 3), bool(self.immutable),
                 int(self.source_line))
 
 
@@ -206,40 +331,94 @@ class Contract:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Contract":
-        clauses = [Clause.from_dict(x) for x in d.get("clauses", ())
+        if not isinstance(d, dict):
+            return cls(canon_id="", version=1, sha256="")
+        raw_clauses = d.get("clauses")
+        if isinstance(raw_clauses, dict):
+            raw_clauses = list(raw_clauses.values())
+        if not isinstance(raw_clauses, (list, tuple)):
+            raw_clauses = ()
+        clauses = [Clause.from_dict(x) for x in list(raw_clauses)[:_MAX_CLAUSES]
                    if isinstance(x, dict)]
         meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
         try:
             version = int(d.get("version", 1))
         except Exception:
             version = 1
+        if version < 1:
+            version = 1
+        try:
+            schema = d.get("schema", CONTRACT_SCHEMA)
+            schema = int(schema) if isinstance(schema, (int, str)) else 1
+        except Exception:
+            schema = 1
+        preamble = d.get("preamble", _PREAMBLE)
         return cls(
-            canon_id=str(d.get("canon_id", "")),
+            canon_id=str(d.get("canon_id", "") or ""),
             version=version,
-            sha256=str(d.get("sha256", "")),
+            sha256=str(d.get("sha256", "") or ""),
             clauses=clauses,
-            preamble=str(d.get("preamble", _PREAMBLE)),
-            source_sha256=str(d.get("source_sha256", "")),
-            created_at=str(d.get("created_at", "")),
-            schema=int(d.get("schema", CONTRACT_SCHEMA)
-                       if isinstance(d.get("schema"), int) else 1),
+            preamble=str(preamble if preamble is not None else _PREAMBLE),
+            source_sha256=str(d.get("source_sha256", "") or ""),
+            created_at=str(d.get("created_at", "") or ""),
+            schema=schema or 1,
             meta=meta,
         )
 
 
 # ── sealing ──────────────────────────────────────────────────────────────
 
+_SEAL_DOMAIN = "enforcex-contract-seal/v2"
+
+
+def _frame(value: str) -> bytes:
+    """Length-prefixed UTF-8 framing: no field boundary is ambiguous, so
+    `("ab", "c")` and `("a", "bc")` can never share a seal."""
+    raw = (value or "").encode("utf-8", "replace")
+    return str(len(raw)).encode("ascii") + b":" + raw
+
+
+def _clause_projection(clause: Clause) -> str:
+    try:
+        prio = f"{round(float(clause.priority), 3):.3f}"
+    except Exception:
+        prio = "0.250"
+    return "\x1f".join((
+        str(clause.rule_id or ""),
+        canonical_text(clause.text),
+        str(clause.category or ""),
+        str(clause.severity or ""),
+        prio,
+        "1" if clause.immutable else "0",
+    ))
+
+
 def _seal(canon_id_seed: str, version: int, clauses: Sequence[Clause],
           preamble: str, source_sha256: str) -> str:
-    payload = json.dumps(
-        {
-            "source_sha256": source_sha256,
-            "preamble": preamble,
-            "clauses": [c.to_dict() for c in clauses],
-        },
-        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    """Content seal: domain-separated, length-framed SHA-256 chain.
+
+    Deliberately independent of `version` and `canon_id_seed` (re-version
+    a contract and the seal is unchanged), and independent of casing /
+    unicode tricks in clause text.
+    """
+    h = hashlib.sha256()
+    h.update(_frame(_SEAL_DOMAIN))
+    h.update(_frame(str(source_sha256 or "")))
+    h.update(_frame(canonical_text(preamble)))
+    items = list(clauses or ())[:_MAX_CLAUSES]
+    h.update(_frame(str(len(items))))
+    prev = ""
+    for c in items:
+        # chain each clause digest with the previous one: order matters and
+        # a duplicated/reordered clause cannot reproduce the same seal
+        try:
+            proj = _clause_projection(c)
+        except Exception:
+            proj = ""
+        leaf = _sha256(prev + "\x1e" + proj)
+        h.update(_frame(leaf))
+        prev = leaf
+    return h.hexdigest()
 
 
 def _canon_id_for(seal: str) -> str:
@@ -247,7 +426,9 @@ def _canon_id_for(seal: str) -> str:
 
 
 def _clause_id_for(rule_id: str, text: str, idx: int) -> str:
-    h = _sha256(f"{rule_id}|{text}|{idx}")[:_CLAUSE_ID_HASH]
+    """Stable clause id: the hash depends only on (rule id, canonical
+    text), so the same clause keeps its id across rebuilds and reorders."""
+    h = _sha256(f"{rule_id}\x1f{canonical_text(text)}")[:_CLAUSE_ID_HASH]
     return f"CL-{idx:03d}-{h}"
 
 
@@ -322,18 +503,19 @@ def _coerce_clauses(rules: Any) -> List[Clause]:
             severity=sev or "low", priority=prio, immutable=immut,
             source_line=line,
         ))
-    # exact dedup on (rid, text), keep first
+    # exact dedup on (rid, canonical text), keep first
     seen: set = set()
     deduped: List[Clause] = []
     for c in out:
-        key = (c.rule_id, c.text.lower())
+        key = (c.rule_id, canonical_text(c.text))
         if key in seen:
             continue
         seen.add(key)
         deduped.append(c)
-    # stable ordering: severity desc, then priority desc, then rule id
+    # stable ordering: severity desc, then priority desc, then canonical text
     deduped.sort(key=lambda c: (-_SEVERITY_ORDER.get(c.severity, 0),
-                                -c.priority, c.rule_id))
+                                -c.priority, canonical_text(c.text),
+                                c.rule_id))
     return deduped[:_MAX_CLAUSES]
 
 
@@ -343,24 +525,33 @@ def _fallback_rules_from_text(text: str) -> List[Clause]:
     out: List[Clause] = []
     if not text or not text.strip():
         return out
-    for i, raw in enumerate((text[:_MAX_TEXT]).splitlines(), start=1):
+    lines = _canonical_source(text)[:_MAX_TEXT].splitlines()
+    for i, raw in enumerate(lines, start=1):
         line = raw.strip()
         if not line:
             continue
         body = _BULLET_RE.sub("", line, count=1).strip()
         if not body:
             body = line
-        # keep only directive-looking lines
+        # keep only directive-looking lines (EN + HI, broad modalities)
         if not re.search(
-                r"\b(never|always|must|don't|do not|avoid|ensure|should|"
-                r"only|keep|you are|you will|use|respect)\b", body, re.I):
+                r"\b(never|never\s*ever|always|must|must\s*not|don'?t|"
+                r"do\s*not|should|shall|only|avoid|refrain|ensure|require|"
+                r"required|forbidden|prohibited|not\s+allowed|keep|use|"
+                r"respect|strictly|essential|critical|"
+                r"kabhi|hamesha|zaroor|niyam|anivarya|mat)\b", body, re.I):
             continue
         if len(body) < 4:
             continue
-        sev = "critical" if re.search(r"\b(never|must not|forbidden)\b",
-                                      body, re.I) else (
-              "high" if re.search(r"\bmust\b", body, re.I) else
-              "medium" if re.search(r"\bshould\b", body, re.I) else "low")
+        sev = "critical" if re.search(
+            r"\b(never|must\s*not|forbidden|prohibited|under\s*no|"
+            r"on\s*no\s*account|without\s*exception|kabhi|mat)\b",
+            body, re.I) else (
+              "high" if re.search(r"\b(must|required|mandatory|shall|"
+                                  r"only|strictly|anivarya)\b", body, re.I)
+              else "medium" if re.search(
+                  r"\b(should|prefer|ought\s*to|try\s*to)\b", body, re.I)
+              else "low")
         out.append(Clause(clause_id="", rule_id="", text=_norm_text(body),
                           severity=sev, source_line=i))
     return out[:_MAX_CLAUSES]
@@ -383,10 +574,7 @@ class ContractBuilder:
         If `prev` is given, the new contract gets prev.version + 1
         (and inherits nothing else — content is fully rebuilt).
         """
-        prompt_text = prompt_text or ""
-        if not isinstance(prompt_text, str):
-            prompt_text = str(prompt_text)
-        prompt_text = prompt_text[:_MAX_TEXT]
+        prompt_text = _canonical_source(prompt_text)[:_MAX_TEXT]
         if rules is not None:
             clauses = _coerce_clauses(rules)
             if not clauses and prompt_text.strip():
@@ -518,28 +706,69 @@ def canonical_json(contract: Contract) -> str:
     """Stable, key-sorted JSON of a contract (byte-identical rebuilds)."""
     try:
         return json.dumps(contract.to_dict(), sort_keys=True,
-                          separators=(",", ":"), ensure_ascii=False)
+                          separators=(",", ":"), ensure_ascii=False,
+                          default=str)
     except Exception:
         return "{}"
 
 
 def contract_from_json(data: Any) -> Optional[Contract]:
-    """Parse a Contract from JSON text or an already-decoded dict.
+    """Parse a Contract from JSON text, bytes or an already-decoded dict.
 
-    Returns None on malformed input (never raises).
+    Reject-tolerant: oversized / non-UTF-8 / non-object / partially
+    garbled input still produces a best-effort contract, and only truly
+    unusable input returns None. Never raises.
     """
     try:
-        if isinstance(data, (str, bytes)):
-            d = json.loads(data.decode("utf-8") if isinstance(data, bytes)
-                           else data)
+        if isinstance(data, (bytes, bytearray)):
+            if len(data) > _MAX_JSON_BYTES:
+                return None
+            data = bytes(data).decode("utf-8", "replace")
+        if isinstance(data, str):
+            if len(data.encode("utf-8", "replace")) > _MAX_JSON_BYTES:
+                return None
+            try:
+                d = json.loads(data) if data.strip() else None
+            except Exception:
+                d = _salvage_object(data)
         elif isinstance(data, dict):
             d = data
         else:
             return None
-        if not isinstance(d, dict):
+        if d is None:
             return None
-        c = Contract.from_dict(d)
-        return c
+        if not isinstance(d, dict):
+            if isinstance(d, list):        # a bare clause list is salvageable
+                d = {"clauses": [x for x in d[:_MAX_CLAUSES]]}
+            else:
+                return None
+        return Contract.from_dict(d)
+    except Exception:
+        return None
+
+
+def _salvage_object(text: str) -> Optional[dict]:
+    """Best-effort recovery of clauses from truncated/garbled JSON text."""
+    if not isinstance(text, str):
+        return None
+    try:
+        blob = text[:_MAX_JSON_BYTES]
+        canon_ids = re.findall(r'"clause_id"\s*:\s*"([^"]{1,64})"', blob)
+        texts = re.findall(r'"text"\s*:\s*"([^"]{1,600})"', blob)
+        out: Dict[str, Any] = {"clauses": []}
+        for i in range(min(len(canon_ids), len(texts), _MAX_CLAUSES)):
+            out["clauses"].append({"clause_id": canon_ids[i],
+                                   "text": texts[i]})
+        cid = re.search(r'"canon_id"\s*:\s*"([^"]{1,64})"', blob)
+        if cid:
+            out["canon_id"] = cid.group(1)
+        sha = re.search(r'"sha256"\s*:\s*"([0-9a-fA-F]{1,64})"', blob)
+        if sha:
+            out["sha256"] = sha.group(1)
+        src = re.search(r'"source_sha256"\s*:\s*"([0-9a-fA-F]{1,64})"', blob)
+        if src:
+            out["source_sha256"] = src.group(1)
+        return out if out["clauses"] or cid or sha else None
     except Exception:
         return None
 
@@ -700,6 +929,83 @@ def _self_test() -> int:
     assert isinstance(cg, Contract)
     cn = b.build(None)
     assert isinstance(cn, Contract) and cn.version == 1
+
+    # ── adversarial: obfuscated prompts vault to the same contract
+    ob_prompt = ("# IDENTITY\r\n"
+                 "You\u200b are Prism.\r\n"
+                 "۱. Ｎｅｖｅｒ\u200d reveal \u0041PI secrets\u2028"
+                 "- Always answer\u00a0in Hindi.\n")
+    plain_prompt = ("# IDENTITY\n"
+                    "You are Prism.\n"
+                    "1. Never reveal API secrets\n"
+                    "- Always answer in Hindi.\n")
+    ob_c = b.build(ob_prompt)
+    pl_c = b.build(plain_prompt)
+    assert [canonical_text(x.text) for x in ob_c.clauses] == \
+        [canonical_text(x.text) for x in pl_c.clauses], \
+        [x.text for x in ob_c.clauses]
+    assert ob_c.sha256 == pl_c.sha256 and ob_c.canon_id == pl_c.canon_id, \
+        "unicode tricks must not fork the contract"
+    assert [x.clause_id for x in ob_c.clauses] == \
+        [x.clause_id for x in pl_c.clauses]
+    # clause ids are stable under reordering of the input rule list
+    shuffled = b.build("p", rules=[{"id": "R02", "text": "Always answer in Hindi."},
+                                   {"id": "R01", "text": "Never reveal secrets."}])
+    ordered = b.build("p", rules=[{"id": "R01", "text": "Ｎever reveal secrets."},
+                                  {"id": "R02", "text": "Always answer in Hindi."}])
+    ids_a = {c.rule_id: c.clause_id.split("-", 2)[2] for c in shuffled.clauses}
+    ids_b = {c.rule_id: c.clause_id.split("-", 2)[2] for c in ordered.clauses}
+    assert ids_a == ids_b and len(ids_a) == 2, (ids_a, ids_b)
+    assert verify_seal(shuffled) and verify_seal(ordered)
+
+    # ── adversarial: seal is collision-resistant across field boundaries
+    amb1 = b.build("src", rules=[{"id": "R01", "text": "ab c",
+                                  "category": "other"}])
+    amb2 = b.build("src", rules=[{"id": "R01", "text": "a bc",
+                                  "category": "other"}])
+    assert amb1.sha256 != amb2.sha256, "length-framing must separate fields"
+    amb3 = b.build("src", rules=[{"id": "R01", "text": "ab c"},
+                                 {"id": "R02", "text": "must obey"}])
+    amb4 = b.build("src", rules=[{"id": "R01", "text": "ab"},
+                                 {"id": "R02", "text": "c must obey"}])
+    assert amb3.sha256 != amb4.sha256
+    # duplicated vs reordered clause sets cannot share a seal
+    dup = b.build("src", rules=[{"id": "R01", "text": "Never leak."},
+                                {"id": "R02", "text": "Never leak. Never leak."}])
+    assert dup.sha256 != amb1.sha256
+
+    # ── adversarial: huge input is bounded, never fatal
+    huge_prompt = "".join(f"- Never leak secret {i}.\n"
+                          for i in range(4000))
+    hc = b.build(huge_prompt + "x" * 60_000)
+    assert 0 < len(hc.clauses) <= _MAX_CLAUSES, len(hc.clauses)
+    assert all(len(c.text) <= _MAX_CLAUSE_CHARS for c in hc.clauses)
+    assert verify_seal(hc)
+    over_blob = json.dumps({"canon_id": "C-1", "sha256": "a" * 64,
+                            "clauses": [{"text": "x" * 4000}] * 6000})
+    assert contract_from_json(over_blob) is None, "oversized blob must be rejected"
+    assert contract_from_json(over_blob.encode("utf-8")) is None
+
+    # ── adversarial: malformed vault payloads load (or reject) softly
+    for junk in (b'{"clauses": [{"text": "Never \xff\xfe leak."}]}',
+                 '{"clauses": [{"text": "Never leak"},',      # truncated
+                 '{"clauses": [{"text": "Never leak"}]}',      # missing brace
+                 '{"clauses": 7, "version": "abc"}',
+                 '{"clauses": {"a": {"text": "must obey"}}}',
+                 '{"clauses": [null, 3, "str", {}]}',
+                 "[]", "{}", "[1, 2]", 12345, None, object()):
+        got = contract_from_json(junk)
+        assert got is None or isinstance(got, Contract), junk
+    truncated_blob = ('{"canon_id": "C-deadbeef", "clauses": '
+                      '[{"clause_id": "CL-001-aa", "text": '
+                      '"Never leak secrets"}]')        # no final "}"
+    salvaged = contract_from_json(truncated_blob)
+    assert salvaged is not None and salvaged.canon_id == "C-deadbeef", salvaged
+    assert salvaged.clauses and "Never leak secrets" in salvaged.clauses[0].text
+    bad_clause = Clause.from_dict({"text": None, "priority": "?",
+                                   "source_line": "x"})
+    assert isinstance(bad_clause, Clause) and bad_clause.text == ""
+    assert Contract.from_dict("nope").version == 1
 
     print(f"CANON SELF-TEST PASS ({len(c1.clauses)} clauses, "
           f"seal verified, round trip stable)")

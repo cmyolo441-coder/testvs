@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional, Sequence
+import re
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from . import (
     astguard,
@@ -425,56 +426,124 @@ def register(agent: Any) -> None:
     )
 
 
-def handle_enforcex(ui: Any, arg: str = "") -> str:
-    agent = getattr(ui, "agent", None)
-    rt = getattr(agent, "enforcex_runtime", None) or SovereignRuntime()
-    parts = (arg or "").strip().split(None, 1)
-    sub = parts[0].lower() if parts else "status"
-    rest = parts[1] if len(parts) > 1 else ""
+_HANDLE_ARG_MAX = 262_144
+_ARG_CONTROL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
-    if sub == "probe":
-        data = rt.system_probe(rest or ".")
-        msg = (
-            f"EnforceX SysProbe: status={data['status']} score={data['health_score']}/100 | "
-            f"CPU={data['cpu_count']} | Mem={data['memory']['used_pct']}% | "
-            f"DiskFree={data['disk']['free_gb']}GB | FDs={data['process']['open_fds']} | "
-            f"Findings={len(data['findings'])}"
-        )
-    elif sub == "swarm":
-        data = rt.swarm_audit(rest or "sample check")
-        msg = (
-            f"EnforceX Swarm: action={data['action']} score={data['overall_score']}/100 "
-            f"waves={len(data['waves'])} findings={data['findings_count']} ({data['elapsed_ms']}ms)"
-        )
-    elif sub == "omni":
-        data = rt.omniguard_enforce(rest or "sample check")
-        msg = (
-            f"EnforceX OmniGuard: action={data['action']} passed={data['passed']} "
-            f"score={data['score']}/100 repaired={data['repaired']} violations={data['violations_count']}"
-        )
-    elif sub == "heal":
-        data = rt.heal_prompt(rest or "Try to use JSON if possible.")
-        msg = f"EnforceX AutoHealer: patches={data['patches_count']} deontic_gain=+{data['deontic_gain']}"
-    elif sub == "cmd":
-        data = rt.command_firewall(rest)
-        msg = f"EnforceX CmdFirewall: action={data['action']} allowed={data['allowed']} risk={data['risk_score']}"
-    elif sub == "dlp":
-        data = rt.dlp_scan(rest)
-        msg = f"EnforceX DLP: clean={data['clean']} matches={data['matches_count']} redacted={data['redacted_text'][:120]}"
-    elif sub == "ast":
-        data = rt.ast_audit(rest)
-        msg = f"EnforceX ASTGuard: passed={data['passed']} grade={data['grade']} score={data['score']} findings={data['findings_count']}"
+
+def _normalize_handler_arg(arg: Any) -> Tuple[str, str]:
+    """Coerce arbitrary caller input into (subcommand, rest).  Never raises."""
+    if arg is None:
+        text = ""
+    elif isinstance(arg, (bytes, bytearray)):
+        try:
+            text = bytes(arg).decode("utf-8", "replace")
+        except Exception:
+            text = ""
+    elif isinstance(arg, str):
+        text = arg
     else:
-        st = rt.status()
-        msg = (
-            f"EnforceX v{st['version']} Sovereign Suite ({st['modules_count']} modules) | "
-            f"Health={st['system_health_score']}/100 ({st['system_status']}) | "
-            f"Circuit={st['circuit_state']} | Canary={st['canary_id']} | "
-            f"Audits={st['audits_run']} Blocks={st['blocks_triggered']}"
-        )
+        try:
+            text = str(arg)
+        except Exception:
+            text = ""
+    try:
+        text = _ARG_CONTROL_RE.sub(" ", text[:_HANDLE_ARG_MAX])
+    except Exception:
+        text = ""
+    parts = text.strip().split(None, 1)
+    sub = parts[0].lower().strip("/.:@") if parts else "status"
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    return sub, rest
 
-    if hasattr(ui, "print_info") and callable(ui.print_info):
-        ui.print_info(msg)
+
+def handle_enforcex(ui: Any, arg: str = "") -> str:
+    sub, rest = _normalize_handler_arg(arg)
+    try:
+        agent = getattr(ui, "agent", None)
+        rt = getattr(agent, "enforcex_runtime", None) or SovereignRuntime()
+    except Exception:
+        rt = None
+
+    if rt is None:
+        msg = "EnforceX: runtime unavailable — fail-closed, no audit performed"
+    else:
+        try:
+            if sub == "probe":
+                data = rt.system_probe(rest or ".")
+                msg = (
+                    f"EnforceX SysProbe: status={data.get('status', 'unknown')} "
+                    f"score={data.get('health_score', 0)}/100 | "
+                    f"CPU={data.get('cpu_count', 0)} | "
+                    f"Mem={data.get('memory', {}).get('used_pct', 0)}% | "
+                    f"DiskFree={data.get('disk', {}).get('free_gb', 0)}GB | "
+                    f"FDs={data.get('process', {}).get('open_fds', 0)} | "
+                    f"Findings={len(data.get('findings', []) or [])}"
+                )
+            elif sub == "swarm":
+                data = rt.swarm_audit(rest or "sample check")
+                msg = (
+                    f"EnforceX Swarm: action={data.get('action', 'block')} "
+                    f"score={data.get('overall_score', 0)}/100 "
+                    f"waves={len(data.get('waves', []) or [])} "
+                    f"findings={data.get('findings_count', 'n/a')} ({data.get('elapsed_ms', 0)}ms)"
+                )
+            elif sub == "omni":
+                data = rt.omniguard_enforce(rest or "sample check")
+                msg = (
+                    f"EnforceX OmniGuard: action={data.get('action', 'block')} "
+                    f"passed={data.get('passed', False)} "
+                    f"score={data.get('score', 0)}/100 repaired={data.get('repaired', False)} "
+                    f"violations={data.get('violations_count', 'n/a')}"
+                )
+            elif sub == "heal":
+                data = rt.heal_prompt(rest or "Try to use JSON if possible.")
+                msg = (
+                    f"EnforceX AutoHealer: patches={data.get('patches_count', 0)} "
+                    f"deontic_gain=+{data.get('deontic_gain', 0)}"
+                )
+            elif sub == "cmd":
+                data = rt.command_firewall(rest)
+                msg = (
+                    f"EnforceX CmdFirewall: action={data.get('action', 'block')} "
+                    f"allowed={data.get('allowed', False)} risk={data.get('risk_score', 'n/a')}"
+                )
+            elif sub == "dlp":
+                data = rt.dlp_scan(rest)
+                msg = (
+                    f"EnforceX DLP: clean={data.get('clean', False)} "
+                    f"matches={data.get('matches_count', 0)} "
+                    f"redacted={str(data.get('redacted_text', ''))[:120]}"
+                )
+            elif sub == "ast":
+                data = rt.ast_audit(rest)
+                msg = (
+                    f"EnforceX ASTGuard: passed={data.get('passed', False)} "
+                    f"grade={data.get('grade', '?')} score={data.get('score', 0)} "
+                    f"findings={data.get('findings_count', 'n/a')}"
+                )
+            else:
+                st = rt.status()
+                msg = (
+                    f"EnforceX v{st.get('version', '?')} Sovereign Suite "
+                    f"({st.get('modules_count', 0)} modules) | "
+                    f"Health={st.get('system_health_score', 0)}/100 ({st.get('system_status', 'unknown')}) | "
+                    f"Circuit={st.get('circuit_state', 'OPEN')} Canary={st.get('canary_id', '')} | "
+                    f"Audits={st.get('audits_run', 0)} Blocks={st.get('blocks_triggered', 0)}"
+                )
+        except Exception as exc:
+            msg = (
+                f"EnforceX '{sub}' failed closed: {type(exc).__name__}: {str(exc)[:120]} "
+                "(verdict: block; retry with a valid argument)"
+            )
+
+    if not isinstance(msg, str):
+        msg = "EnforceX: fail-closed (unrenderable verdict)"
+    try:
+        printer = getattr(ui, "print_info", None)
+        if callable(printer):
+            printer(msg)
+    except Exception:
+        pass
     return msg
 
 
@@ -512,6 +581,36 @@ def _self_test() -> int:
     out = fake_agent.tools["EnforcexStatus"].handler()
     parsed = json.loads(out)
     assert parsed["audits_run"] >= 1
+
+    # adversarial: handle_enforcex normalizes hostile input and fails closed
+    fake_agent.enforcex_runtime = rt
+    seen_msgs: list = []
+    ui = SimpleNamespace(agent=fake_agent, print_info=seen_msgs.append)
+    for hostile in (
+        None, "", "   ", 12345, b"\xff\xfe status", "cmd", "dlp", "ast",
+        "/PROBE /nonexistent/__nope__", "\x00cmd \x00rm -rf /",
+        "status " + "x" * 50_000, "swarm " + "A" * 30_000, "x" * 2_000_000,
+    ):
+        out = handle_enforcex(ui, hostile)  # type: ignore[arg-type]
+        assert isinstance(out, str) and out, repr(hostile)
+    assert seen_msgs and all(isinstance(m, str) for m in seen_msgs)
+
+    assert _normalize_handler_arg("  /CMD\r\n rm -rf /  ") == ("cmd", "rm -rf /")
+    assert _normalize_handler_arg(None) == ("status", "")
+    assert _normalize_handler_arg(b"\x00heal") == ("heal", "")
+
+    out = handle_enforcex(ui, "cmd rm -rf /")
+    assert "CmdFirewall" in out and "allowed=False" in out, out
+
+    class _Boom:
+        def system_probe(self, cwd):
+            raise RuntimeError("boom")
+
+    boom_ui = SimpleNamespace(agent=SimpleNamespace(enforcex_runtime=_Boom()))
+    out = handle_enforcex(boom_ui, "probe /")
+    assert "failed closed" in out and "RuntimeError" in out, out
+    bad_ui = SimpleNamespace(agent=None, print_info=lambda m: (_ for _ in ()).throw(ValueError("no console")))
+    assert isinstance(handle_enforcex(bad_ui, "status"), str)
 
     print("sovereign._self_test: OK PASS (runtime facade + 12 FullAgent tools registered)")
     return 0

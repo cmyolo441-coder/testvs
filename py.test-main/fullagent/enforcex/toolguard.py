@@ -65,10 +65,8 @@ _LOOPBACK_HOSTS = {
 }
 _UNICODE_DOTS = ("\u3002", "\uff0e", "\uff61")
 _NUMERIC_PART_RE = re.compile(r"^(?:0[xX][0-9a-fA-F]+|[0-9]+)$")
-_ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u0003\u00ad]")
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
-_SHELL_METACHAR_RE = re.compile(r"[;&|`$\n\r]")
-_PATH_TRAVERSAL_RE = re.compile(r"(?:^|[\\/])\.\.([\\/]|$)")
+_ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _PATH_KEY_RE = re.compile(
     r"^(?:path|paths|file|files|filename|filepath|file_path|directory|dir|"
     r"folder|target|destination|dest|source|src|dst|cwd)$",
@@ -294,7 +292,7 @@ def check_path_safety(
         return False, "high", "filesystem path exceeds the maximum supported length"
     if "\x00" in path_str:
         return False, "critical", "null byte in filesystem path"
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in path_str):
+    if _CONTROL_CHAR_RE.search(path_str):
         return False, "high", "control character in filesystem path"
 
     try:
@@ -424,7 +422,7 @@ def check_url_ssrf(
         return False, "high", "URL exceeds the maximum supported length"
     if "\\" in candidate:
         return False, "high", "backslash in URL is ambiguous and blocked"
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in candidate):
+    if _CONTROL_CHAR_RE.search(candidate):
         return False, "critical", "control characters in URL blocked"
     folded = _normalize_glyphs(candidate)
     if len(folded) > _MAX_URL_CHARS:
@@ -881,6 +879,20 @@ def _self_test() -> int:
     assert not check_url_ssrf("http://" + "a" * 9_000)[0]
     assert not check_url_ssrf("http://999.999.999.999/")[0]
     assert not check_url_ssrf(12345)[0]                     # type: ignore[arg-type]
+
+    # adversarial: unicode obfuscation (zero-width splits, fullwidth homoglyphs,
+    # mixed case) must not bypass SSRF/path jail after NFKC normalisation
+    assert not check_url_ssrf("http://169.254.169.\u200b254/latest/meta-data/")[0]
+    assert not check_url_ssrf("http://local\u200chost:8080/admin")[0]
+    assert not check_url_ssrf("ＨＴＴＰ://169.254.169.254/")[0]
+    assert not check_path_safety("/ＥＴＣ/ｓｈadow")[0]
+    assert not check_path_safety("/ｅｔｃ/ｐａｓｓwd")[0]
+    assert not check_path_safety("/tmp/\u200b.ssh/id_rsa")[0]
+    assert not check_path_safety("~/.ssh/id\u200brsa")[0]
+    assert not check_path_safety("/ETC/SSH/\uff43onfig")[0]
+    assert not tg.check_call("\u200bRUN_COMMAND", {"command": "rm -rf /"}).allowed
+    assert not tg.check_call("Read_File", {"path": "/proc/self/environ"}).allowed
+    assert not evaluate_tool_call("web_fetch", {"url": "http://127\u200c.0.0.1/"}).allowed
 
     # path handling edge cases never raise
     for bad in (None, "", "   ", "x\x00y", "/tmp/" + "a" * 9_000):

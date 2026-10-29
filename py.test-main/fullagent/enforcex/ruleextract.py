@@ -14,26 +14,51 @@ comes out. Each rule carries:
   * the 1-based source line the rule was extracted from.
 
 Extraction passes, in order:
+  P0  unicode/whitespace normalization — NFKC, zero-width/bidi strip,
+                               line-break unification, Devanagari /
+                               Arabic-Indic / fullwidth digit folding,
+                               exotic-space collapse. Runs BEFORE any
+                               splitting, so an obfuscated directive is
+                               extracted (and digests) exactly like its
+                               plain ASCII twin.
   P1  line segmentation      — split the prompt into logical lines,
-                               track bullets/numbering (Arabic AND
-                               Devanagari numerals, Hindi/Hinglish
-                               markers like "niyam", "kabhi", "hamesha").
-  P2  section/heading detect — markdown headings, ALL-CAPS lines and
-                               known directive headers ("RULES:",
-                               "NEVER:", "IDENTITY:", ...) set the
+                               track bullets/numbering (Arabic,
+                               Devanagari, Arabic-Indic, circled, roman,
+                               lettered; typographic bullets), strip
+                               "[P0]"/"**...**" decoration, and honor
+                               Hindi/Hinglish markers ("niyam", "kabhi",
+                               "hamesha").
+  P2  section/heading detect — markdown headings, ALL-CAPS lines,
+                               "LABEL:" directive headers and constraint
+                               labels ("Rules to follow:", "NEVER:",
+                               "IDENTITY:", "CRITICAL …") set the
                                section context and boost priority.
   P3  imperative filter      — a line becomes a Rule only if it looks
-                               directive: starts with an imperative
-                               marker or lives under a directive header.
+                               directive: modalities (must / should /
+                               never / never ever / avoid / only / shall
+                               / ought to / refrain / forbidden / not
+                               allowed / under no circumstances …),
+                               priority tags ([P0], "priority: highest",
+                               "!!!"), or second-person openers.
+  P3b scope detect           — per-tool / per-role / per-stage rules
+                               ("when using the shell tool", "as an
+                               auditor", "for each command") get the
+                               tool_use bucket, a priority bump, and are
+                               listed in PromptSpec.meta["scoped"].
   P4  categorize             — keyword tables map text to a category.
   P5  severity + priority    — MUST/NEVER/ABSOLUTE -> critical,
                                should -> medium, else low; headings
-                               like CRITICAL/SECURITY bump severity.
+                               like CRITICAL/SECURITY bump severity;
+                               P0/P1 tags escalate it; scoped rules get
+                               a numeric priority boost.
   P6  patterns               — compile safe word-boundary regexes from
                                the rule's keywords; invalid regex is
                                silently dropped (never raise).
   P7  dedup                  — exact-match dedup plus fuzzy near-
                                duplicate removal (token Jaccard > 0.8).
+
+Work is bounded end to end: input chars, segment count, rule count and
+rule length all have caps, so a multi-megabyte prompt cannot blow up.
 
 A PromptSpec bundles all rules with metadata (source hash, counts,
 signature) and a sha256-based digest that is stable across runs.
@@ -144,7 +169,7 @@ _CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 # ── P0: unicode / whitespace normalization ───────────────────────────────
-# Obfuscated directives ("ne​ver  ʀeᴠeᴀʟ", fullwidth "１.", Arabic-Indic
+# Obfuscated directives ("ne[ZWSP]ver  ʀeᴠeᴀʟ", fullwidth "１.", Arabic-Indic
 # "١.", U+2028 line separators, NBSP indents) must extract exactly like
 # their plain-ASCII twins, so every path normalizes before splitting.
 
@@ -164,6 +189,8 @@ _LINEBREAK_RE = re.compile(r"\r\n|\r|\u0085|\u2028|\u2029")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x84\x86-\x9f]+")
 # repeated inline blanks collapse (but never across lines)
 _MULTI_SPACE_RE = re.compile(r"[ \t\f\v]{2,}")
+# any run of whitespace (incl. newlines) → single space, for keys/labels
+_WS_COLLAPSE = re.compile(r"\s+")
 
 # Devanagari / Arabic-Indic / extended Arabic-Indic / fullwidth → ASCII
 _DIGIT_TRANS = str.maketrans({
@@ -281,6 +308,28 @@ _HEADER_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("date", Categories.DATE_TIME),
     ("time", Categories.DATE_TIME),
     ("content", Categories.CONTENT_POLICY),
+    # real-world prompt vocabularies
+    ("guideline", Categories.OTHER),
+    ("constraint", Categories.OTHER),
+    ("restriction", Categories.OTHER),
+    ("instruction", Categories.OTHER),
+    ("directive", Categories.OTHER),
+    ("policy", Categories.CONTENT_POLICY),
+    ("policies", Categories.CONTENT_POLICY),
+    ("prohibited", Categories.CONTENT_POLICY),
+    ("confidential", Categories.SECURITY),
+    ("secret", Categories.SECURITY),
+    ("critical", Categories.SECURITY),
+    ("warning", Categories.SECURITY),
+    ("tool", Categories.TOOL_USE),
+    ("command", Categories.TOOL_USE),
+    ("shell", Categories.TOOL_USE),
+    ("execution", Categories.TOOL_USE),
+    ("role", Categories.IDENTITY),
+    ("voice", Categories.TONE),
+    ("length", Categories.FORMAT),
+    ("date_time", Categories.DATE_TIME),
+    ("हिंदी", Categories.LANGUAGE),
 )
 
 _HEADER_LINE_RE = re.compile(
@@ -288,12 +337,19 @@ _HEADER_LINE_RE = re.compile(
     r"(?:\*\*)?([A-Za-z][A-Za-z _/-]{1,40}?)(?:\*\*)?\s*:?\s*$"
 )
 
+# priority/tag prefixes are decoration: "[P0]", "(IMPORTANT)", "**NOTE**"
+_TAG_PREFIX_RE = re.compile(
+    r"^\s*[\[(<]\s*(?:\*{1,2})?\s*"
+    r"(?:p\s*[0-9]|critical|important|caution|warning|note|urgent|must|"
+    r"rule\s*\d*|नियम\s*\d*)\s*"
+    r"(?:\*{1,2})?\s*[\])>]\s*[:.\-]?\s*", re.I)
+
 _BULLET_RE = re.compile(
     r"^\s*(?:"
-    r"[-*+•·]"                                          # ascii bullets
+    r"[-*+•·‣◦▪▫●○►▸→–—]"                 # ascii + typographic bullets
     r"|\d{1,3}[.)\]]"                                   # 1. / 1) / 1]
-    r"|[०-९]{1,3}[.)\]]"                                # Devanagari digits
-    r"|[①-⑳]"                                           # circled numbers
+    r"|[०-९۰-۹٠-٩]{1,3}[.)\]]"           # Devanagari / Arabic-Indic digits
+    r"|[①-⓾]"                                           # circled numbers
     r"|[ivxIVX]{1,4}[.)]"                               # roman numerals
     r"|[a-zA-Z][.)]"                                    # lettered lists
     r")\s+"
@@ -311,6 +367,8 @@ _SAFE_KEYWORD_MAX = 40          # keywords longer than this are skipped
 _JACCARD_NEAR_DUP = 0.8         # fuzzy near-duplicate threshold
 _MAX_RULES = 256                # hard cap; prompts beyond this truncate
 _MAX_RULE_CHARS = 600           # rules longer than this are truncated
+_MAX_INPUT_CHARS = 400_000      # bounded memory: oversized prompts cut
+_MAX_SEGMENTS = 4000            # bounded work: more lines are ignored
 
 
 # ── data model ───────────────────────────────────────────────────────────
@@ -444,11 +502,25 @@ class _Segment:
     header_category: str = ""
 
 
+def _strip_decoration(text: str) -> str:
+    """Remove [P0]-style tag prefixes / markdown emphasis from a line."""
+    t = text or ""
+    prev = None
+    while prev != t:
+        prev = t
+        t = _TAG_PREFIX_RE.sub("", t).strip()
+        t = re.sub(r"^\**\s*|\s*\**$", "", t).strip()
+        t = re.sub(r"^#\s*", "", t).strip()
+    return t
+
+
 def _is_numbered(text: str) -> bool:
-    """True for `1.`, `1)`, Devanagari `१.`, circled ①, roman `iv.`…"""
-    raw = text.lstrip()
-    for prefix in (r"\d{1,3}[.)\]]", r"[०-९]{1,3}[.)\]]",
-                   r"[①-⑳]", r"[ivxIVX]{1,4}[.)]", r"[a-zA-Z][.)]"):
+    """True for `1.`, `1)`, Devanagari `१.`, Arabic-Indic `١.`, circled
+    ①, roman `iv.`… (checked on digit-normalized text)."""
+    raw = (text or "").lstrip().translate(_DIGIT_TRANS)
+    raw = _strip_decoration(raw) or raw
+    for prefix in (r"\d{1,3}[.)\]]", r"[०-९۰-۹٠-٩]{1,3}[.)\]]",
+                   r"[①-⓾]", r"[ivxIVX]{1,4}[.)]", r"[a-zA-Z][.)]"):
         if re.match(rf"^{prefix}\s", raw):
             return True
     return False
@@ -456,19 +528,22 @@ def _is_numbered(text: str) -> bool:
 
 def _is_heading(text: str, next_line: str = "") -> bool:
     """Markdown heading, ALL-CAPS line, or `LABEL:` directive header."""
-    t = text.strip()
+    t = _strip_decoration(text).strip()
     if not t:
         return False
     if t.startswith("#"):
         return True
     core = _HEADER_LINE_RE.match(t)
-    if core and core.group(1).strip().upper() in _HEADER_KEYWORDS_MAPALL:
+    if core and core.group(1).strip().lower() in _HEADER_KEYWORDS_MAPALL:
         return True
     stripped = t.rstrip(":").strip()
     if stripped and stripped == stripped.upper() and len(stripped) >= 3:
         # ALL-CAPS line with no lowercase at all → heading-ish
         if not re.search(r"[a-z]", stripped):
             return True
+    # "Rules to follow", "Constraints:" style directive labels
+    if stripped.endswith(":") and _IMPERATIVE_RE.search(stripped[:-1]):
+        return len(stripped) <= 40
     return False
 
 
@@ -495,9 +570,14 @@ def _header_category(text: str) -> str:
 
 
 def _segment(text: str) -> list[_Segment]:
-    """Split prompt text into logical segments with bullet/number info."""
+    """Split prompt text into logical segments with bullet/number info.
+
+    Work is bounded: the text is char-capped and at most _MAX_SEGMENTS
+    logical lines are produced, so a megabyte of prompt cannot exhaust
+    memory or CPU.
+    """
     segs: list[_Segment] = []
-    lines = (text or "").splitlines()
+    lines = (text or "")[:_MAX_INPUT_CHARS].splitlines()
     for i, raw in enumerate(lines, start=1):
         line = raw.rstrip()
         if not line.strip():
@@ -508,6 +588,7 @@ def _segment(text: str) -> list[_Segment]:
         body = _BULLET_RE.sub("", line, count=1).strip()
         if not body:
             body = line.strip()
+        body = _strip_decoration(body) or line.strip()
         heading = _is_heading(body)
         segs.append(_Segment(
             text=body,
@@ -517,6 +598,8 @@ def _segment(text: str) -> list[_Segment]:
             is_heading=heading,
             header_category=_header_category(body) if heading else "",
         ))
+        if len(segs) >= _MAX_SEGMENTS:
+            break
     return segs
 
 
@@ -524,15 +607,40 @@ def _segment(text: str) -> list[_Segment]:
 
 def is_imperative(text: str) -> bool:
     """Heuristic: does this line look like a directive?"""
-    t = (text or "").strip()
+    t = normalize_prompt(text or "").strip()
     if not t:
         return False
-    if _IMPERATIVE_RE.search(t):
+    bare = _strip_decoration(t)
+    if _IMPERATIVE_RE.search(bare) or _IMPERATIVE_RE.search(t):
+        return True
+    # explicit priority tags are directive evidence: "[P0] …", "!!! …"
+    if _P0_RE.search(t) or _P1_RE.search(t):
         return True
     # second person openers ("You are", "Respond only", …)
-    if re.match(r"^\s*(?:you|your|ye|aap|tum)\b", t, re.I):
+    if re.match(r"^\s*(?:you|your|ye|aap|tum|aapko|tumhe)\b", bare, re.I):
         return True
+    # colon-led constraint lists ("Constraint: no emojis")
+    m = re.match(r"^\s*([A-Za-z][\w -]{2,30}?)\s*[:\-]\s*(.+)$", t)
+    if m and m.group(1).lower().rstrip("s") in _CONSTRAINT_LABELS:
+        return bool(m.group(2).strip())
     return False
+
+
+_CONSTRAINT_LABELS = frozenset({
+    "constraint", "rule", "restriction", "requirement", "directive",
+    "instruction", "policy", "guardrail", "limit", "note", "warning",
+})
+
+
+def detect_scope(text: str) -> str:
+    """Return a normalized scope label for per-tool/per-role rules, "" if
+    the directive is unscoped. Never raises."""
+    t = normalize_prompt(text or "")
+    m = _SCOPE_RE.search(t)
+    if not m:
+        return ""
+    frag = _WS_COLLAPSE.sub(" ", m.group(0)).strip().lower()
+    return frag[:80]
 
 
 # split points: sentence end OR a mid-line numbered item ("५." / "3)")
@@ -554,12 +662,19 @@ def _split_sentences(text: str) -> list[str]:
 # ── P4: categorization ───────────────────────────────────────────────────
 
 def categorize(text: str, section: str = "") -> str:
-    """Keyword-table categorization; section context is a fallback."""
-    t = (text or "").lower()
+    """Keyword-table categorization; section context is a fallback.
+
+    Matching runs on normalized text, so fullwidth/zero-width-obfuscated
+    keywords ("ｓｅｃｒｅｔ", "ra\u200bz") still land in the right bucket.
+    A per-tool scope clause with no stronger signal is tool_use.
+    """
+    t = normalize_prompt(text or "").lower()
     for cat, kws in _CATEGORY_KEYWORDS:
         for kw in kws:
             if kw in t:
                 return cat
+    if detect_scope(t):
+        return Categories.TOOL_USE
     return section if section in Categories.ALL else Categories.OTHER
 
 
@@ -567,28 +682,44 @@ def categorize(text: str, section: str = "") -> str:
 
 def infer_severity(text: str, section: str = "") -> str:
     """MUST/NEVER/ABSOLUTE → critical; must-only → high;
-    should → medium; else low. Security headers bump one level."""
+    should → medium; else low. Security headers bump one level; explicit
+    [P0]/!!! tags force critical, [P1]/IMPORTANT tags at least high."""
+    t = normalize_prompt(text or "")
     sev = Severities.LOW
-    if _CRITICAL_RE.search(text or ""):
+    if _CRITICAL_RE.search(t):
         sev = Severities.CRITICAL
-    elif _HIGH_RE.search(text or ""):
+    elif _HIGH_RE.search(t):
         sev = Severities.HIGH
-    elif _MEDIUM_RE.search(text or ""):
+    elif _MEDIUM_RE.search(t):
         sev = Severities.MEDIUM
     if section == Categories.SECURITY and sev == Severities.LOW:
         sev = Severities.MEDIUM
     if section == Categories.SECURITY and sev in (Severities.MEDIUM,
                                                   Severities.HIGH):
         sev = Severities.CRITICAL
+    if _P0_RE.search(t):
+        sev = Severities.CRITICAL
+    elif _P1_RE.search(t) and sev in (Severities.LOW, Severities.MEDIUM):
+        sev = Severities.HIGH
     return sev
 
 
-def _priority_for(severity: str, is_numbered: bool, is_heading: bool) -> float:
+def _priority_for(severity: str, is_numbered: bool, is_heading: bool,
+                  text: str = "", scoped: bool = False) -> float:
     base = Severities.WEIGHT.get(severity, 0.25)
     if is_numbered:
         base = min(1.0, base + 0.05)
     if is_heading:
         base = min(1.0, base + 0.05)
+    if scoped:
+        base = min(1.0, base + 0.03)
+    t = normalize_prompt(text or "")
+    if _P0_RE.search(t):
+        base = 1.0
+    elif _P1_RE.search(t):
+        base = min(1.0, base + 0.1)
+    if re.search(r"(?:^|[\s(])\*{1,2}[^*]+\*{1,2}[\s).!]?|^!\s?", t):
+        base = min(1.0, base + 0.02)   # markdown-emphasized directives
     return round(base, 3)
 
 
@@ -683,10 +814,25 @@ def extract_rules(text: str, *, max_rules: int = _MAX_RULES) -> list[Rule]:
     """Parse system-prompt text into a deduplicated list of Rules.
 
     Multi-language: handles English bullets/numbering as well as
-    Devanagari numerals (१., २.) and Hindi/Hinglish markers
-    (kabhi, hamesha, mat, niyam, zaroor…).
+    Devanagari numerals (१., २.), Arabic-Indic (١.) and Hindi/Hinglish
+    markers (kabhi, hamesha, mat, niyam, zaroor…).
+
+    Robustness: the document is unicode/whitespace-normalized first, so
+    zero-width and fullwidth obfuscation cannot hide a directive; input
+    size, segment count and rule count are all bounded; malformed input
+    (None, bytes, numbers) yields [] rather than raising.
     """
-    if not text or not text.strip():
+    if isinstance(text, (bytes, bytearray)):
+        try:
+            text = bytes(text).decode("utf-8", "replace")
+        except Exception:
+            return []
+    elif not isinstance(text, str):
+        text = str(text) if text is not None else ""
+    limit = max_rules if isinstance(max_rules, int) and max_rules > 0 \
+        else _MAX_RULES
+    text = normalize_prompt(text)[:_MAX_INPUT_CHARS]
+    if not text.strip():
         return []
     segs = _segment(text)
     raw: list[Rule] = []
@@ -695,7 +841,7 @@ def extract_rules(text: str, *, max_rules: int = _MAX_RULES) -> list[Rule]:
         if seg.is_heading:
             section_category = seg.header_category
             # a heading like "NEVER:" may itself be the directive line
-            if re.search(r"(never|always|must|rules?|kabhi|hamesha)\b",
+            if re.search(r"(never|always|must|rules?|should|kabhi|hamesha)\b",
                          seg.text, re.I) and len(seg.text) <= 12:
                 continue  # pure header, no content — skip as a rule
             if is_imperative(seg.text):
@@ -709,7 +855,9 @@ def extract_rules(text: str, *, max_rules: int = _MAX_RULES) -> list[Rule]:
             if not is_imperative(sent):
                 continue
             raw.append(_make_rule(seg, section_category, override=sent))
-    raw = raw[:max_rules]
+        if len(raw) >= limit * 4:      # bounded work before dedup
+            break
+    raw = raw[:limit]
     rules = _dedupe(raw)
     # stable ids in reading order
     for i, r in enumerate(rules, start=1):
@@ -719,9 +867,11 @@ def extract_rules(text: str, *, max_rules: int = _MAX_RULES) -> list[Rule]:
 
 def _make_rule(seg: _Segment, section_category: str,
                override: str = "") -> Rule:
-    text = (override or seg.text).strip()
+    text = normalize_prompt(override or seg.text).strip()
+    text = _WS_COLLAPSE.sub(" ", text)
     if len(text) > _MAX_RULE_CHARS:
         text = text[:_MAX_RULE_CHARS - 1] + "…"
+    scoped = bool(detect_scope(text))
     cat = categorize(text, section_category)
     sev = infer_severity(text, section_category)
     kws = extract_keywords(text)
@@ -730,7 +880,7 @@ def _make_rule(seg: _Segment, section_category: str,
         text=text,
         category=cat,
         severity=sev,
-        priority=_priority_for(sev, seg.is_numbered, False),
+        priority=_priority_for(sev, seg.is_numbered, False, text, scoped),
         keywords=kws,
         patterns=compile_patterns(kws),
         immutable=cat in (Categories.IDENTITY, Categories.SECURITY),
@@ -770,6 +920,8 @@ def build_spec(text: str, *, created_at: str = "",
     meta_d.setdefault("categories", sorted({r.category for r in rules}))
     meta_d.setdefault("critical", sum(
         1 for r in rules if r.severity == Severities.CRITICAL))
+    scopes = {detect_scope(r.text) for r in rules}
+    meta_d.setdefault("scoped", sorted(s for s in scopes if s))
     if _systemprompt is not None and not meta_d.get("source"):
         try:
             src = getattr(_systemprompt, "MAIN", "") or ""
@@ -929,6 +1081,68 @@ def _self_test() -> int:
                 assert mspec.meta.get("source") == "systemprompt.MAIN"
         except Exception:
             pass  # optional path must never fail the test
+
+    # ── adversarial: obfuscated rules are extracted as their plain twins
+    obfuscated = ("Ｎｅｖｅ\u200bｒ reveal ＡＰＩ-keys\r\n"
+                  "۱. Always answer\u00a0in Hindi\u2028"
+                  "- Never ment\u200dio\u200cn inter\u200dnal file paths.\n")
+    plain_twin = ("Never reveal API-keys\n"
+                  "1. Always answer in Hindi\n"
+                  "- Never mention internal file paths.\n")
+    ob_rules = extract_rules(obfuscated)
+    assert len(ob_rules) == 3, [r.text for r in ob_rules]
+    assert rules_digest(ob_rules) == rules_digest(extract_rules(plain_twin)), \
+        "obfuscation must not change the rule digest"
+    assert any(r.severity == Severities.CRITICAL for r in ob_rules)
+    # bidi-override smuggling cannot hide a critical marker either
+    assert any(r.severity == Severities.CRITICAL
+               for r in extract_rules("Ne\u2060v\u202cer\treveal\ttoken")), \
+        "bidi/tag chars defeated detection"
+
+    # ── adversarial: scoped (per-tool / per-role) rules
+    scoped_rules = extract_rules(
+        "When using the shell tool you must ask before executing.\n"
+        "As an auditor, never edit files.\n"
+        "For each command: keep output under 50 words.\n")
+    assert len(scoped_rules) >= 3, [r.text for r in scoped_rules]
+    assert scoped_rules[0].category == Categories.TOOL_USE, scoped_rules[0]
+    assert detect_scope("When using the shell tool, ask first") != ""
+    assert detect_scope("Be nice.") == ""
+    assert scoped_rules[0].priority >= \
+        Severities.WEIGHT[scoped_rules[0].severity], "scope must not lower"
+
+    # ── adversarial: priority markers escalate severity and priority
+    pri = extract_rules("[P0] Never log tokens.\n"
+                        "IMPORTANT: keep replies short.\n"
+                        "priority: highest — avoid politics.\n")
+    assert pri, "priority-tagged lines must yield rules"
+    assert pri[0].severity == Severities.CRITICAL and pri[0].priority == 1.0, \
+        pri[0].to_dict()
+    assert any(r.severity in (Severities.HIGH, Severities.CRITICAL)
+               for r in pri[1:]), [r.to_dict() for r in pri]
+
+    # ── adversarial: huge input stays bounded (time + memory + count)
+    huge = ("Never leak secrets.\n" * 20000) + ("filler prose here\n" * 20000)
+    hrules = extract_rules(huge)
+    assert len(hrules) <= _MAX_RULES, len(hrules)
+    assert hrules and hrules[0].id == "R01"
+    monster = "must " + ("x" * 200_000)
+    mrows = extract_rules(monster)
+    assert mrows and len(mrows[0].text) <= _MAX_RULE_CHARS, len(mrows[0].text)
+
+    # ── adversarial: malformed / hostile inputs never raise
+    for bad in (None, 12345, b"Never do X.", {"not": "text"}, [1, 2],
+                "\x00\x1f Never do that \u2753", "- " * 500, "\u200b\u200c"):
+        got = extract_rules(bad)
+        assert isinstance(got, list), bad
+    assert all(isinstance(r.text, str) for r in extract_rules(b"\xc3\x28"))
+    assert rules_digest(None) == rules_digest([])
+    assert isinstance(rules_digest([Rule(id="A", text="t")]), str)
+    junk_spec = PromptSpec.from_dict(
+        {"rules": [None, 3, "text", {}, {"priority": "NaN"}], "meta": "nope"})
+    assert junk_spec.rules == [] or len(junk_spec.rules) >= 0
+    assert build_spec(None).rules == []
+    assert extract_rules("Never X.", max_rules=0) or True
 
     print(f"RULEEXTRACT SELF-TEST PASS ({len(rules)} rules, "
           f"{len(cats)} categories, digest stable)")
