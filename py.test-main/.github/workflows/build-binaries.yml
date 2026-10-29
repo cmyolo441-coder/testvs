@@ -1,0 +1,116 @@
+name: build-binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile check
+        run: python -m compileall -q fullagent
+      - name: Run every module self-test
+        run: python run_selftests.py
+
+  build:
+    needs: selftest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: fullagent-linux-x64
+          - os: windows-latest
+            asset: fullagent-windows-x64.exe
+          - os: macos-latest
+            asset: fullagent-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+      - name: Build single-file binary
+        run: pyinstaller --clean --noconfirm fullagent.spec
+      - name: Verify binary
+        shell: bash
+        run: |
+          cd dist
+          BIN="fullagent"
+          if [[ "${{ matrix.os }}" == windows-* ]]; then BIN="fullagent.exe"; fi
+          ./$BIN --version
+          # --version alone proves nothing: resolve every lazily-imported
+          # subsystem and construct the agent, or fail the build.
+          ./$BIN --self-check
+      - name: Rename asset
+        shell: bash
+        run: |
+          cd dist
+          SRC="fullagent"
+          if [[ "${{ matrix.os }}" == windows-* ]]; then SRC="fullagent.exe"; fi
+          mv "$SRC" ../${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel and stage assets
+        run: |
+          mkdir -p release_assets
+          pip install build
+          python -m build --wheel --outdir release_assets/
+          for d in artifacts/*/; do mv "$d"* release_assets/ 2>/dev/null || true; done
+          chmod +x release_assets/fullagent-* 2>/dev/null || true
+          ls -la release_assets/
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'EOF'
+          Single-file binaries — fullagent works out of the box, no Python needed.
+
+          | Platform | How to install |
+          |---|---|
+          | Linux x64 | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/install.sh \| bash` |
+          | Windows x64 | download `fullagent-windows-x64.exe`, rename to `fullagent.exe`, put on PATH |
+          | macOS (Apple Silicon) | download `fullagent-darwin-arm64`, `chmod +x`, move to /usr/local/bin |
+          | Termux (Android) | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/install-termux.sh \| bash` |
+          | Any OS with Python 3.9+ | `pip install git+https://github.com/cmyolo441-coder/py.test.git` |
+          EOF
+          sed -i 's/^          //' notes.md
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          gh release view "$VERSION" >/dev/null 2>&1 && gh release delete "$VERSION" --yes || true
+          gh release create "$VERSION" release_assets/* \
+            --title "FullAgent ${VERSION}" \
+            --notes-file notes.md
