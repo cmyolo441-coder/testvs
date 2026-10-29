@@ -23,14 +23,18 @@ from fullagent.config import Model, Provider
 
 
 def test_configured_providers():
-    assert list(config.PROVIDERS) == ["kios", "gwarden"]
+    assert list(config.PROVIDERS) == ["kios", "gwarden", "sambanova"]
     assert {m.id for m in config.MODELS} == {
         "deepseek-v4.1-flash-1017", "gemini-4-argon",
-        "deepseek-v4.1-flash-free", "minimax-m3.1-flash-free"}
+        "deepseek-v4.1-flash-free", "minimax-m3.1-flash-free",
+        "MiniMax-M3.1-Flash"}
     assert config.DEFAULT_MODEL_ID == "deepseek-v4.1-flash-1017"
     gwarden = config.PROVIDERS["gwarden"]
     assert gwarden.base_url == "https://gwarden.su/v1"
     assert gwarden.api_key, "gwarden must have embedded zero-config key"
+    sambanova = config.PROVIDERS["sambanova"]
+    assert sambanova.base_url == "https://api.sambanova.ai/v1"
+    assert sambanova.api_key, "sambanova must have embedded zero-config key"
 
 
 def test_kios_ships_embedded_api_key():

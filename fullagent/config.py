@@ -113,6 +113,8 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gemini-4-argon": 1_000_000,
     # upstream: minimax/minimax-m3.1-flash:free (1,000,000-token window)
     "minimax-m3.1-flash-free": 1_000_000,
+    # same upstream model served via SambaNova Cloud
+    "MiniMax-M3.1-Flash": 1_000_000,
 }
 # Default for models NOT in the table above: assume a small window rather
 # than risk a ~44s doomed request against an unknown cap. A request we can
@@ -204,6 +206,7 @@ def _provider_api_key(provider: str) -> str:
 _EMBEDDED_KEYS: dict[str, str] = {
     "kios": "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
     "gwarden": "GWAR-OM8VK0HO-94OFDH0DIE3T-U1B3V-WPPPNO-MF8VSR0U",
+    "sambanova": "d3445159-3dc0-4bf9-99d3-085aa1ef81b2",
 }
 
 
@@ -221,6 +224,13 @@ PROVIDERS: dict[str, Provider] = {
         base_url="https://gwarden.su/v1",
         api_key=_provider_api_key("gwarden"),
         color="#bd93f9",
+    ),
+    "sambanova": Provider(
+        key="sambanova",
+        name="SambaNova Cloud",
+        base_url="https://api.sambanova.ai/v1",
+        api_key=_provider_api_key("sambanova"),
+        color="#f1fa8c",
     ),
 }
 
@@ -242,6 +252,9 @@ MODELS: list[Model] = [
     Model("minimax-m3.1-flash-free", "kios", "MiniMax M3.1 Flash Free",
           tag="free", supports_tools=True,
           context_window=model_context_window("minimax-m3.1-flash-free")),
+    Model("MiniMax-M3.1-Flash", "sambanova", "MiniMax M3.1 Flash",
+          tag="sambanova", supports_tools=True,
+          context_window=model_context_window("MiniMax-M3.1-Flash")),
 ]
 # Fastest Kios free route measured 2026-10-21 (~1s first token vs ~3s for
 # MiniMax and ~40s for qwen3.8-flash-free): default to it.

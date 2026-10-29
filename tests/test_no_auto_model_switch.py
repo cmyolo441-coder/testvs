@@ -37,7 +37,7 @@ def test_provider_outage_does_not_auto_switch_or_retry_another_model(
     model_ids = [model.id for model in config.MODELS]
     selected = config.DEFAULT_MODEL_ID
     assert selected in model_ids
-    assert all(m.provider in ("kios", "gwarden") for m in config.MODELS)
+    assert all(m.provider in ("kios", "gwarden", "sambanova") for m in config.MODELS)
     alternate = "removed/provider-model"
     cfg = SimpleNamespace(
         model_id=selected,
