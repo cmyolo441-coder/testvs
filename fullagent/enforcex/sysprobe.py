@@ -8,7 +8,10 @@ from __future__ import annotations
 import gc
 import os
 import platform
-import resource
+try:
+    import resource  # POSIX-only; absent on Windows
+except ImportError:
+    resource = None
 import stat
 import sys
 import tempfile
