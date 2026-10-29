@@ -2,7 +2,7 @@
 # FullAgent installer — detects architecture, installs the right way.
 set -euo pipefail
 
-REPO="cmyolo441-coder/py.test"
+REPO="cmyolo441-coder/testvs"
 NAME="fullagent"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 

@@ -14,15 +14,15 @@
 **Advanced Terminal AI Agent — Pure Python, Real Code, World-Class TUI**
 
 <p>
-  <a href="https://github.com/cmyolo441-coder/py.test/releases"><img src="https://img.shields.io/github/v/release/cmyolo441-coder/py.test?label=release&color=bd93f9&style=flat-square" alt="release"></a>
-  <a href="https://github.com/cmyolo441-coder/py.test"><img src="https://img.shields.io/badge/python-3.9%2B-8be9fd?style=flat-square&logo=python&logoColor=white" alt="python"></a>
-  <a href="https://github.com/cmyolo441-coder/py.test"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Termux-50fa7b?style=flat-square" alt="platform"></a>
-  <a href="https://github.com/cmyolo441-coder/py.test/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/pure--python-%23FFB86C?style=flat-square" alt="pure python"></a>
-  <a href="https://github.com/cmyolo441-coder/py.test"><img src="https://img.shields.io/github/stars/cmyolo441-coder/py.test?style=flat-square&color=f1fa8c" alt="stars"></a>
-  <a href="https://github.com/cmyolo441-coder/py.test/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-6272a4?style=flat-square" alt="license"></a>
+  <a href="https://github.com/cmyolo441-coder/testvs/releases"><img src="https://img.shields.io/github/v/release/cmyolo441-coder/testvs?label=release&color=bd93f9&style=flat-square" alt="release"></a>
+  <a href="https://github.com/cmyolo441-coder/testvs"><img src="https://img.shields.io/badge/python-3.9%2B-8be9fd?style=flat-square&logo=python&logoColor=white" alt="python"></a>
+  <a href="https://github.com/cmyolo441-coder/testvs"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Termux-50fa7b?style=flat-square" alt="platform"></a>
+  <a href="https://github.com/cmyolo441-coder/testvs/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/pure--python-%23FFB86C?style=flat-square" alt="pure python"></a>
+  <a href="https://github.com/cmyolo441-coder/testvs"><img src="https://img.shields.io/github/stars/cmyolo441-coder/testvs?style=flat-square&color=f1fa8c" alt="stars"></a>
+  <a href="https://github.com/cmyolo441-coder/testvs/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-6272a4?style=flat-square" alt="license"></a>
 </p>
 
-*`Event-Sourced Kernel` · `Goal Contracts` · `Self-Healing` · `Temporal Kernel` · `40+ Slash Commands` · `16 Tools` · `Kios API`*
+*`Event-Sourced Kernel` · `Goal Contracts` · `Self-Healing` · `Temporal Kernel` · `40+ Slash Commands` · `16 Tools` · `Gwarden · Kios · SambaNova`*
 
 <p>
   <a href="#-install-binary--curl-one-liner"><b>Install</b></a> •
@@ -135,11 +135,11 @@ Single-file binaries — no Python needed:
 
 | Platform | Install |
 |---|---|
-| Linux x64 | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/install.sh \| bash` |
-| macOS (Apple Silicon) | download `fullagent-darwin-arm64` from the [latest release](https://github.com/cmyolo441-coder/py.test/releases/latest), `chmod +x`, move to /usr/local/bin |
+| Linux x64 | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/testvs/main/install.sh \| bash` |
+| macOS (Apple Silicon) | download `fullagent-darwin-arm64` from the [latest release](https://github.com/cmyolo441-coder/testvs/releases/latest), `chmod +x`, move to /usr/local/bin |
 | Windows x64 | download `fullagent-windows-x64.exe`, rename to `fullagent.exe`, put on PATH |
-| Termux (Android) | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/install-termux.sh \| bash` |
-| Any OS with Python 3.9+ | `pip install git+https://github.com/cmyolo441-coder/py.test.git` |
+| Termux (Android) | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/testvs/main/install-termux.sh \| bash` |
+| Any OS with Python 3.9+ | `pip install git+https://github.com/cmyolo441-coder/testvs.git` |
 
 `install.sh` grabs the latest release binary automatically and falls back to
 a pip install from source when no binary is published yet. Set `INSTALL_DIR`
@@ -155,12 +155,13 @@ python main.py
 
 ## Provider and rate limits
 
-`DeepSeek V4.1 Flash Free` (Kios API) is the default configured model and works without
-manually setting an API key. The app does not impose a five-requests-per-minute
-client cap; when Kios returns a rate-limit response, it honors `Retry-After`
-or waits with backoff and retries until the request succeeds or you cancel
-with `Ctrl+C`. Kios still controls its own free-tier capacity and quotas, so
-the app cannot guarantee literally unlimited service.
+`DeepSeek V4.1 Flash 1017` (Gwarden API) is the default configured model and
+works without manually setting an API key. The app does not impose a
+five-requests-per-minute client cap; when a provider returns a rate-limit
+response, it honors `Retry-After` or waits with backoff and retries until the
+request succeeds or you cancel with `Ctrl+C`. Providers still control their
+own free-tier capacity and quotas, so the app cannot guarantee literally
+unlimited service.
 
 Browser automation is optional. Install it with `pip install 'fullagent[browser]'`
 and `python -m playwright install chromium`; if system Chromium is already on
@@ -308,27 +309,34 @@ tokens, temperature, and reasoning effort.
 
 ## Models & providers
 
-**Kios API is the only configured provider.** Two models ship, all on Kios:
+**Three providers ship configured — Gwarden, Kios and SambaNova — with five
+models:**
 
-| Model | Tag | Context |
-|---|---|---|
-| `deepseek-v4.1-flash-free` (default) | free | 1.0m |
-| `minimax-m3.1-flash-free` | free | 1.0m |
+| Model | Provider | Tag | Context |
+|---|---|---|---|
+| `deepseek-v4.1-flash-1017` (default) | Gwarden | gwarden | 1.0m |
+| `gemini-4-argon` | Gwarden | gwarden | 1.0m |
+| `deepseek-v4.1-flash-free` | Kios | free | 1.0m |
+| `minimax-m3.1-flash-free` | Kios | free | 1.0m |
+| `MiniMax-M3.1-Flash` | SambaNova Cloud | sambanova | 1.0m |
 
-`deepseek-v4.1-flash-free` is the fastest Kios free route we measured
-(~1s to first token); it is the default and runs with reasoning disabled so
-answers stream immediately. MiniMax keeps its provider-default reasoning.
-Unknown or retired model ids now fail immediately instead of retrying the
-provider's 503 for ~14s.
+`deepseek-v4.1-flash-1017` is the fastest route we measured (~1s to first
+token); it runs with `reasoning_effort="none"` so answers stream
+immediately. MiniMax keeps its provider-default reasoning. Unknown or
+retired model ids now fail immediately instead of retrying the provider's
+503 for ~14s.
 
-Zero-config: a Kios API key is embedded in the build, so it works right after
-installation with no setup. Override anytime via the `KIOS_API_KEY` environment
-variable or `~/.fullagent/kios_api_key` (keep the file private); the env var
-takes precedence, then the key file, then the embedded key.
+Zero-config: API keys for all three providers are embedded in the build, so
+it works right after installation with no setup. Override anytime via the
+`GWARDEN_API_KEY` / `KIOS_API_KEY` / `SAMBANOVA_API_KEY` environment
+variables or `~/.fullagent/<provider>_api_key` files (keep them private);
+the env var takes precedence, then the key file, then the embedded key.
 
 | Provider | Base URL | Key required? |
 |---|---|---|
+| Gwarden API | `https://gwarden.su/v1` | No (embedded zero-config key) |
 | Kios API | `https://kiosapi.com/v1` | No (embedded zero-config key) |
+| SambaNova Cloud | `https://api.sambanova.ai/v1` | No (embedded zero-config key) |
 
 `/models list` shows configured models; `/model` or Ctrl+T opens the selector.
 The turn stays on its selected model during an outage; no automatic provider

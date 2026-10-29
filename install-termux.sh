@@ -4,7 +4,7 @@
 # Also works on any system where `python` + `pip` are available.
 set -euo pipefail
 
-REPO="cmyolo441-coder/py.test"
+REPO="cmyolo441-coder/testvs"
 
 echo ">> Step 1/4: install python + git (if missing)"
 if command -v pkg >/dev/null 2>&1; then
