@@ -1600,12 +1600,15 @@ class UI:
     def _accept_handler(self, buff: Buffer) -> bool:
         text = buff.text.strip()
         # A multi-line input makes the box taller; without a frame reset the
-        # freed rows stay inside the box once the buffer is cleared.
+        # freed rows stay inside the box once the buffer is cleared. The
+        # reset must happen BEFORE the turn starts: the turn thread prints
+        # the user line immediately, and erasing a frame whose cached cursor
+        # row is stale would wipe that fresh output.
         multiline = "\n" in buff.text
-        if text:
-            self._dispatch(text)
         if multiline:
             self._reset_frame()
+        if text:
+            self._dispatch(text)
         return False  # clear the buffer
 
     # -- state filters ------------------------------------------------------------------
@@ -1812,10 +1815,11 @@ class UI:
                         C["yellow"])
             elif self.buffer.text:
                 multiline = "\n" in self.buffer.text
-                self.buffer.reset()
                 if multiline:
                     # the box shrinks back to one row — re-anchor the frame
+                    # while the tall buffer is still the last rendered one
                     self._reset_frame()
+                self.buffer.reset()
                 self._set_flash("input cleared — Ctrl+C again or /exit to quit",
                                 C["red"])
             else:

@@ -202,14 +202,22 @@ class FrameShrinkTests(unittest.TestCase):
         self.assertEqual(ui.app.renderer.erased, 1)
 
     def test_multiline_submit_resets_the_frame(self):
+        order = []
         ui = _make_ui()
         ui.app = SimpleNamespace(renderer=_FakeRenderer(),
                                  invalidate=lambda: None)
-        ui._dispatch = lambda text: None
+        ui.app.renderer.erase = lambda *a, **k: order.append("erase")
+
+        def dispatch(text):
+            order.append("dispatch")
+
+        ui._dispatch = dispatch
         buff = Buffer(multiline=True)
         buff.insert_text("line one\nline two")
         self.assertFalse(ui._accept_handler(buff))
-        self.assertEqual(ui.app.renderer.erased, 1)
+        self.assertEqual(order, ["erase", "dispatch"],
+                         "the frame must be re-anchored before the turn "
+                         "thread prints its first line")
 
     def test_single_line_submit_does_not_reset_the_frame(self):
         ui = _make_ui()
