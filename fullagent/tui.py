@@ -655,6 +655,25 @@ from .streamthrottle import StreamThrottle as _StreamThrottle  # noqa: F401
 # ---------------------------------------------------------------------------
 
 
+def _completion_fills_text(completion, document) -> bool:
+    """True when accepting ``completion`` would actually change the text.
+
+    A completion that merely repeats what is already typed must never
+    swallow the Enter key: the menu would look like a dead key ("/help" is
+    fully typed, the menu shows "/help", Enter does nothing). ``start_position``
+    is relative to the cursor, so the replaced span is
+    ``text_before_cursor[start:]``.
+    """
+    try:
+        before = document.text_before_cursor
+        start = len(before) + completion.start_position
+        if start < 0:
+            return True
+        return before[start:] != completion.text
+    except Exception:
+        return True
+
+
 class OverlayList:
     """A modal selection list rendered directly above the prompt box."""
 
@@ -860,6 +879,28 @@ class UI:
             self.app.invalidate()
         except Exception:
             pass
+
+    def _reset_frame(self) -> None:
+        """Re-anchor the prompt box after the layout SHRINKS.
+
+        prompt_toolkit never grows smaller on its own: ``Renderer.render``
+        computes the next frame height as
+        ``max(min_available_height, last_height, preferred_height)``, so the
+        rendered frame keeps the height it had before. The freed rows are
+        then handed to the flexible input window (height 1..10), which left
+        the box tall with a hollow interior after a picker closed — and
+        after clearing a multi-line input.
+
+        ``Renderer.erase()`` is public API: it erases just the prompt area
+        (the transcript above is untouched), forgets the last screen and
+        resets the cached heights, so the next frame is drawn at the real
+        preferred height. Never raises into a key handler.
+        """
+        try:
+            self.app.renderer.erase()
+        except Exception:
+            pass
+        self._invalidate()
 
     def _set_flash(self, text: str, color: str = C["yellow"]) -> None:
         self._flash_gen += 1
@@ -1078,15 +1119,37 @@ class UI:
     def _skills_count(self) -> int:
         """Real installed skills: SKILL.md skills + forged tools.
 
-        Scans the same sources ``/skills`` shows (``~/.fullagent/skills``
-        SKILL.md directories plus the forge registry), cached for 5s — the
-        footer re-renders every frame and both sources touch disk.
+        The footer re-renders on every frame, and a first scan touches disk
+        (``~/.fullagent/skills``), so only the cheap in-memory forge
+        registry is counted inline. The SKILL.md scan runs on a background
+        thread and is folded into the next frame — a slow/network home
+        directory must never block the keyboard.
         """
         now = time.time()
         cached = getattr(self, "_skills_cache", None)
         if (cached is not None
                 and now - getattr(self, "_skills_cache_ts", 0.0) < 5.0):
             return cached
+        names: set[str] = set()
+        try:
+            names.update(str(k).strip().lower() for k in
+                         (getattr(self.agent.skill_forge, "registry", {})
+                          or {}))
+        except Exception:
+            pass
+        try:
+            names.update(getattr(self, "_skills_md_names", ()) or ())
+        except Exception:
+            pass
+        count = len(names)
+        self._skills_cache = count
+        self._skills_cache_ts = now
+        self._start_skills_scan()
+        return count
+
+    def _scan_skill_md_names(self) -> set:
+        """Blocking: names of every SKILL.md skill (never runs on the UI
+        thread — see ``_start_skills_scan``)."""
         names: set[str] = set()
         try:
             mgr = getattr(self.agent, "skill_manager", None)
@@ -1098,15 +1161,35 @@ class UI:
                     names.add(str(item["name"]).strip().lower())
         except Exception:
             pass
+        return names
+
+    def _start_skills_scan(self) -> None:
+        """Single-flight background refresh of the SKILL.md skill names."""
+        if getattr(self, "_skills_scan_running", False):
+            return
+        self._skills_scan_running = True
+
+        def _scan() -> None:
+            try:
+                found = self._scan_skill_md_names()
+                self._skills_md_names = found
+                # the merged count is stale now — force one recompute
+                self._skills_cache = None
+                self._skills_cache_ts = 0.0
+            except Exception:
+                pass
+            finally:
+                self._skills_scan_running = False
+            try:
+                self._invalidate()
+            except Exception:
+                pass
+
         try:
-            names.update(str(k).strip().lower() for k in
-                         (getattr(self.agent.skill_forge, "registry", {})
-                          or {}))
+            threading.Thread(target=_scan, daemon=True,
+                             name="skills-scan").start()
         except Exception:
-            pass
-        self._skills_cache = len(names)
-        self._skills_cache_ts = now
-        return self._skills_cache
+            self._skills_scan_running = False
 
     def _log_chrome_error(self, where: str, exc: Exception) -> None:
         """Record a chrome wiring failure once (never spam, never crash).
@@ -1272,35 +1355,72 @@ class UI:
             pass
         return "No API key · local session"
 
+    def _git_branch_name(self) -> str | None:
+        """Blocking: the real git branch of the cwd (None = no repo/HEAD).
+
+        Never called from a render callback — see ``_branch_label``.
+        """
+        try:
+            import subprocess
+            if not shutil.which("git"):
+                return None
+            proc = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=os.getcwd(), capture_output=True, text=True,
+                timeout=2.0)
+            if proc.returncode == 0:
+                name = (proc.stdout or "").strip()
+                if name and name != "HEAD":
+                    return name
+        except Exception:
+            return None
+        return None
+
+    def _branch_fallback(self) -> str:
+        sid = str(getattr(self.agent, "session_id", "") or "")
+        return f"session {sid[:8]}" if sid else "no git"
+
     def _branch_label(self) -> str:
         """The real git branch of the working directory (or a clear fallback).
 
-        ``git rev-parse --abbrev-ref HEAD`` is cheap and cached for 5s; a
-        non-repo / detached HEAD shows the session id instead of inventing
-        a branch name.
+        ``git rev-parse --abbrev-ref HEAD`` runs a subprocess: on a big
+        repo, a network mount or Termux it can take hundreds of
+        milliseconds (worst case the 2s timeout). Running it inside the
+        render callback froze the prompt box for that long every five
+        seconds, which the user feels as keyboard lag — the probe now runs
+        on a background thread and the footer always returns the last known
+        value instantly. A non-repo / detached HEAD shows the session id
+        instead of inventing a branch name.
         """
         now = time.time()
-        if (getattr(self, "_branch_cache", None) is not None
+        cached = getattr(self, "_branch_cache", None)
+        if (cached is not None
                 and now - getattr(self, "_branch_cache_ts", 0.0) < 5.0):
-            return self._branch_cache
-        name = ""
-        try:
-            import subprocess
-            if shutil.which("git"):
-                proc = subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    cwd=os.getcwd(), capture_output=True, text=True,
-                    timeout=2.0)
-                if proc.returncode == 0:
-                    name = (proc.stdout or "").strip()
-        except Exception:
-            name = ""
-        if not name or name == "HEAD":
-            sid = str(getattr(self.agent, "session_id", "") or "")
-            name = f"session {sid[:8]}" if sid else "no git"
-        self._branch_cache = name
-        self._branch_cache_ts = now
-        return name
+            return cached
+        self._branch_cache_ts = now  # single flight: one probe per TTL
+        if not getattr(self, "_branch_probe_running", False):
+            self._branch_probe_running = True
+
+            def _probe() -> None:
+                try:
+                    self._branch_cache = (self._git_branch_name()
+                                          or self._branch_fallback())
+                except Exception:
+                    self._branch_cache = self._branch_fallback()
+                finally:
+                    self._branch_probe_running = False
+                try:
+                    self._invalidate()
+                except Exception:
+                    pass
+
+            try:
+                threading.Thread(target=_probe, daemon=True,
+                                 name="git-branch").start()
+            except Exception:
+                self._branch_probe_running = False
+                self._branch_cache = self._branch_fallback()
+        return cached if cached is not None else self._branch_fallback()
 
     def _context_percent(self) -> int:
         """Live context usage %, cached 1s (the border redraws every frame)."""
@@ -1479,8 +1599,13 @@ class UI:
 
     def _accept_handler(self, buff: Buffer) -> bool:
         text = buff.text.strip()
+        # A multi-line input makes the box taller; without a frame reset the
+        # freed rows stay inside the box once the buffer is cleared.
+        multiline = "\n" in buff.text
         if text:
             self._dispatch(text)
+        if multiline:
+            self._reset_frame()
         return False  # clear the buffer
 
     # -- state filters ------------------------------------------------------------------
@@ -1548,11 +1673,15 @@ class UI:
         @kb.add(Keys.Enter, filter=ov)
         def _ov_enter(event):
             self.overlay.select()
+            # the picker just vanished — without this the frame keeps its
+            # old (taller) height and the box is redrawn hollow
+            self._reset_frame()
 
         @kb.add(Keys.Escape, filter=ov)
         @kb.add("c-c", filter=ov)
         def _ov_close(event):
             self.overlay.close()
+            self._reset_frame()
 
         @kb.add(Keys.Up, filter=ov)
         @kb.add("c-p", filter=ov)
@@ -1613,12 +1742,28 @@ class UI:
         @kb.add(Keys.Enter, filter=can_submit)
         def _enter(event):
             b = self.buffer
-            if b.complete_state is not None:
-                # First Enter with menu open: accept the highlighted
-                # completion (fill text) but DON'T submit — user can edit
-                # or press Enter again to run the command.
-                b.complete_state = None
-                return
+            state = b.complete_state
+            if state is not None:
+                # Enter with the menu open fills in the best completion —
+                # the highlighted row, or the first suggestion when nothing
+                # is highlighted (complete-while-typing never highlights) —
+                # and does NOT submit, so the user can edit it or press
+                # Enter again to run it.
+                #
+                # BUG: this used to assign `b.complete_state = None`, which
+                # only closed the menu and threw the selection away, so the
+                # full command the user had already typed stayed in the box
+                # and Enter looked like a dead key.
+                completion = state.current_completion
+                if completion is None and state.completions:
+                    completion = state.completions[0]
+                if completion is not None and _completion_fills_text(
+                        completion, state.original_document):
+                    b.apply_completion(completion)
+                    return
+                # nothing to insert (the text is already complete) — never
+                # eat the keystroke, just run what is typed
+                b.cancel_completion()
             if not b.text.strip():
                 return
             b.validate_and_handle()
@@ -1666,7 +1811,11 @@ class UI:
                         f"⊘ cancelling — {cleared} queued message(s) cleared",
                         C["yellow"])
             elif self.buffer.text:
+                multiline = "\n" in self.buffer.text
                 self.buffer.reset()
+                if multiline:
+                    # the box shrinks back to one row — re-anchor the frame
+                    self._reset_frame()
                 self._set_flash("input cleared — Ctrl+C again or /exit to quit",
                                 C["red"])
             else:

@@ -13,6 +13,7 @@ if _ROOT_DIR not in _sys.path:
 
 import io
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -259,11 +260,19 @@ class UiChromeTests(unittest.TestCase):
 
     def test_footer_branch_is_the_real_git_branch(self):
         ui = _make_ui([])
-        branch = ui._branch_label()
-        self.assertTrue(branch)
-        self.assertNotIn("\n", branch)
+        # the footer NEVER blocks on the git subprocess: the first frame
+        # renders the fallback, the real branch arrives from the probe
+        first = ui._branch_label()
+        self.assertTrue(first)
+        self.assertNotIn("\n", first)
         # cached value is stable and identical on the next frame
-        self.assertEqual(branch, ui._branch_label())
+        self.assertEqual(first, ui._branch_label())
+
+        deadline = time.time() + 10.0
+        while time.time() < deadline and getattr(ui, "_branch_probe_running",
+                                                 False):
+            time.sleep(0.02)
+        branch = ui._branch_label()
 
         import subprocess
         try:
