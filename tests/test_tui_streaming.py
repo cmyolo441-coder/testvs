@@ -52,23 +52,32 @@ class StreamingTests(unittest.TestCase):
         ui.agent = SimpleNamespace(save_session=lambda: None)
         return ui
 
-    def test_first_partial_token_renders_before_second_token(self):
+    def test_partial_tokens_never_scribble_on_the_box_border(self):
+        """The reply belongs to the transcript, not to the border line.
+
+        The border used to mirror the live token preview, so the model
+        looked like it was writing over "⏎ send · / cmds …". During
+        streaming the border may only show a status label.
+        """
         ui = self.make_ui()
         ui._approve_request = None
         ui._spinner_i = 0
         frames = []
         def run(text, on_token, *args, **kwargs):
             on_token("first ")
-            frames.append("".join(text for _, text in ui._bottom_fragments()))
+            frames.append("".join(t for _, t in ui._bottom_fragments()))
             on_token("second ")
-            frames.append("".join(text for _, text in ui._bottom_fragments()))
+            frames.append("".join(t for _, t in ui._bottom_fragments()))
             return Turn(text, assistant_text="first second ")
         ui.agent.run_turn = run
         with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
-        self.assertIn("first", frames[0])
-        self.assertNotIn("second", frames[0])
-        self.assertIn("first second", frames[1])
+        self.assertNotIn("first", frames[0])
+        self.assertNotIn("second", frames[1])
+        self.assertIn("streaming reply", frames[0])
+        # ...and the whole reply still reaches the transcript, once
+        out = ui.output.getvalue()
+        self.assertEqual(out.count("first second"), 1)
 
     def test_burst_line_is_visible_before_next_token(self):
         ui = self.make_ui()
@@ -84,11 +93,41 @@ class StreamingTests(unittest.TestCase):
         with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
         self.assertIn("first line\n", snapshots[0])
-        self.assertIn("last", snapshots[1])
+        # the unfinished tail stays out of the border; the label is shown
+        self.assertNotIn("last", snapshots[1])
+        self.assertIn("streaming reply", snapshots[1])
         self.assertEqual(ui.output.getvalue().count("first line"), 1)
         self.assertEqual(ui.output.getvalue().count("last"), 1)
 
-    def test_markdown_burst_preview_updates_without_another_token(self):
+    def test_long_single_line_streams_into_the_transcript(self):
+        """A one-paragraph answer has no newline: it must still flow above
+        the box (soft-wrapped) instead of waiting for the end of the turn."""
+        ui = self.make_ui()
+        ui._width = lambda: 80
+        ui._approve_request = None
+        ui._spinner_i = 0
+        snapshots = []
+        text = " ".join(f"word{i}" for i in range(60))
+        def run(t,_on_token, *args, **kwargs):
+            for w in text.split(" "):
+                _on_token(w + " ")
+            snapshots.append(ui.output.getvalue())
+            return Turn(t, assistant_text=text)
+        ui.agent.run_turn = run
+        with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
+            ui._run_turn_thread("hello")
+        streamed = snapshots[0]
+        self.assertIn("word0", streamed,
+                      "the first words never reached the transcript")
+        self.assertIn("word40", streamed,
+                      "long partial lines must be soft-wrapped live")
+        import re
+        out = ui.output.getvalue()
+        printed = re.findall(r"word\d+", out)
+        self.assertEqual(printed, text.split(" "),
+                         "soft wrapping must neither lose nor duplicate words")
+
+    def test_markdown_mode_keeps_the_border_free_of_reply_text(self):
         ui = self.make_ui(render=True)
         snapshots = []
         def run(text, on_token, *args, **kwargs):
@@ -99,7 +138,7 @@ class StreamingTests(unittest.TestCase):
         ui.agent.run_turn = run
         with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
-        self.assertIn("last", snapshots[0])
+        self.assertNotIn("last", snapshots[0])
         self.assertNotIn("first last", snapshots[1])
         self.assertEqual(ui.output.getvalue().count("first last"), 1)
 
@@ -151,12 +190,10 @@ class StreamingTests(unittest.TestCase):
             ui._dispatch("next request")
             worker.return_value.start.assert_called_once()
 
-    def test_1000_token_burst_throttles_renders_without_losing_text(self):
-        """1000 rapid tokens must not cause ~1000 renders. With a frozen
-        clock the 10fps throttle emits ~1 status frame, absorbs the rest,
-        the final flush surfaces the complete tail, and every token's text
-        still reaches the printed output (complete lines print immediately,
-        never throttled)."""
+    def test_1000_token_burst_streams_without_losing_text(self):
+        """1000 rapid tokens: every token reaches the printed output, the
+        border never receives reply text, and the turn costs a handful of
+        status renders instead of ~1000."""
         ui = self.make_ui()
         ui._approve_request = None
         ui._spinner_i = 0
@@ -174,8 +211,8 @@ class StreamingTests(unittest.TestCase):
         words = [f"tok{i}" for i in range(N)]
 
         def run(text, on_token, *args, **kwargs):
-            # every 7th token completes a line (must print immediately);
-            # the rest accumulate as partial tail shown in the preview
+            # every 7th token completes a line (prints immediately); the
+            # rest accumulate as the unfinished line
             for i, w in enumerate(words):
                 on_token(w + ("\n" if i % 7 == 6 else " "))
             return Turn(text, assistant_text=" ".join(words))
@@ -187,23 +224,18 @@ class StreamingTests(unittest.TestCase):
         # no text lost: every token appears in the printed output
         for w in words:
             self.assertIn(w, out)
-        th = ui._stream_throttle
-        self.assertIsInstance(th, _StreamThrottle)
-        # renders collapsed to turn-lifecycle only (thinking…, first frame,
-        # final flush, teardown "", + 2 unconditional invalidates) —
-        # versus ~1 invalidation per token before throttling
-        self.assertLessEqual(renders["n"], 6,
-                             f"expected <=6 renders for {N} rapid tokens, "
+        # no text duplicated and nothing echoed into the border
+        self.assertEqual(out.count("tok999"), 1)
+        for s in statuses:
+            self.assertNotIn("tok", s,
+                             f"reply text leaked into the border: {s!r}")
+        # renders stay at turn-lifecycle level (thinking…, streaming label,
+        # teardown "") instead of one invalidation per token
+        self.assertLessEqual(renders["n"], 8,
+                             f"expected <=8 renders for {N} rapid tokens, "
                              f"got {renders['n']}")
-        self.assertEqual(th.frames, 2,
-                         "only 2 stream frames should emit: first + final flush")
-        self.assertGreaterEqual(th.suppressed, N - 2,
-                                "throttle must absorb nearly the whole burst")
-        # the final flush surfaced the complete tail as a status frame
-        self.assertTrue(any(words[-1] in s for s in statuses),
-                        "final flush must surface the complete tail")
-        print(f"\n  [throttle] {N} tokens -> {renders['n']} renders "
-              f"({th.suppressed} absorbed, {th.frames} frames emitted)")
+        print(f"\n  [stream] {N} tokens -> {renders['n']} renders, "
+              f"{len(statuses)} status updates, border text-free")
 
     def test_cancel_before_worker_start_is_preserved(self):
         ui = self.make_ui()

@@ -4333,24 +4333,24 @@ class UI:
         self._invalidate_agents()
         self._set_status("thinking…")
         self._start_spinner()
-        # Only retain the unfinished line; emit complete lines immediately.
-        # Throttle terminal redraws in Application, never token ingestion.
-        # SPEED: pieces used to be concatenated with `tail = tail + piece`
-        # on EVERY token — O(n^2) copying for a long single line (minified
-        # JSON, base64 blobs) that visibly slowed the stream loop as the
-        # line grew. Parts accumulate in a list; we only join when a
-        # newline arrives (to split off complete lines) and keep a bounded
-        # live preview, so per-token cost stays O(len(piece)).
-        stream_tail = {"parts": [], "blank": False, "pv": "", "cr": False}
+        # DELIVERY: the reply goes to the TRANSCRIPT only — complete lines
+        # print the moment they arrive, and an unfinished line is soft-wrapped
+        # into the transcript once it is longer than the terminal width. The
+        # box border used to mirror the live token preview, which looked like
+        # the model was scribbling on the "⏎ send · / cmds …" line; the border
+        # now only ever shows a status (spinner, tok/s, elapsed, queue).
+        # SPEED: pieces are never concatenated with `tail = tail + piece`
+        # (O(n^2) for a long single line); they accumulate in a list and are
+        # joined once when a line has to be emitted.
+        stream_tail = {"parts": [], "blank": False, "cr": False, "tail_len": 0}
         render_md = bool(self.cfg.extra.get("render_markdown", False))
-        md_preview = ""
+        # status text for the border while tokens stream in (no raw text)
+        _stream_label = "streaming reply…"
 
-        # SPEED: the status preview used to invalidate the whole
-        # prompt_toolkit app on EVERY token — a full-screen re-render per
-        # token chunk. Tokens are still ingested instantly (complete lines
-        # print immediately below); only the status/invalidate is throttled
-        # to ~10fps. flush() at the end guarantees the final frame is
-        # never skipped.
+        # SPEED: the status used to invalidate the whole prompt_toolkit app on
+        # EVERY token — a full-screen re-render per token chunk. The label is
+        # set once (it dedupes), so streaming costs no redraws beyond the
+        # spinner and the actual printed output.
         _throttle = _StreamThrottle(0.1)
         self._stream_throttle = _throttle  # diagnostics / tests
 
@@ -4360,8 +4360,38 @@ class UI:
             if frame is not None:
                 self._set_status(frame)
 
+        def _emit_line(text: str) -> None:
+            """Print one line of reply text to the transcript.
+
+            Untrusted text reaches the tty only after the whole chunk is
+            assembled (so escape sequences split across provider chunks are
+            stripped as a unit), and prompt_toolkit can interleave output
+            safely because every write ends in a newline.
+            """
+            if not text:
+                return
+            self.console.print(Text(sanitize_terminal_text(text)),
+                               soft_wrap=True)
+
+        def _soft_wrap_partial() -> None:
+            """Flush part of the unfinished line so it keeps flowing above
+            the box instead of waiting for a newline (which may never come
+            in a one-paragraph answer)."""
+            chunk = "".join(stream_tail["parts"])
+            if not chunk:
+                return
+            cut = chunk.rfind(" ")
+            if cut < 1 or len(chunk) - cut > max(8, len(chunk) // 2):
+                cut = len(chunk)          # no usable space: hard wrap
+                tail = ""
+            else:
+                tail = chunk[cut + 1:]
+            _emit_line(chunk[:cut].rstrip())
+            stream_tail["parts"][:] = [tail] if tail else []
+            stream_tail["tail_len"] = len(tail)
+            stream_tail["blank"] = False
+
         def on_token(piece: str):
-            nonlocal md_preview
             # CRLF / lone CR: providers may emit either style, and a CRLF can
             # even be split across two chunks. Without this a "\r\n" reply
             # printed a phantom blank line after every line. A trailing CR is
@@ -4380,25 +4410,24 @@ class UI:
                     stream_tail["cr"] = True
                 piece = piece.replace("\r", "\n")   # lone CRs are breaks too
             self._stream_tokens_count = getattr(self, "_stream_tokens_count", 0) + 1
+            # the border shows a status, never the reply text itself
+            _stream_status(_stream_label)
             if render_md:
-                # Keep a bounded preview; the agent owns the complete reply.
-                maxw = max(1, self._width() - 26)
-                md_preview = (md_preview + piece)[-maxw:]
-                preview = sanitize_terminal_text(md_preview.strip("\n"))
-                _stream_status(preview if preview else "writing…")
+                # the finished reply is rendered once as Markdown below
                 return
-            # patch_stdout can only interleave output safely when every
-            # write ends in a newline, so emit complete lines here and keep
-            # the partial line as a live preview inside the box border.
             parts = stream_tail["parts"]
+            if not parts and not piece.strip():
+                # still inside leading whitespace — nothing to show yet
+                return
             parts.append(piece)
-            maxw = max(1, self._width() - 26)
+            stream_tail["tail_len"] += len(piece)
             if "\n" in piece:
                 # the unfinished tail never contains "\n" (it is the text
                 # after the last newline seen), so a newline can only have
                 # arrived inside this piece — join once, split, done.
                 full = "".join(parts)
                 parts.clear()
+                stream_tail["tail_len"] = 0
                 before, _, rem = full.rpartition("\n")
                 # collapse blank-line runs (the model loves "\n\n\n" between
                 # tool calls) — keep at most one blank in a row
@@ -4412,22 +4441,12 @@ class UI:
                         stream_tail["blank"] = False
                     out.append(ln)
                 if out:
-                    # untrusted text goes to the tty only after the whole
-                    # chunk is assembled, so multi-byte escape sequences
-                    # split across stream chunks are stripped as a unit
-                    self.console.print(
-                        Text(sanitize_terminal_text("\n".join(out))),
-                        soft_wrap=True)
+                    _emit_line("\n".join(out))
                 if rem:
                     parts.append(rem)
-                pv = rem[-maxw:] if rem else ""
-            else:
-                pv = stream_tail["pv"] + piece
-                if len(pv) > maxw:
-                    pv = pv[-maxw:]
-            stream_tail["pv"] = pv
-            preview = sanitize_terminal_text(pv.strip("\n"))
-            _stream_status(preview if preview else "writing…")
+                    stream_tail["tail_len"] = len(rem)
+            elif stream_tail["tail_len"] >= max(40, self._width() - 4):
+                _soft_wrap_partial()
 
         # Live-reasoning stream state — one accumulator per turn; the TUI
         # feeds client.py's on_reasoning chunks and shows a bounded tail
@@ -5652,13 +5671,13 @@ def _tui_selftest() -> None:
     assert not missing, f"text lost: {missing[:5]}…"
     th2 = ui._stream_throttle
     assert isinstance(th2, _StreamThrottle)
-    assert th2.suppressed >= N - 2, th2.suppressed
-    # turn-lifecycle renders only: thinking…, first frame, final flush,
-    # teardown "" + 2 unconditional invalidates — NOT ~1000
-    assert renders["n"] <= 6, f"{renders['n']} renders for {N} tokens"
+    # the reply is printed to the transcript, never mirrored into the border
+    assert "w1" not in (ui._status_text or ""), ui._status_text
+    # turn-lifecycle renders only: thinking…, streaming label, teardown ""
+    # + unconditional invalidates — NOT ~1000
+    assert renders["n"] <= 8, f"{renders['n']} renders for {N} tokens"
     print(f"PASS  stream path: {N} tokens -> {renders['n']} renders "
-          f"({th2.suppressed} absorbed, {th2.frames} frames), "
-          f"all {N} tokens present in output")
+          f"(border text-free), all {N} tokens present in output")
 
     # -- 3. wall-clock timing: frames really are ~100ms apart -------------
     th3 = _StreamThrottle(0.1)

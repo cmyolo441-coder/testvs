@@ -100,9 +100,20 @@ works, the bottom border shows a live animated status:
 Tokens stream live above the box, tool calls appear as `⚙ name args` with
 `✓`/`✗` results, and each turn ends with a stats line (`2.3s · 512→87 tokens`).
 
-Streaming updates the unfinished-line preview on every token; only terminal
-redraws are throttled (about 33 fps). Complete lines print without waiting for
-the next token. Rapid submissions cannot overlap an active turn, including
+The reply is delivered **to the transcript only** — the border never mirrors
+token text, so the model can't scribble over the `⏎ send · / cmds …` hint line:
+
+```
+╰ ⠹ streaming reply…  ·  ⚡180 tok/s · 3s · Esc cancel ────────────────────╯
+```
+
+Complete lines print the moment their newline arrives, and an unfinished line
+(a one-paragraph answer has none) is soft-wrapped into the transcript once it
+is wider than the terminal, so text keeps flowing above the box instead of
+waiting for the end of the turn. Escape sequences / control characters in a
+model reply or tool output are stripped before printing (a quoted `\x1b[2J`
+used to erase the screen), and CRLF is normalised so replies never print
+phantom blank lines. Rapid submissions cannot overlap an active turn, including
 final rendering and session saving. Completed file-change output prints
 without artificial animation delays.
 
