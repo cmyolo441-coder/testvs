@@ -323,5 +323,149 @@ class RenderCallbackIOTests(unittest.TestCase):
         self.assertEqual(ui._skills_count(), 1)
 
 
+class UntrustedTextTests(unittest.TestCase):
+    """Model/tool text must never reach the terminal as escape sequences.
+
+    A reply that quotes colored log output (or contains ``\\x1b[2J``) used to
+    be written straight through rich's ``Text`` — the erase-display sequence
+    wiped the whole session transcript off the screen.
+    """
+
+    def test_sanitizer_strips_escape_sequences(self):
+        from fullagent.tui import sanitize_terminal_text
+
+        self.assertEqual(
+            sanitize_terminal_text("\x1b[31mred\x1b[0m plain"), "red plain")
+        self.assertEqual(sanitize_terminal_text("a\x1b[2Jb"), "ab")
+        self.assertEqual(sanitize_terminal_text("\x1b]0;title\x07kept"), "kept")
+        self.assertEqual(sanitize_terminal_text("bell\x07nul\x00x"), "bellnulx")
+        # meaningful whitespace and unicode survive untouched
+        self.assertEqual(sanitize_terminal_text("keep\tthis\nand 🚀 你好"),
+                         "keep\tthis\nand 🚀 你好")
+        self.assertEqual(sanitize_terminal_text("plain text"), "plain text")
+
+    def test_sanitizer_normalizes_carriage_returns(self):
+        from fullagent.tui import sanitize_terminal_text
+
+        self.assertEqual(sanitize_terminal_text("a\r\nb"), "a\nb")
+        self.assertEqual(sanitize_terminal_text("progress\r50%\rdone"),
+                         "progress\n50%\ndone")
+
+    def test_sanitizer_is_safe_on_junk(self):
+        from fullagent.tui import sanitize_terminal_text
+
+        self.assertEqual(sanitize_terminal_text(None), "")
+        self.assertEqual(sanitize_terminal_text(42), "42")
+        self.assertEqual(sanitize_terminal_text(""), "")
+
+    def test_streamed_reply_is_scrubbed_before_printing(self):
+        ui = _make_ui()
+        ui._approve_request = None
+        ui._spinner_i = 0
+        ui._diff_history = []
+        ui.agent.save_session = lambda: None
+        ui.agent.subagents = None
+        ui.cfg.save = lambda: None
+
+        def run(text, on_token, on_reasoning, on_tool_call, on_tool_update,
+                on_status, approve, **kwargs):
+            on_token("before ")
+            on_token("\x1b[2J")
+            on_token("after\n")
+            return SimpleNamespace(assistant_text="before after",
+                                   reasoning="", error="", tools=[],
+                                   usage=None, duration=0.0)
+
+        ui.agent.run_turn = run
+        ui._run_turn_thread("hello")
+        out = ui.output.getvalue()
+        self.assertNotIn("\x1b", out, "an escape sequence reached the tty")
+        self.assertIn("before after\n", out)
+
+    def test_tool_result_escapes_are_scrubbed(self):
+        from fullagent.agent import ToolEvent
+
+        ui = _make_ui()
+        ui._approve_request = None
+        ui._spinner_i = 0
+        ui._diff_history = []
+        ui.agent.save_session = lambda: None
+        ui.agent.subagents = None
+        ui.cfg.save = lambda: None
+
+        def run(text, on_token, on_reasoning, on_tool_call, on_tool_update,
+                on_status, approve, **kwargs):
+            ev = ToolEvent("run_command", {"command": "ls --color"},
+                           result="\x1b[32mgreen\x1b[0m\n\x1b[2Jwiped\n",
+                           status="done")
+            on_tool_call(ev)
+            on_tool_update(ev)
+            return SimpleNamespace(assistant_text="ok", reasoning="",
+                                   error="", tools=[ev], usage=None,
+                                   duration=0.0)
+
+        ui.agent.run_turn = run
+        ui._run_turn_thread("list files")
+        out = ui.output.getvalue()
+        self.assertNotIn("\x1b", out, "tool output leaked an escape sequence")
+        self.assertIn("green", out)
+        self.assertIn("wiped", out)
+
+    def test_escape_sequence_split_across_chunks_is_still_stripped(self):
+        """Providers chunk mid-escape; the sequence must not leak as text."""
+        ui = _make_ui()
+        ui._approve_request = None
+        ui._spinner_i = 0
+        ui._diff_history = []
+        ui.agent.save_session = lambda: None
+        ui.agent.subagents = None
+        ui.cfg.save = lambda: None
+
+        def run(text, on_token, on_reasoning, on_tool_call, on_tool_update,
+                on_status, approve, **kwargs):
+            for piece in ("clean one\n", "\x1b[", "2J", "clean two\n"):
+                on_token(piece)
+            return SimpleNamespace(assistant_text="clean one\nclean two",
+                                   reasoning="", error="", tools=[],
+                                   usage=None, duration=0.0)
+
+        ui.agent.run_turn = run
+        ui._run_turn_thread("hello")
+        out = ui.output.getvalue()
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("[2J", out, "half a sequence leaked as literal text")
+        self.assertIn("clean one\nclean two\n", out)
+
+    def test_crlf_and_split_crlf_do_not_add_blank_lines(self):
+        ui = _make_ui()
+        ui._approve_request = None
+        ui._spinner_i = 0
+        ui._diff_history = []
+        ui.agent.save_session = lambda: None
+        ui.agent.subagents = None
+        ui.cfg.save = lambda: None
+
+        def run(text, on_token, on_reasoning, on_tool_call, on_tool_update,
+                on_status, approve, **kwargs):
+            # whole CRLF, then a CRLF split across two chunks, then a lone CR
+            for piece in ("one\r\n", "two\r", "\n", "three\rfour\n"):
+                on_token(piece)
+            return SimpleNamespace(assistant_text="", reasoning="", error="",
+                                   tools=[], usage=None, duration=0.0)
+
+        ui.agent.run_turn = run
+        ui._run_turn_thread("hello")
+        out = ui.output.getvalue()
+        self.assertNotIn("\r", out)
+        self.assertIn("one\ntwo\nthree\nfour", out)
+        self.assertNotIn("one\n\ntwo", out,
+                         "a CRLF reply must not print phantom blank lines")
+
+    def test_status_line_strips_escapes(self):
+        ui = _make_ui()
+        ui._set_status("thinking \x1b[2J\x1b[31mred")
+        self.assertNotIn("\x1b", ui._status_text)
+
+
 if __name__ == "__main__":
     unittest.main()

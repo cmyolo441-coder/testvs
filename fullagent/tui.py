@@ -46,6 +46,7 @@ import threading
 import time
 import unicodedata
 from collections import deque
+from dataclasses import replace
 from html import escape as html_escape
 from pathlib import Path
 from typing import Callable
@@ -357,6 +358,68 @@ def _disp_width(s: str) -> int:
     for ch in s:
         w += 2 if unicodedata.east_asian_width(ch) in _WIDE_CATS else 1
     return w
+
+
+# ---------------------------------------------------------------------------
+# Untrusted text sanitizer.
+#
+# Model replies and tool output are arbitrary strings. A single ANSI escape
+# sequence inside them is written straight to the terminal by rich (Text is
+# literal), so a reply quoting colored log output — or one containing
+# "\x1b[2J" (erase display) — used to wipe the whole session transcript off
+# the screen and leave the prompt box surrounded by garbage. Everything that
+# came from the model or a tool goes through sanitize_terminal_text() before
+# it reaches the console.
+# ---------------------------------------------------------------------------
+
+_ANSI_ESCAPE = re.compile(
+    r"\x1b(?:"
+    r"\[[0-?]*[ -/]*[@-~]"                 # CSI — colors, cursor moves, ED/EL
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)?"     # OSC — window title, hyperlinks
+    r"|[PX^_][^\x1b]*(?:\x1b\\)?"          # DCS/SOS/PM/APC string payloads
+    r"|[@-Z\\-_]"                          # two-character escapes
+    r")"
+)
+# C0 controls except TAB (\x09) and LF (\x0a), plus DEL.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# Fast path probe: nothing to strip.
+_NEEDS_SANITIZE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def sanitize_terminal_text(text) -> str:
+    """Strip escape sequences / control characters from untrusted text.
+
+    Newlines and tabs are kept (they are meaningful); CRLF becomes LF and a
+    lone CR becomes LF so terminal progress-bar output cannot overwrite
+    already-printed lines. Clean strings are returned untouched (fast path,
+    this runs per streamed token).
+    """
+    if not isinstance(text, str):
+        return "" if text is None else str(text)
+    if not text or _NEEDS_SANITIZE.search(text) is None:
+        return text
+    out = _ANSI_ESCAPE.sub("", text)
+    if "\r" in out:
+        out = out.replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL_CHARS.sub("", out)
+
+
+def _display_safe_event(ev: ToolEvent) -> ToolEvent:
+    """A display copy of a tool event with terminal escapes stripped.
+
+    ``ev.result`` is raw command/file output and ``ev.args`` can carry a
+    whole file. The copy is only used for rendering (and for the detail
+    panel) — the real event keeps its bytes for the log and the model.
+    """
+    try:
+        args = {
+            k: (sanitize_terminal_text(v) if isinstance(v, str) else v)
+            for k, v in (ev.args or {}).items()
+        }
+        return replace(ev, args=args,
+                       result=sanitize_terminal_text(ev.result or ""))
+    except Exception:
+        return ev
 
 
 def _truncate_w(s: str, maxw: int) -> str:
@@ -922,6 +985,9 @@ class UI:
         self._invalidate()
 
     def _set_status(self, text: str) -> None:
+        # the status line lives INSIDE the prompt frame: a raw escape
+        # sequence from a reasoning/token preview would corrupt the border
+        text = sanitize_terminal_text(text)
         if text == self._status_text:
             return
         self._status_text = text
@@ -984,17 +1050,11 @@ class UI:
         if self._focus_remaining > 0:
             segs.append((f" 🎯 focus×{self._focus_remaining} ",
                          "class:box.flash"))
-        # live context usage — cached 1s (the border redraws every frame)
-        if self._ctx_cache is None or now - self._ctx_cache_ts > 1.0:
-            try:
-                from .client import estimate_tokens
-                used = estimate_tokens(self.agent.messages,
-                                       self.agent.model.id)
-                window = max(1, self.agent.model.context_window)
-                self._ctx_cache = min(100, int(used * 100 / window))
-            except Exception:
-                self._ctx_cache = 0
-            self._ctx_cache_ts = now
+        # live context usage — cached 1s (the border redraws every frame).
+        # _context_percent() owns that cache, so the top border and the
+        # footer share ONE token estimate per second instead of each paying
+        # their own (estimate_tokens is O(messages) and grows all session).
+        self._context_percent()
         # ctxmeter: visual context bar (falls back to text % on any error)
         try:
             from . import ctxmeter
@@ -1998,7 +2058,8 @@ class UI:
         The full reasoning is kept in ``_last_detail_event`` so Ctrl+O can
         re-print every row instead of just the collapsed preview.
         """
-        lines = [ln.rstrip() for ln in str(text or "").splitlines()
+        lines = [ln.rstrip() for ln in
+                 sanitize_terminal_text(str(text or "")).splitlines()
                  if ln.strip()]
         if not lines:
             return
@@ -4280,7 +4341,7 @@ class UI:
         # line grew. Parts accumulate in a list; we only join when a
         # newline arrives (to split off complete lines) and keep a bounded
         # live preview, so per-token cost stays O(len(piece)).
-        stream_tail = {"parts": [], "blank": False, "pv": ""}
+        stream_tail = {"parts": [], "blank": False, "pv": "", "cr": False}
         render_md = bool(self.cfg.extra.get("render_markdown", False))
         md_preview = ""
 
@@ -4301,12 +4362,29 @@ class UI:
 
         def on_token(piece: str):
             nonlocal md_preview
+            # CRLF / lone CR: providers may emit either style, and a CRLF can
+            # even be split across two chunks. Without this a "\r\n" reply
+            # printed a phantom blank line after every line. A trailing CR is
+            # held back until the next piece says whether an LF followed.
+            if not isinstance(piece, str):
+                piece = "" if piece is None else str(piece)
+            if stream_tail["cr"]:
+                stream_tail["cr"] = False
+                # the held-back CR was a line break: emit exactly one, and
+                # drop the LF when the CRLF was split across chunks
+                piece = "\n" + (piece[1:] if piece.startswith("\n") else piece)
+            if "\r" in piece:
+                piece = piece.replace("\r\n", "\n")
+                if piece.endswith("\r"):
+                    piece = piece[:-1]
+                    stream_tail["cr"] = True
+                piece = piece.replace("\r", "\n")   # lone CRs are breaks too
             self._stream_tokens_count = getattr(self, "_stream_tokens_count", 0) + 1
             if render_md:
                 # Keep a bounded preview; the agent owns the complete reply.
                 maxw = max(1, self._width() - 26)
                 md_preview = (md_preview + piece)[-maxw:]
-                preview = md_preview.strip("\n")
+                preview = sanitize_terminal_text(md_preview.strip("\n"))
                 _stream_status(preview if preview else "writing…")
                 return
             # patch_stdout can only interleave output safely when every
@@ -4334,7 +4412,12 @@ class UI:
                         stream_tail["blank"] = False
                     out.append(ln)
                 if out:
-                    self.console.print(Text("\n".join(out)), soft_wrap=True)
+                    # untrusted text goes to the tty only after the whole
+                    # chunk is assembled, so multi-byte escape sequences
+                    # split across stream chunks are stripped as a unit
+                    self.console.print(
+                        Text(sanitize_terminal_text("\n".join(out))),
+                        soft_wrap=True)
                 if rem:
                     parts.append(rem)
                 pv = rem[-maxw:] if rem else ""
@@ -4343,7 +4426,7 @@ class UI:
                 if len(pv) > maxw:
                     pv = pv[-maxw:]
             stream_tail["pv"] = pv
-            preview = pv.strip("\n")
+            preview = sanitize_terminal_text(pv.strip("\n"))
             _stream_status(preview if preview else "writing…")
 
         # Live-reasoning stream state — one accumulator per turn; the TUI
@@ -4376,7 +4459,8 @@ class UI:
             # the provider fields (reasoning_content / reasoning) into this
             # callback. When thinking display is off, keep the old static
             # status so the user sees no reasoning text at all.
-            reasoning_stream.feed(piece)
+            # display-only: reasoning text can quote terminal colors too
+            reasoning_stream.feed(sanitize_terminal_text(piece))
             _reasoning_status()
 
         # live shell streaming state — one tool runs at a time, so a plain
@@ -4400,7 +4484,10 @@ class UI:
             shell_live["lines"] = n + 1
             shell_live["streamed"] = True
             style = C["orange"] if stream == "err" else C["fg"]
-            self.console.print(Text(" │ " + line, style=style),
+            # command output is untrusted: strip escapes so a colored log
+            # dump cannot repaint/corrupt the prompt frame
+            self.console.print(Text(" │ " + sanitize_terminal_text(line),
+                                    style=style),
                                soft_wrap=True)
 
         # Real-Time Streaming Live Diff Preview Engine (powered by LiveDiffStreamer)
@@ -4499,12 +4586,14 @@ class UI:
 
         def on_tool_call(ev: ToolEvent):
             self._invalidate_agents()  # TaskGroup spawns must show immediately
+            ev = _display_safe_event(ev)  # never let tool bytes hit the tty
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
             stream_tail["pv"] = ""
             stream_tail["blank"] = False
             if rem:
-                self.console.print(Text(rem), soft_wrap=True)
+                self.console.print(Text(sanitize_terminal_text(rem)),
+                                   soft_wrap=True)
             shell_live["active"] = ev.name in ("run_command", "live_shell")
             shell_live["streamed"] = False
             shell_live["lines"] = 0
@@ -4529,6 +4618,7 @@ class UI:
 
         def on_tool_update(ev: ToolEvent):
             self._invalidate_agents()  # worker progress/finish is real state
+            ev = _display_safe_event(ev)  # never let tool bytes hit the tty
             if ev.name in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch") \
                     and ev.status in ("done", "error"):
                 if hasattr(self, "_diff_history"):
@@ -4629,7 +4719,8 @@ class UI:
             if frame is not None:
                 self._set_status(frame)
             if rem:
-                self.console.print(Text(rem), soft_wrap=True)
+                self.console.print(Text(sanitize_terminal_text(rem)),
+                                   soft_wrap=True)
             else:
                 self.console.print()
             self._stop_spinner()
@@ -4651,8 +4742,9 @@ class UI:
             if render_md and turn.assistant_text.strip() and not turn.error:
                 # the finished reply, rendered once as rich Markdown
                 self.console.print()
-                self.console.print(Markdown(turn.assistant_text),
-                                   soft_wrap=True)
+                self.console.print(
+                    Markdown(sanitize_terminal_text(turn.assistant_text)),
+                    soft_wrap=True)
             # thinking module: collapsible reasoning display; falls back
             # to the legacy show_reasoning flag
             _think_visible = self.cfg.show_reasoning
