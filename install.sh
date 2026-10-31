@@ -88,7 +88,12 @@ fi
 
 echo ">> Installing FullAgent..."
 "$VENV_DIR/bin/pip" install -q --upgrade pip
-"$VENV_DIR/bin/pip" install -q --upgrade "git+https://github.com/${REPO}.git"
+# A git URL without a ref is a DIRECT reference: pip compares it to what is
+# already installed and can report "Requirement already satisfied", keeping a
+# stale checkout (that is how a fresh install kept booting v4.0.0 while main
+# was v4.1.2). Force the rebuild and bypass the wheel cache.
+"$VENV_DIR/bin/pip" install -q --upgrade --force-reinstall --no-cache-dir \
+  "git+https://github.com/${REPO}.git"
 
 mkdir -p "$INSTALL_DIR"
 cat > "$INSTALL_DIR/$NAME" <<EOF
@@ -97,6 +102,31 @@ exec "$VENV_DIR/bin/python" -m fullagent "\$@"
 EOF
 chmod +x "$INSTALL_DIR/$NAME"
 
-echo ">> Installed: $INSTALL_DIR/$NAME"
+# A stale `fullagent` EARLIER in PATH (typical: an old single-file binary in
+# /usr/local/bin, or the previous release left in ~/.local/bin before pip had
+# a venv) shadows this install — the user then keeps running the old build
+# and sees the old version/errors. Move it aside when we can, else say so.
+shadowed=""
+IFS=':' read -r -a _path_dirs <<< "$PATH"
+for _d in "${_path_dirs[@]}"; do
+  [ -z "$_d" ] && continue
+  [ "$_d" = "$INSTALL_DIR" ] && break
+  if [ -f "$_d/$NAME" ] && [ -x "$_d/$NAME" ]; then
+    shadowed="$_d/$NAME"
+    break
+  fi
+done
+if [ -n "$shadowed" ]; then
+  if [ -w "$shadowed" ]; then
+    mv "$shadowed" "$shadowed.bak-$(date +%Y%m%d%H%M%S)"
+    echo ">> Moved stale $shadowed aside (it shadowed the new install)"
+  else
+    echo "!! $shadowed shadows the new install and is not writable."
+    echo "   Remove it: sudo rm -f $shadowed"
+  fi
+fi
+
+INSTALLED_VERSION="$("$VENV_DIR/bin/python" -m fullagent --version 2>/dev/null || true)"
+echo ">> Installed: $INSTALL_DIR/$NAME (${INSTALLED_VERSION:-version unknown})"
 ensure_path
-echo ">> Run: $NAME"
+echo ">> Run: $NAME   (open a new shell, or: hash -r; source ~/.bashrc)"
