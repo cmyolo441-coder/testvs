@@ -1468,7 +1468,7 @@ _MIN_COMPLETION_TOKENS = 1_024    # never clamp max_tokens below this
 def _context_margin(window: int) -> int:
     """Fixed safety margin, scaled down for small windows so the fit
     check stays meaningful (an 8k margin on an 8k window could never
-    fit anything). Unchanged for all production windows (>= 128k)."""
+    fit anything). Unchanged for all production windows (>= 1M)."""
     return min(CONTEXT_MARGIN, window // 8)
 
 
@@ -1514,13 +1514,13 @@ def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
     return max(_MIN_COMPLETION_TOKENS, min(requested, headroom))
 
 
-# FullAgent asks for 200k output tokens everywhere, but each backend has its
-# own hard ceiling. Clamp at send time so the request is never rejected for
-# an oversized max_tokens; providers without a known cap pass through.
+# FullAgent asks for the full maximum output tokens everywhere (MAX_TOKENS),
+# but each backend has its own real ceiling; the window clamp plus the
+# backend-learned window are authoritative before anything goes on the wire.
 _MAX_TOKENS_CAP: dict[str, int] = {
-    "kios": 131_072,
-    # NVIDIA NIM accepted max_tokens=200000 against the Mistral Large
-    # route in testing, so allow the full global output budget.
+    # Every route gets the full maximum output budget; a smaller real
+    # completion limit is learned from the backend's own error/usage data.
+    "kios": config.MAX_TOKENS,
     "nvidia": config.MAX_TOKENS,
 }
 
@@ -3183,10 +3183,10 @@ if __name__ == "__main__":
     # (5) the approximation stays within a sane bound of a chars/4-style
     # real-tokenizer guess; (6) the raw estimator beats flat chars/4
     # (tiktoken when installed, else the BPE-aware heuristic);
-    # (7) MODEL_CONTEXT_WINDOWS holds researched values with a 128k
-    # default; (8) build_payload prunes history FIRST when input +
-    # max_tokens would exceed the window, logs it, and never sends a
-    # request it can prove won't fit.
+    # (7) MODEL_CONTEXT_WINDOWS holds the maximum window for every model;
+    # (8) build_payload prunes history FIRST when input + max_tokens would
+    # exceed the window, logs it, and never sends a request it can prove
+    # won't fit.
     import tempfile as _tempfile
     import time as _t
     from pathlib import Path as _Path
@@ -3347,10 +3347,10 @@ if __name__ == "__main__":
     # -- 9. per-model window table ----------------------------------------------
     check("DeepSeek V4.1 Flash Free window is 1048576",
           config.model_context_window("deepseek-v4.1-flash-free") == 1_048_576)
-    check("unknown model defaults to 128k",
-          config.model_context_window("nope-xyz") == 128_000)
+    check("unknown model defaults to 1_048_576",
+          config.model_context_window("nope-xyz") == 1_048_576)
     check("every shipped model has a sane window",
-          all(m.context_window >= 128_000 for m in config.MODELS))
+          all(m.context_window >= 1_048_576 for m in config.MODELS))
     check("table covers every shipped model",
           all(m.id in config.MODEL_CONTEXT_WINDOWS for m in config.MODELS))
 

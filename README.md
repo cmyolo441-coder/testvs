@@ -9,7 +9,7 @@
 ╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝
 ```
 
-<h1>FullAgent <sup><code>v4.1.4</code></sup></h1>
+<h1>FullAgent <sup><code>v4.1.5</code></sup></h1>
 
 **Advanced Terminal AI Agent — Pure Python, Real Code, World-Class TUI**
 
@@ -48,7 +48,7 @@
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results │
  ╚═╝     ╚═╝  ╚═╝                   ╰─────────────────────────────────────╯
-  FullAgent CLI v4.1.4
+  FullAgent CLI v4.1.5
 ```
 
 While a swarm is running the frame shows the Qoder-style board and footer:
@@ -127,7 +127,7 @@ without artificial animation delays.
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code, run… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results      │
  ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
-  FullAgent CLI v4.1.4
+  FullAgent CLI v4.1.5
   API key · built-in (Kios API)
   DeepSeek V4.1 Flash Free  ·  high
   ~/Desktop  ·  session a1b2c3d4
@@ -342,7 +342,7 @@ with six models:**
 | `deepseek-v4.1-flash-free` | Kios | free | 1.0m |
 | `minimax-m3.1-flash-free` | Kios | free | 1.0m |
 | `MiniMax-M3.1-Flash` | SambaNova Cloud | sambanova | 1.0m |
-| `mistralai/mistral-large-4-1t-a52b` | NVIDIA NIM | nvidia | 128k |
+| `mistralai/mistral-large-4-1t-a52b` | NVIDIA NIM | nvidia | 1.0m |
 
 `deepseek-v4.1-flash-1017` is the fastest route we measured (~1s to first
 token); it runs with `reasoning_effort="none"` so answers stream
@@ -511,11 +511,10 @@ only JSON, the synthesizer only source.
 Add more prompts later by dropping a constant in `systemprompt.py` and
 registering it in the `PROMPTS` map (or call `register()` at runtime).
 
-## Output budget — 200k tokens
+## Output budget — maximum (1,048,576 tokens)
 
-Every effort level requests **200,000 output tokens** (`config.MAX_TOKENS`).
-The client clamps requests to the Kios backend's **131,072-token** completion
-ceiling and the remaining context window before sending them to Kios.
+Every effort level requests **1,048,576 output tokens** (`config.MAX_TOKENS`, the full maximum context window).
+The client clamps each request to the model's effective context window — the runtime-learned backend window can only shrink it — before sending. The pre-send payload budget (`config.MAX_PAYLOAD_TOKENS`) and per-request prompt budget (`config.prompt_token_budget`) now default to the same maximum, and the model-visible history prune window defaults to disabled (`prune_window: 0`) so the token budget decides.
 
 ## Mastermind — coherence, not coercion
 

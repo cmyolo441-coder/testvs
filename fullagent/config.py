@@ -94,37 +94,37 @@ TURN_TIME_BUDGET_SLOW_S = 1800.0
 # this many times in a row (no-progress loop).
 NO_PROGRESS_STALL_LIMIT = 3
 MAX_TOOL_OUTPUT_CHARS = 24_000
-# One output ceiling for every effort level: 200k tokens.
-MAX_TOKENS = 200_000
+# One output ceiling for every effort level: the full maximum window.
+# The backend can still serve less; client._window_max_tokens clamps each
+# request to input + max_tokens <= the model's effective window.
+MAX_TOKENS = 1_048_576
+MAX_CONTEXT_TOKENS = MAX_TOKENS
 # Backends reject a request when input + max_tokens exceeds the model's
 # context window. Every request's max_tokens is clamped to fit (client.py).
 #
-# Per-model context windows, researched 2026-10-21.
-# Free-tier gateways sometimes serve LESS than the lab's headline number,
-# so values below are the SERVED window where documented, conservative
-# otherwise. The backend can still teach a smaller window at runtime
-# (client.learn_context_window) — that only ever shrinks these.
+# Maximum planning window for every model (user override): all routes get
+# the largest window the app knows about. A backend that serves less
+# teaches its real window at runtime via client.learn_context_window —
+# that only ever shrinks these, so no request is trusted past what the
+# backend itself reported.
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # upstream: deepseek/deepseek-v4.1-flash (1,048,576-token window)
-    "deepseek-v4.1-flash-free": 1_048_576,
+    "deepseek-v4.1-flash-free": MAX_CONTEXT_TOKENS,
     # same flash family, Gwarden route (2026-10 snapshot)
-    "deepseek-v4.1-flash-1017": 1_048_576,
-    # upstream: google/gemini-4-argon (1,000,000-token window)
-    "gemini-4-argon": 1_000_000,
-    # upstream: minimax/minimax-m3.1-flash:free (1,000,000-token window)
-    "minimax-m3.1-flash-free": 1_000_000,
+    "deepseek-v4.1-flash-1017": MAX_CONTEXT_TOKENS,
+    # upstream: google/gemini-4-argon
+    "gemini-4-argon": MAX_CONTEXT_TOKENS,
+    # upstream: minimax/minimax-m3.1-flash:free
+    "minimax-m3.1-flash-free": MAX_CONTEXT_TOKENS,
     # same upstream model served via SambaNova Cloud
-    "MiniMax-M3.1-Flash": 1_000_000,
-    # upstream: mistralai/mistral-large (NVIDIA NIM). Configured for a 1M
-    # planning window at the user's request; the backend's real reported
-    # window (131k served) is learned at runtime and always wins, because
-    # effective_window() only ever shrinks.
-    "mistralai/mistral-large-4-1t-a52b": 1_000_000,
+    "MiniMax-M3.1-Flash": MAX_CONTEXT_TOKENS,
+    # upstream: mistralai/mistral-large (NVIDIA NIM); real served window
+    # (131k) is learned at runtime and always wins.
+    "mistralai/mistral-large-4-1t-a52b": MAX_CONTEXT_TOKENS,
 }
-# Default for models NOT in the table above: assume a small window rather
-# than risk a ~44s doomed request against an unknown cap. A request we can
-# prove won't fit is never sent (see client.build_payload).
-UNKNOWN_MODEL_WINDOW = 128_000
+# Default for models NOT in the table above: use the maximum too. If the
+# backend serves less, the learned window immediately shrinks the plan.
+UNKNOWN_MODEL_WINDOW = MAX_CONTEXT_TOKENS
 
 
 def model_context_window(model_id: str) -> int:
@@ -152,12 +152,12 @@ def _env_int(name: str, default: int) -> int:
 
 # Hard pre-send payload ceiling (estimated input tokens). When a request's
 # input exceeds this, client.build_payload prunes history (oldest tool
-# results first, then old assistant texts) BEFORE sending — some providers
-# reject oversized payloads with invalid_request_error only after a long
-# wait, and the window clamp above does not protect against that. Set well
-# under typical 128k/200k windows to leave headroom. Override with
+# results first, then old assistant texts) BEFORE sending. Raised to the
+# maximum window so no artificial payload cap remains; the backend's real
+# window still clamps each request. Override with
 # FULLAGENT_MAX_PAYLOAD_TOKENS.
-MAX_PAYLOAD_TOKENS = _env_int("FULLAGENT_MAX_PAYLOAD_TOKENS", 100_000)
+MAX_PAYLOAD_TOKENS = _env_int("FULLAGENT_MAX_PAYLOAD_TOKENS",
+                              MAX_CONTEXT_TOKENS)
 
 
 @dataclass(frozen=True)
@@ -360,11 +360,12 @@ class Config:
     # the optional project.txt specification when present)
     prompt: str = "main"
     extra: dict = field(default_factory=dict)
-    # PERF: sliding window for model-visible history. 0 = disabled (legacy).
-    prune_window: int = 40
+    # PERF: sliding window for model-visible history. 0 = disabled, which
+    # lets the full token budget decide what fits (maximum context).
+    prune_window: int = 0
     # PERF (worker 2/20): hard per-request prompt token budget
-    # (messages + tool schemas). 0 = disabled.
-    prompt_token_budget: int = 100_000
+    # (messages + tool schemas). Raised to the maximum window; 0 disables.
+    prompt_token_budget: int = MAX_CONTEXT_TOKENS
 
     @classmethod
     def load(cls) -> "Config":

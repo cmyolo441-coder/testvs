@@ -185,7 +185,7 @@ class NvidiaConfigTests(unittest.TestCase):
         self.assertEqual(model.provider, "nvidia")
         self.assertTrue(model.supports_tools)
         self.assertTrue(model.supports_reasoning)
-        self.assertEqual(model.context_window, 1_000_000)
+        self.assertEqual(model.context_window, 1_048_576)
         self.assertGreaterEqual(model.context_window, config.MAX_TOKENS)
 
     def test_missing_key_is_a_clear_error_not_a_bad_request(self):
@@ -242,9 +242,10 @@ class SmallWindowRegressionTests(unittest.TestCase):
     """A window smaller than the effort's token budget used to be fatal.
 
     `_ensure_window_fit` compared input + the RAW requested budget
-    (config.MAX_TOKENS = 200k) against the window, so every 128k model
-    rejected even a three-word history locally with "conversation is too
-    large" — the NVIDIA Mistral route could never be called at all.
+    (config.MAX_TOKENS = 1M) against the window, so every model that was
+    smaller than that budget rejected even a three-word history locally
+    with "conversation is too large" — the NVIDIA Mistral route could
+    never be called at all.
     """
 
     def test_small_history_fits_a_small_window(self):

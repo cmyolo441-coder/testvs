@@ -22,7 +22,7 @@ import re
 TAIL_KEEP = 10               # last N messages are always kept verbatim
 MAX_SUMMARY_LINES = 40       # hard cap on heuristic summary length
 SUGGEST_THRESHOLD = 0.80     # suggest /compact once estimated usage passes this
-DEFAULT_CONTEXT_WINDOW = 200_000
+DEFAULT_CONTEXT_WINDOW = 1_048_576
 SUMMARY_MARKER = "Previous conversation summary:"
 
 # decision-ish language in assistant text worth preserving
@@ -331,7 +331,7 @@ def do_compact(agent) -> dict:
 
 def _selftest() -> None:
     class FakeModel:
-        context_window = 200_000
+        context_window = 1_048_576
 
     class FakeAgent:
         def __init__(self):
@@ -413,20 +413,20 @@ def _selftest() -> None:
 
     # --- should_suggest_compact threshold ---
     big = FakeAgent()
-    # >80% of 200k tokens => >160k tokens => >640k chars
-    big.messages = [umsg("x" * 700_000)]
+    # >80% of 1,048,576 tokens => >838,861 tokens => >~4M chars
+    big.messages = [umsg("x" * 4_000_000)]
     assert should_suggest_compact(big) is True
     small = FakeAgent()
     small.messages = [umsg("hello")]
     assert should_suggest_compact(small) is False
-    # missing model -> default 200k window, still fine
+    # missing model -> default 1M window, still fine
     nomodel = FakeAgent()
     del nomodel.model
     nomodel.messages = [umsg("hello")]
     assert should_suggest_compact(nomodel) is False
-    # exactly at boundary: 80% -> not >, just under threshold must be False
+    # under the threshold: 80% -> not >, just under threshold must be False
     edge = FakeAgent()
-    edge.messages = [umsg("x" * 640_000)]  # exactly 160k est tokens = 80%
+    edge.messages = [umsg("x" * 1_000_000)]  # ~250k est tokens = under 80%
     assert should_suggest_compact(edge) is False
 
     print("PASS")

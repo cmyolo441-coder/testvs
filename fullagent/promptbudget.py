@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 
-DEFAULT_BUDGET_TOKENS = 100_000   # hard per-request ceiling
+DEFAULT_BUDGET_TOKENS = 1_048_576   # hard per-request ceiling (max window)
 MIN_BUDGET_TOKENS = 8_000         # below this the system prompt alone wins
 _NEWEST_VERBATIM_CAP = 8_000      # chars per tool result, newest 2
 _OLDER_RESULT_CAP = 2_000         # chars per tool result, older ones
@@ -156,7 +156,7 @@ def _selftest() -> int:
     request payload is bounded under the budget on every call."""
     import random
     random.seed(7)
-    budget = 100_000
+    budget = DEFAULT_BUDGET_TOKENS
     system = {"role": "system", "content": "S" * 2500}
     schemas = [{"type": "function",
                 "function": {"name": f"tool_{i:03d}",

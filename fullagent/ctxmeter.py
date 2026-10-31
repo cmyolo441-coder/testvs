@@ -219,7 +219,7 @@ if __name__ == "__main__":
     # context_bar against a fake UI mirroring tui.py's shape
     class FakeModel:
         id = "test-model"
-        context_window = 200000
+        context_window = 1048576
 
     class FakeUI:
         def __init__(self):
