@@ -27,6 +27,7 @@ _ROOT_DIR = str(_Path(__file__).resolve().parent.parent)
 if _ROOT_DIR not in _sys.path:
     _sys.path.insert(0, _ROOT_DIR)
 
+import dataclasses
 import os
 import stat
 import subprocess
@@ -110,6 +111,10 @@ class KeyCommandTests(unittest.TestCase):
 
     # -- B. the key is actually used -------------------------------------
     def test_saved_key_authorises_the_next_request(self):
+        # start from "no key" so the 401 path is exercised even though the
+        # shipped build embeds one
+        config.PROVIDERS["nvidia"] = dataclasses.replace(
+            config.PROVIDERS["nvidia"], api_key="")
         with self.assertRaises(client.APIError):
             client._check_api_key(config.PROVIDERS["nvidia"],
                                   config.model_by_id(
@@ -196,12 +201,15 @@ class BuildKeyEmbeddingTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o600)
         self.assertEqual(self._config_view(), "nvapi-buildtime-999")
 
-    def test_no_generated_module_means_no_embedded_nvidia_key(self):
+    def test_no_generated_module_falls_back_to_the_shipped_key(self):
+        """Without a build-time key module the shipped NIM key is used."""
         try:
             self.target.unlink()
         except FileNotFoundError:
             pass
-        self.assertEqual(self._config_view(), "")
+        value = self._config_view()
+        self.assertTrue(value.startswith("nvapi-"), value)
+        self.assertNotEqual(value, "nvapi-buildtime-999")
 
     def test_git_ignores_the_generated_module(self):
         gitignore = (Path(__file__).resolve().parents[1]
