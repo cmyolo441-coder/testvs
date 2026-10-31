@@ -206,8 +206,10 @@ class NvidiaPayloadTests(unittest.TestCase):
         # defaults and are not sent by the app at all).
         self.assertEqual(sorted(payload),
                          ["max_tokens", "messages", "model",
-                          "reasoning_effort", "stream", "temperature",
-                          "tool_choice", "tools"])
+                          "reasoning_effort", "stream", "stream_options",
+                          "temperature", "tool_choice", "tools"])
+        # usage in the final SSE chunk feeds the per-model token calibration
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
         self.assertEqual(payload["model"], NVIDIA_MODEL_ID)
         self.assertIs(payload["stream"], True)
         self.assertEqual(payload["messages"],

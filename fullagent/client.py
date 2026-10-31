@@ -1018,6 +1018,12 @@ def build_payload(model: Model, effort: Effort, messages: list[dict],
         # use it to skip the hidden chain-of-thought.
         if effort.reasoning_effort or model.provider != "nvidia":
             payload["reasoning_effort"] = effort.reasoning_effort or "none"
+    if stream and model.provider == "nvidia":
+        # NVIDIA NIM reports usage only when asked. The per-model token
+        # calibration is learned from usage, so without this every streamed
+        # turn teaches nothing and the estimate drifts — which is exactly
+        # how input + max_tokens ended up over the real window.
+        payload["stream_options"] = {"include_usage": True}
     return payload
 
 
@@ -1437,6 +1443,14 @@ def learn_token_correction(raw_tokens: float, actual_tokens: int,
         return
     key = _cal_key(model_id)
     samples = _correction_samples.setdefault(key, [])
+    if samples:
+        mean = sum(samples) / len(samples)
+        # A measurement that wildly contradicts the rolling mean means the
+        # estimator regime changed (different prompt composition or provider
+        # accounting). Keeping the stale samples would drag the correction
+        # in the wrong direction and make the clamp under-count the input.
+        if mult >= mean * 1.5 or mult <= mean / 1.5:
+            samples.clear()
     samples.append(mult)
     if len(samples) > _CORRECTION_SAMPLES_MAX:
         del samples[: len(samples) - _CORRECTION_SAMPLES_MAX]
@@ -1819,6 +1833,28 @@ def _with_error_type(msg: str, err: dict) -> str:
     return msg
 
 
+def _error_details_suffix(obj: Any) -> str:
+    """Serialize a provider error's nested `details` into the message.
+
+    NVIDIA NIM reports a recoverable context overflow as a generic
+    "Invalid request" with the real numbers in details
+    ({"type": "context_length", "limit": N, "actual": M}). Dropping the
+    details turned it into an ordinary bad request, so the client pruned
+    history instead of re-clamping max_tokens and retrying. Never raises.
+    """
+    if not isinstance(obj, dict):
+        return ""
+    details = obj.get("details")
+    if not isinstance(details, dict) or not details:
+        return ""
+    try:
+        text = json.dumps(details, ensure_ascii=False, default=str,
+                          separators=(", ", ": "))
+    except (TypeError, ValueError):
+        text = str(details)
+    return f" (details: {text[:300]})"
+
+
 def _extract_error_message(body: str, status: int | None = None) -> str:
     """Best-effort human-readable message from an error response body.
 
@@ -1844,12 +1880,16 @@ def _extract_error_message(body: str, status: int | None = None) -> str:
         return body[:500]
     err = obj.get("error")
     if isinstance(err, dict):
-        return _with_error_type(str(err.get("message") or err), err)
+        typed = err if (err.get("type") or err.get("code")) else obj
+        return _with_error_type(
+            str(err.get("message") or err)
+            + _error_details_suffix(err)
+            + _error_details_suffix(obj), typed)
     if isinstance(err, str):
-        return err
+        return err + _error_details_suffix(obj)
     message = obj.get("message")
     if isinstance(message, str):
-        return _with_error_type(message, obj)
+        return _with_error_type(message + _error_details_suffix(obj), obj)
     return body[:500]
 
 
@@ -1939,9 +1979,14 @@ def is_context_overflow(message: str) -> bool:
     return any(m in low for m in _OVERFLOW_MARKERS)
 
 
-def _parse_overflow(message: str) -> dict | None:
+def _parse_overflow(message: str,
+                    sent_max_tokens: int | None = None) -> dict | None:
     """Extract real token counts from a backend overflow error. Returns a
-    dict with any of: window, input_tokens, completion_tokens, total."""
+    dict with any of: window, input_tokens, completion_tokens, total.
+
+    ``sent_max_tokens`` is the max_tokens of the rejected request; some
+    gateways (NVIDIA NIM) only report input + max_tokens as "actual", so
+    the input size can only be recovered by subtracting it."""
     if not is_context_overflow(message):
         return None
     low = message.lower()
@@ -1967,6 +2012,17 @@ def _parse_overflow(message: str) -> dict | None:
              or _num(r"requested (?:a total of )?([\d,]+)\s+tokens"))
     if total:
         info["total"] = total
+    # NVIDIA NIM / Rust gateways:
+    #   {"message":"Invalid request","details":{"type":"context_length",
+    #    "limit":N,"actual":M}}  where actual = input + requested max_tokens
+    limit = _num(r'"limit"\s*:\s*([\d,]+)')
+    actual = _num(r'"actual"\s*:\s*([\d,]+)')
+    if limit and ("context_length" in low or actual):
+        info["window"] = limit
+    if actual:
+        info["total"] = actual
+        if sent_max_tokens and actual > sent_max_tokens:
+            info["input_tokens"] = actual - sent_max_tokens
     return info or {}
 
 
@@ -2198,7 +2254,8 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
                 invalid_retried = True
                 continue
             healed = _heal_overflow(model, current_effort, e,
-                                    overflow_attempt, sent_text)
+                                    overflow_attempt, sent_text,
+                                    sent_max_tokens=payload.get("max_tokens"))
             if healed is not None:
                 current_effort = healed
                 continue
@@ -2221,14 +2278,15 @@ OVERFLOW_SHRINKS = 2   # shrink-the-conversation-and-retry attempts
 
 
 def _heal_overflow(model: Model, effort: Effort, error: APIError,
-                   attempt: int, sent_text: str = "") -> Effort | None:
+                   attempt: int, sent_text: str = "",
+                   sent_max_tokens: int | None = None) -> Effort | None:
     """Turn a backend overflow error into a tighter Effort, or None when
     the input itself no longer fits (nothing a clamp can fix)."""
     if not is_context_overflow(str(error)):
         return None
     if attempt >= OVERFLOW_RETRIES:
         return None
-    info = _parse_overflow(str(error)) or {}
+    info = _parse_overflow(str(error), sent_max_tokens) or {}
     # the backend just told us the real input size — calibrate the
     # per-model estimator with it so every later clamp is accurate
     if info.get("input_tokens") and sent_text:
@@ -2990,7 +3048,8 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                     f"{err} — history was sanitized but provider still "
                     f"rejects. Try /new or /rewind.") from err
             healed = _heal_overflow(model, current_effort, err,
-                                    overflow_attempt, sent_text)
+                                    overflow_attempt, sent_text,
+                                    sent_max_tokens=payload.get("max_tokens"))
             if healed is not None:
                 current_effort = healed
                 continue

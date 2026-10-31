@@ -9,7 +9,7 @@
 ╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝
 ```
 
-<h1>FullAgent <sup><code>v4.1.6</code></sup></h1>
+<h1>FullAgent <sup><code>v4.1.7</code></sup></h1>
 
 **Advanced Terminal AI Agent — Pure Python, Real Code, World-Class TUI**
 
@@ -48,7 +48,7 @@
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results │
  ╚═╝     ╚═╝  ╚═╝                   ╰─────────────────────────────────────╯
-  FullAgent CLI v4.1.6
+  FullAgent CLI v4.1.7
 ```
 
 While a swarm is running the frame shows the Qoder-style board and footer:
@@ -127,7 +127,7 @@ without artificial animation delays.
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code, run… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results      │
  ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
-  FullAgent CLI v4.1.6
+  FullAgent CLI v4.1.7
   API key · built-in (Kios API)
   DeepSeek V4.1 Flash Free  ·  high
   ~/Desktop  ·  session a1b2c3d4
@@ -376,7 +376,8 @@ curl https://integrate.api.nvidia.com/v1/chat/completions \
        "messages":[{"role":"user","content":"hii"}],
        "max_tokens":4096,"stream":true,"temperature":0.5,
        "tools":[{"type":"function","function":{"name":"describe_harry_potter_character"}}],
-       "tool_choice":"auto","reasoning_effort":"high"}'
+       "tool_choice":"auto","reasoning_effort":"high",
+       "stream_options":{"include_usage":true}}'
 ```
 
 Zero-config: API keys for Gwarden, Kios, SambaNova and NVIDIA NIM are
