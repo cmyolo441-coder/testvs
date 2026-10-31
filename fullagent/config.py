@@ -115,6 +115,8 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "minimax-m3.1-flash-free": 1_000_000,
     # same upstream model served via SambaNova Cloud
     "MiniMax-M3.1-Flash": 1_000_000,
+    # upstream: mistralai/mistral-large (NVIDIA NIM, 128k served window)
+    "mistralai/mistral-large-4-1t-a52b": 131_072,
 }
 # Default for models NOT in the table above: assume a small window rather
 # than risk a ~44s doomed request against an unknown cap. A request we can
@@ -232,6 +234,16 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("sambanova"),
         color="#f1fa8c",
     ),
+    # NVIDIA NIM (build.nvidia.com). No key ships embedded — NIM issues
+    # per-account keys, so this provider is configured with NVIDIA_API_KEY
+    # or ~/.fullagent/nvidia_api_key (see README).
+    "nvidia": Provider(
+        key="nvidia",
+        name="NVIDIA NIM",
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=_provider_api_key("nvidia"),
+        color="#76b900",
+    ),
 }
 
 MODELS: list[Model] = [
@@ -255,6 +267,14 @@ MODELS: list[Model] = [
     Model("MiniMax-M3.1-Flash", "sambanova", "MiniMax M3.1 Flash",
           tag="sambanova", supports_tools=True,
           context_window=model_context_window("MiniMax-M3.1-Flash")),
+    # NVIDIA NIM route used by the reported streaming curl: tools +
+    # tool_choice "auto" + reasoning_effort "high" come from
+    # client.build_payload, and the SSE stream is consumed by
+    # client.chat_stream. Needs NVIDIA_API_KEY (no embedded key).
+    Model("mistralai/mistral-large-4-1t-a52b", "nvidia", "Mistral Large",
+          tag="nvidia", supports_tools=True, supports_reasoning=True,
+          context_window=model_context_window(
+              "mistralai/mistral-large-4-1t-a52b")),
 ]
 # Fastest Kios free route measured 2026-10-21 (~1s first token vs ~3s for
 # MiniMax and ~40s for qwen3.8-flash-free): default to it.
