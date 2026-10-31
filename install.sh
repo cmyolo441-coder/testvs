@@ -96,11 +96,29 @@ echo ">> Installing FullAgent..."
   "git+https://github.com/${REPO}.git"
 
 mkdir -p "$INSTALL_DIR"
+# Launch through a tiny script instead of `python -m fullagent`. With -m,
+# Python puts the CURRENT DIRECTORY first on sys.path — so running the command
+# from inside a checkout of this repo imported THAT copy (e.g. an old v4.0.0
+# clone) instead of the freshly installed package, and the app kept showing
+# the old version and the old "no API key" error. A script's sys.path[0] is
+# its own folder ($VENV_DIR/bin), which never contains `fullagent`.
+cat > "$VENV_DIR/bin/_fullagent_shim.py" <<'PY'
+import sys
+
+from fullagent.__main__ import main
+
+sys.exit(main())
+PY
 cat > "$INSTALL_DIR/$NAME" <<EOF
 #!/bin/sh
-exec "$VENV_DIR/bin/python" -m fullagent "\$@"
+exec "$VENV_DIR/bin/python" "$VENV_DIR/bin/_fullagent_shim.py" "\$@"
 EOF
 chmod +x "$INSTALL_DIR/$NAME"
+
+if [ -d "$PWD/fullagent" ]; then
+  echo ">> note: $PWD contains a fullagent/ checkout — the launcher ignores it"
+  echo "   (the installed package is used; a local clone only matters for python main.py)"
+fi
 
 # A stale `fullagent` EARLIER in PATH (typical: an old single-file binary in
 # /usr/local/bin, or the previous release left in ~/.local/bin before pip had
@@ -126,7 +144,10 @@ if [ -n "$shadowed" ]; then
   fi
 fi
 
-INSTALLED_VERSION="$("$VENV_DIR/bin/python" -m fullagent --version 2>/dev/null || true)"
+# Probe through the installed command itself (not `python -m`, which a local
+# checkout in the current directory would shadow) so the reported version is
+# exactly what the user gets when they type `fullagent`.
+INSTALLED_VERSION="$("$INSTALL_DIR/$NAME" --version 2>/dev/null || true)"
 echo ">> Installed: $INSTALL_DIR/$NAME (${INSTALLED_VERSION:-version unknown})"
 ensure_path
 echo ">> Run: $NAME   (open a new shell, or: hash -r; source ~/.bashrc)"

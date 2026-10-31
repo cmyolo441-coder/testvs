@@ -168,6 +168,11 @@ which -a fullagent      # first line wins; remove stale ones
 hash -r                 # forget bash's cached path
 ```
 
+The installed launcher deliberately runs the **installed** package even when
+your current directory is a checkout of this repo (`python -m fullagent` would
+import that checkout instead — that is how an old local clone can make a fresh
+install look stale). To run a local checkout on purpose, use `python main.py`.
+
 ## Run
 
 ```bash
