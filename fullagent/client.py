@@ -202,12 +202,18 @@ def _wait_for_rate_limit(error: APIError, attempt: int,
 
 def _base_headers(provider: Provider, stream: bool) -> dict[str, str]:
     """The per-request headers. Built from one place so every call path
-    (streaming, blocking, overflow-retry) sends the identical set."""
+    (streaming, blocking, overflow-retry) sends the identical set.
+
+    The Accept header always names the body shape we can actually parse:
+    `text/event-stream` for a streamed call, `application/json` otherwise
+    — the same branch the documented NVIDIA NIM curl uses. Leaving it
+    unset made the wire request `Accept: */*`, which some gateways answer
+    with a JSON body even when `"stream": true` was requested."""
     headers = {"Content-Type": "application/json"}
     if provider.api_key:
         headers["Authorization"] = f"Bearer {provider.api_key}"
-    if stream:
-        headers["Accept"] = "text/event-stream"
+    headers["Accept"] = ("text/event-stream" if stream
+                         else "application/json")
     return headers
 
 
@@ -871,23 +877,36 @@ def _ensure_window_fit(model: Model, messages: list[dict],
     """
     window = effective_window(model)
     requested = effort.max_tokens or 0
-    # When max_tokens is unset the backend chooses the completion length;
-    # still reserve room for a minimal completion so a huge input alone
-    # can never go out unflagged.
-    completion = requested if requested else _MIN_COMPLETION_TOKENS
+    # `requested` is a WISH, not a constraint: build_payload clamps
+    # max_tokens to the window afterwards (_window_max_tokens). The
+    # pre-check therefore only asks whether the input still leaves room
+    # for a MINIMAL completion. Comparing input + the full requested
+    # budget made every window smaller than that budget (every 128k model,
+    # e.g. the NVIDIA NIM Mistral route) fail locally with "conversation
+    # is too large" for a three-word history — a request the backend would
+    # happily have served after the normal clamp.
+
+    def _completion_budget(n: int) -> int:
+        """max_tokens that can still ship alongside `n` input tokens;
+        0 when even the minimum completion would overflow the window."""
+        margin = _context_margin(window) + n // 32
+        headroom = window - n - margin
+        if headroom < _MIN_COMPLETION_TOKENS:
+            return 0
+        return min(requested or _MIN_COMPLETION_TOKENS, headroom)
 
     def _fits(n: int) -> bool:
-        margin = _context_margin(window) + n // 32
-        return n + margin + completion <= window
+        return _completion_budget(n) > 0
 
     n = _input_tokens(model, messages, tools)
     if _fits(n):
         return n
     before_msgs, before_n = len(messages), n
     _log.warning(
-        "token pre-check: ~%d input tokens + %d max_tokens would exceed "
-        "the %s context window (%d) — pruning history first",
-        n, completion, model.label, window)
+        "token pre-check: ~%d input tokens + margin leave no room for a "
+        "%d-token completion inside the %s context window (%d) — "
+        "pruning history first",
+        n, _MIN_COMPLETION_TOKENS, model.label, window)
     # Progressively tighter sliding windows (reuses agent.prune_messages:
     # keeps the system prompt + first user message + the tail).
     for w in (20, 10, 4):
@@ -1494,6 +1513,9 @@ def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
 # an oversized max_tokens; providers without a known cap pass through.
 _MAX_TOKENS_CAP: dict[str, int] = {
     "kios": 131_072,
+    # NVIDIA NIM rejects a request whose max_tokens exceeds the served
+    # model's completion limit, so keep the ask conservative.
+    "nvidia": 32_768,
 }
 
 

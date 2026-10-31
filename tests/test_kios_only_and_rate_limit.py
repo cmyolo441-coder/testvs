@@ -23,11 +23,12 @@ from fullagent.config import Model, Provider
 
 
 def test_configured_providers():
-    assert list(config.PROVIDERS) == ["kios", "gwarden", "sambanova"]
+    assert list(config.PROVIDERS) == ["kios", "gwarden", "sambanova",
+                                      "nvidia"]
     assert {m.id for m in config.MODELS} == {
         "deepseek-v4.1-flash-1017", "gemini-4-argon",
         "deepseek-v4.1-flash-free", "minimax-m3.1-flash-free",
-        "MiniMax-M3.1-Flash"}
+        "MiniMax-M3.1-Flash", "mistralai/mistral-large-4-1t-a52b"}
     assert config.DEFAULT_MODEL_ID == "deepseek-v4.1-flash-1017"
     gwarden = config.PROVIDERS["gwarden"]
     assert gwarden.base_url == "https://gwarden.su/v1"
@@ -35,6 +36,12 @@ def test_configured_providers():
     sambanova = config.PROVIDERS["sambanova"]
     assert sambanova.base_url == "https://api.sambanova.ai/v1"
     assert sambanova.api_key, "sambanova must have embedded zero-config key"
+    nvidia = config.PROVIDERS["nvidia"]
+    assert nvidia.base_url == "https://integrate.api.nvidia.com/v1"
+    # NIM issues per-account keys — nothing is embedded for it, so a user
+    # without NVIDIA_API_KEY gets the clear "no API key configured" error
+    # instead of a request that silently fails upstream.
+    assert "nvidia" not in config._EMBEDDED_KEYS
 
 
 def test_kios_ships_embedded_api_key():
