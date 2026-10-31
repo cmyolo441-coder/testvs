@@ -8,3 +8,5 @@ build/
 dist/
 .bg-shell/
 .gsd/
+# generated at build time from *_API_KEY env vars / CI secrets — never commit
+fullagent/_buildkeys.py

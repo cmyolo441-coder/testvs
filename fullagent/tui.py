@@ -2446,6 +2446,9 @@ class UI:
         elif cmd == "/config":
             from .configcmd import handle_config
             handle_config(self, arg)
+        elif cmd == "/key":
+            from .apikeycmd import handle_apikey
+            handle_apikey(self, arg)
         elif cmd == "/vim":
             from .vimmode import handle_vim
             handle_vim(self, arg)

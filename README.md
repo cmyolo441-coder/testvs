@@ -9,7 +9,7 @@
 ╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝
 ```
 
-<h1>FullAgent <sup><code>v4.1.0</code></sup></h1>
+<h1>FullAgent <sup><code>v4.1.1</code></sup></h1>
 
 **Advanced Terminal AI Agent — Pure Python, Real Code, World-Class TUI**
 
@@ -48,7 +48,7 @@
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results │
  ╚═╝     ╚═╝  ╚═╝                   ╰─────────────────────────────────────╯
-  FullAgent CLI v4.1.0
+  FullAgent CLI v4.1.1
 ```
 
 While a swarm is running the frame shows the Qoder-style board and footer:
@@ -127,7 +127,7 @@ without artificial animation delays.
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code, run… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results      │
  ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
-  FullAgent CLI v4.1.0
+  FullAgent CLI v4.1.1
   API key · built-in (Kios API)
   DeepSeek V4.1 Flash Free  ·  high
   ~/Desktop  ·  session a1b2c3d4
@@ -373,6 +373,25 @@ anytime via the `GWARDEN_API_KEY` / `KIOS_API_KEY` / `SAMBANOVA_API_KEY` /
 `NVIDIA_API_KEY` environment variables or `~/.fullagent/<provider>_api_key`
 files (keep them private); the env var takes precedence, then the key
 file, then the embedded key.
+
+Inside the app, set any provider key without leaving the TUI:
+
+```bash
+/key                 # every provider, masked key, and where it came from
+/key nvidia nvapi-…  # save it (~/.fullagent/nvidia_api_key, chmod 600)
+/key nvidia clear    # remove it again
+```
+
+`/key` writes the same key file the app reads at startup and hot-swaps the
+in-memory provider, so **the next request already uses it** — no restart.
+Release binaries can also carry the key baked in: the build-binaries
+workflow reads the `NVIDIA_API_KEY` repository secret and generates the
+git-ignored `fullagent/_buildkeys.py` through `gen_buildkeys.py`, which
+`config.py` merges into `_EMBEDDED_KEYS`. A local build does the same:
+
+```bash
+NVIDIA_API_KEY=nvapi-… pyinstaller --clean --noconfirm fullagent.spec
+```
 
 | Provider | Base URL | Key required? |
 |---|---|---|

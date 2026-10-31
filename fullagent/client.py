@@ -2041,9 +2041,11 @@ def _check_api_key(provider: Provider, model: Model | None = None) -> None:
     if not provider.api_key:
         env_name = f"{provider.key.upper()}_API_KEY"
         raise APIError(
-            f"no API key configured for {provider.name}. Set the "
-            f"{env_name} environment variable or save the key in "
-            f"{config.APP_DIR / (provider.key + '_api_key')} and restart.", status=401)
+            f"no API key configured for {provider.name}. Run "
+            f"/key {provider.key} <API_KEY> in the TUI (applies immediately), "
+            f"set the {env_name} environment variable, or save the key in "
+            f"{config.APP_DIR / (provider.key + '_api_key')} and restart.",
+            status=401)
 
 
 def chat_stream(provider: Provider, model: Model, effort: Effort,
