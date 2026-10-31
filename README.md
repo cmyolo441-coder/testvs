@@ -345,6 +345,28 @@ efforts — the same request shape as the documented NIM curl. NIM issues
 per-account keys, so this one provider needs `NVIDIA_API_KEY` (or
 `~/.fullagent/nvidia_api_key`) before it can be used.
 
+The equivalent raw request (the one `tests/test_nvidia_stream_payload.py`
+replays through the real send/parse pipeline) is:
+
+```bash
+stream=true
+if [ "$stream" = true ]; then
+    accept_header='Accept: text/event-stream'
+else
+    accept_header='Accept: application/json'
+fi
+
+curl https://integrate.api.nvidia.com/v1/chat/completions \
+  -H "Authorization: Bearer $NVIDIA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "$accept_header" \
+  -d '{"model":"mistralai/mistral-large-4-1t-a52b",
+       "messages":[{"role":"user","content":"hii"}],
+       "max_tokens":4096,"stream":true,"temperature":0.5,
+       "tools":[{"type":"function","function":{"name":"describe_harry_potter_character"}}],
+       "tool_choice":"auto","reasoning_effort":"high"}'
+```
+
 Zero-config: API keys for Gwarden, Kios and SambaNova are embedded in the
 build, so those work right after installation with no setup. Override
 anytime via the `GWARDEN_API_KEY` / `KIOS_API_KEY` / `SAMBANOVA_API_KEY` /
