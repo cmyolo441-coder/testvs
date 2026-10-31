@@ -185,8 +185,8 @@ class NvidiaConfigTests(unittest.TestCase):
         self.assertEqual(model.provider, "nvidia")
         self.assertTrue(model.supports_tools)
         self.assertTrue(model.supports_reasoning)
-        self.assertEqual(model.context_window, 131_072)
-        self.assertLess(model.context_window, config.MAX_TOKENS)
+        self.assertEqual(model.context_window, 1_000_000)
+        self.assertGreaterEqual(model.context_window, config.MAX_TOKENS)
 
     def test_missing_key_is_a_clear_error_not_a_bad_request(self):
         with self.assertRaises(client.APIError) as ctx:

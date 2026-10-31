@@ -115,8 +115,11 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "minimax-m3.1-flash-free": 1_000_000,
     # same upstream model served via SambaNova Cloud
     "MiniMax-M3.1-Flash": 1_000_000,
-    # upstream: mistralai/mistral-large (NVIDIA NIM, 128k served window)
-    "mistralai/mistral-large-4-1t-a52b": 131_072,
+    # upstream: mistralai/mistral-large (NVIDIA NIM). Configured for a 1M
+    # planning window at the user's request; the backend's real reported
+    # window (131k served) is learned at runtime and always wins, because
+    # effective_window() only ever shrinks.
+    "mistralai/mistral-large-4-1t-a52b": 1_000_000,
 }
 # Default for models NOT in the table above: assume a small window rather
 # than risk a ~44s doomed request against an unknown cap. A request we can

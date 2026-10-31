@@ -1519,9 +1519,9 @@ def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
 # an oversized max_tokens; providers without a known cap pass through.
 _MAX_TOKENS_CAP: dict[str, int] = {
     "kios": 131_072,
-    # NVIDIA NIM rejects a request whose max_tokens exceeds the served
-    # model's completion limit, so keep the ask conservative.
-    "nvidia": 32_768,
+    # NVIDIA NIM accepted max_tokens=200000 against the Mistral Large
+    # route in testing, so allow the full global output budget.
+    "nvidia": config.MAX_TOKENS,
 }
 
 
