@@ -205,11 +205,27 @@ def _provider_api_key(provider: str) -> str:
 # Build-time embedded API keys (zero-config). These ship inside the
 # wheel/binary. Override anytime via <PROVIDER>_API_KEY env var or
 # ~/.fullagent/<provider>_api_key file.
+#
+# `_buildkeys.py` is GENERATED at build time (gen_buildkeys.py, called by
+# fullagent.spec and the build-binaries workflow) from *_API_KEY environment
+# variables / repository secrets, and is git-ignored — so a release binary can
+# carry a key that never lands in this file. Missing file => empty dict.
+try:  # pragma: no cover — absent in a plain checkout
+    from ._buildkeys import KEYS as _BUILD_KEYS  # type: ignore[attr-defined]
+except Exception:  # ImportError, or a malformed generated file
+    _BUILD_KEYS = {}
+if not isinstance(_BUILD_KEYS, dict):  # pragma: no cover — hostile module
+    _BUILD_KEYS = {}
+
 _EMBEDDED_KEYS: dict[str, str] = {
     "kios": "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
     "gwarden": "GWAR-OM8VK0HO-94OFDH0DIE3T-U1B3V-WPPPNO-MF8VSR0U",
     "sambanova": "d3445159-3dc0-4bf9-99d3-085aa1ef81b2",
 }
+# Build-time keys win over the shipped defaults (a CI-provided NVIDIA_API_KEY
+# must be the one inside the artifact).
+_EMBEDDED_KEYS.update(
+    {str(k): str(v) for k, v in _BUILD_KEYS.items() if str(v).strip()})
 
 
 PROVIDERS: dict[str, Provider] = {

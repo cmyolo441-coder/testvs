@@ -93,6 +93,7 @@ SLASH_COMMANDS = [
     ("/doctor", "run local diagnostics and health checks"),
     ("/status", "show current agent and session status"),
     ("/config", "inspect or update agent configuration"),
+    ("/key", "set a provider API key — /key [provider] [KEY|clear]"),
     ("/vim", "toggle Vim-style input mode"),
     ("/undo", "inspect or undo recent file changes"),
     ("/retry", "repair or retry the previous turn"),

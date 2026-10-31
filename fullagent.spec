@@ -14,6 +14,19 @@ if _ROOT not in sys.path:
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
+# Build-time embedded provider keys: generate the git-ignored
+# fullagent/_buildkeys.py from *_API_KEY env vars (CI feeds repository
+# secrets; a local build can do `NVIDIA_API_KEY=nvapi-… pyinstaller
+# fullagent.spec`). With no such vars the previous file is left untouched.
+try:
+    import gen_buildkeys
+    _embedded = gen_buildkeys.main()
+    print(f"[fullagent.spec] embedded keys for: {sorted(_embedded)}"
+          if _embedded else
+          "[fullagent.spec] no *_API_KEY env vars — building without embedded keys")
+except Exception as _exc:  # never fail the build over key embedding
+    print(f"[fullagent.spec] key embedding skipped: {_exc!r}")
+
 # every fullagent subpackage — systemprompt.py and others importlib them
 # dynamically, so PyInstaller cannot see them on its own
 datas, binaries, hiddenimports = collect_all('fullagent')
