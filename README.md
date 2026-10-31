@@ -152,9 +152,21 @@ Single-file binaries — no Python needed:
 | Termux (Android) | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/testvs/main/install-termux.sh \| bash` |
 | Any OS with Python 3.9+ | `pip install git+https://github.com/cmyolo441-coder/testvs.git` |
 
-`install.sh` grabs the latest release binary automatically and falls back to
-a pip install from source when no binary is published yet. Set `INSTALL_DIR`
+`install.sh` installs the freshest source into `~/.fullagent-venv` (Linux x64)
+and falls back to the prebuilt release binary when `python3` is missing. It
+prints the installed version, moves any stale `fullagent` that sits EARLIER
+in `PATH` aside (`/usr/local/bin/fullagent` from an older release is the
+classic case — it silently shadows the new install and keeps printing the old
+version), and reminds you to `hash -r; source ~/.bashrc`. Set `INSTALL_DIR`
 to install elsewhere (e.g. `INSTALL_DIR=$HOME/.local/bin curl -fsSL … | bash`).
+
+If `fullagent` still reports an old version after installing, check which copy
+your shell resolves:
+
+```bash
+which -a fullagent      # first line wins; remove stale ones
+hash -r                 # forget bash's cached path
+```
 
 ## Run
 
