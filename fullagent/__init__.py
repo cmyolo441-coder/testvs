@@ -37,7 +37,7 @@ Package layout:
     __main__.py     entry point
 """
 
-__version__ = "4.1.5"
+__version__ = "4.1.6"
 
 
 import importlib.abc as _abc

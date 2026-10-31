@@ -496,8 +496,10 @@ def assistant_message(content: str | None, tool_calls: list[dict],
         if not isinstance(msg.get("content"), str) or not msg["content"]:
             msg["content"] = _CONTENT_PLACEHOLDER
     # Always carry reasoning_content when reasoning exists OR when the
-    # turn carried tool_calls (history validation requires it).  Set
-    # both keys for maximum provider compatibility.
+    # turn carried tool_calls (history validation requires it). Only the
+    # canonical field is stored: serde-based gateways alias "reasoning"
+    # to "reasoning_content", so a history turn carrying both spellings
+    # is rejected with "duplicate field `reasoning_content`".
     _rs = reasoning
     if _rs is not None and not isinstance(_rs, str):
         if isinstance(_rs, (dict, list)):
@@ -509,8 +511,6 @@ def assistant_message(content: str | None, tool_calls: list[dict],
             _rs = _typeguards.ensure_str(_rs)
     if _rs:
         msg["reasoning_content"] = _rs
-        # some providers also accept "reasoning"
-        msg["reasoning"] = _rs
     elif calls:
         msg["reasoning_content"] = ""
     return msg
@@ -717,6 +717,24 @@ def _sanitize_messages(messages: list[dict]) -> bool:
     if not isinstance(messages, list):
         return False
     fixed = False
+    # Wire hygiene: serde-based gateways alias "reasoning" to
+    # "reasoning_content". A turn carrying both keys (older sessions were
+    # saved that way) is rejected as "duplicate field `reasoning_content`".
+    # Keep the canonical field and drop the alias from every message.
+    for message in messages:
+        if not isinstance(message, dict) or "reasoning" not in message:
+            continue
+        alias = message.pop("reasoning")
+        if message.get("reasoning_content") is None and alias:
+            if isinstance(alias, (dict, list)):
+                try:
+                    alias = json.dumps(alias, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    alias = str(alias)
+            elif not isinstance(alias, str):
+                alias = _typeguards.ensure_str(alias)
+            message["reasoning_content"] = alias
+        fixed = True
     issued: dict[str, tuple[int, dict]] = {}
     for index, message in enumerate(messages):
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -815,9 +833,13 @@ def _sanitize_messages(messages: list[dict]) -> bool:
 
 
 def _is_reasoning_content_error(err: Exception) -> bool:
-    """True if an APIError is the reasoning_content validation."""
+    """True if an APIError is the reasoning_content history validation."""
     msg = str(err).lower()
-    return "reasoning_content" in msg and "required" in msg
+    if "reasoning_content" not in msg:
+        return False
+    # "required" = missing reasoning on a tool-call turn; "duplicate
+    # field" = both the canonical key and its serde alias were sent.
+    return "required" in msg or "duplicate field" in msg
 
 
 # -- token-limit pre-check (worker 17/20) -------------------------------------
