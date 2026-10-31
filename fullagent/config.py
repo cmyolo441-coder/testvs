@@ -254,9 +254,9 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("sambanova"),
         color="#f1fa8c",
     ),
-    # NVIDIA NIM (build.nvidia.com). No key ships embedded — NIM issues
-    # per-account keys, so this provider is configured with NVIDIA_API_KEY
-    # or ~/.fullagent/nvidia_api_key (see README).
+    # NVIDIA NIM (build.nvidia.com). A key ships embedded (zero-config);
+    # override it with NVIDIA_API_KEY, ~/.fullagent/nvidia_api_key or
+    # /key nvidia <KEY> in the TUI (see README).
     "nvidia": Provider(
         key="nvidia",
         name="NVIDIA NIM",
@@ -290,7 +290,8 @@ MODELS: list[Model] = [
     # NVIDIA NIM route used by the reported streaming curl: tools +
     # tool_choice "auto" + reasoning_effort "high" come from
     # client.build_payload, and the SSE stream is consumed by
-    # client.chat_stream. Needs NVIDIA_API_KEY (no embedded key).
+    # client.chat_stream. The NVIDIA key ships embedded; override it with
+    # NVIDIA_API_KEY or ~/.fullagent/nvidia_api_key.
     Model("mistralai/mistral-large-4-1t-a52b", "nvidia", "Mistral Large",
           tag="nvidia", supports_tools=True, supports_reasoning=True,
           context_window=model_context_window(

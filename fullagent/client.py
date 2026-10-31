@@ -989,7 +989,13 @@ def build_payload(model: Model, effort: Effort, messages: list[dict],
     # the hidden-CoT latency. The streamed reasoning reaches the TUI via
     # client.py's on_reasoning callback (reasoning_content field).
     if model.supports_reasoning:
-        payload["reasoning_effort"] = effort.reasoning_effort or "none"
+        # NVIDIA NIM rejects reasoning_effort="none" as an invalid request
+        # (verified against the Mistral Large route: 400 Bad Request), so
+        # omit the field there for efforts that don't ask for thinking.
+        # Other routes (e.g. Kios/DeepSeek) document "none" as valid and
+        # use it to skip the hidden chain-of-thought.
+        if effort.reasoning_effort or model.provider != "nvidia":
+            payload["reasoning_effort"] = effort.reasoning_effort or "none"
     return payload
 
 
