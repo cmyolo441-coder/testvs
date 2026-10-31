@@ -9,7 +9,7 @@
 ╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝
 ```
 
-<h1>FullAgent <sup><code>v4.1.1</code></sup></h1>
+<h1>FullAgent <sup><code>v4.1.2</code></sup></h1>
 
 **Advanced Terminal AI Agent — Pure Python, Real Code, World-Class TUI**
 
@@ -48,7 +48,7 @@
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results │
  ╚═╝     ╚═╝  ╚═╝                   ╰─────────────────────────────────────╯
-  FullAgent CLI v4.1.1
+  FullAgent CLI v4.1.2
 ```
 
 While a swarm is running the frame shows the Qoder-style board and footer:
@@ -127,7 +127,7 @@ without artificial animation delays.
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code, run… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results      │
  ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
-  FullAgent CLI v4.1.1
+  FullAgent CLI v4.1.2
   API key · built-in (Kios API)
   DeepSeek V4.1 Flash Free  ·  high
   ~/Desktop  ·  session a1b2c3d4
@@ -341,9 +341,9 @@ retired model ids now fail immediately instead of retrying the provider's
 The NVIDIA NIM route streams with `"stream": true` and
 `Accept: text/event-stream`, sends the tool schemas with
 `"tool_choice": "auto"` and asks for `reasoning_effort` on the higher
-efforts — the same request shape as the documented NIM curl. NIM issues
-per-account keys, so this one provider needs `NVIDIA_API_KEY` (or
-`~/.fullagent/nvidia_api_key`) before it can be used.
+efforts — the same request shape as the documented NIM curl. Its key ships
+embedded like the others, so a fresh install answers on this route with no
+setup.
 
 The equivalent raw request (the one `tests/test_nvidia_stream_payload.py`
 replays through the real send/parse pipeline) is:
@@ -367,12 +367,12 @@ curl https://integrate.api.nvidia.com/v1/chat/completions \
        "tool_choice":"auto","reasoning_effort":"high"}'
 ```
 
-Zero-config: API keys for Gwarden, Kios and SambaNova are embedded in the
-build, so those work right after installation with no setup. Override
-anytime via the `GWARDEN_API_KEY` / `KIOS_API_KEY` / `SAMBANOVA_API_KEY` /
-`NVIDIA_API_KEY` environment variables or `~/.fullagent/<provider>_api_key`
-files (keep them private); the env var takes precedence, then the key
-file, then the embedded key.
+Zero-config: API keys for Gwarden, Kios, SambaNova and NVIDIA NIM are
+embedded in the build, so every configured provider works right after
+installation with no setup. Override anytime via the `GWARDEN_API_KEY` /
+`KIOS_API_KEY` / `SAMBANOVA_API_KEY` / `NVIDIA_API_KEY` environment
+variables or `~/.fullagent/<provider>_api_key` files (keep them private);
+the env var takes precedence, then the key file, then the embedded key.
 
 Inside the app, set any provider key without leaving the TUI:
 
@@ -398,7 +398,7 @@ NVIDIA_API_KEY=nvapi-… pyinstaller --clean --noconfirm fullagent.spec
 | Gwarden API | `https://gwarden.su/v1` | No (embedded zero-config key) |
 | Kios API | `https://kiosapi.com/v1` | No (embedded zero-config key) |
 | SambaNova Cloud | `https://api.sambanova.ai/v1` | No (embedded zero-config key) |
-| NVIDIA NIM | `https://integrate.api.nvidia.com/v1` | Yes (`NVIDIA_API_KEY`) |
+| NVIDIA NIM | `https://integrate.api.nvidia.com/v1` | No (embedded zero-config key) |
 
 `/models list` shows configured models; `/model` or Ctrl+T opens the selector.
 The turn stays on its selected model during an outage; no automatic provider

@@ -38,10 +38,10 @@ def test_configured_providers():
     assert sambanova.api_key, "sambanova must have embedded zero-config key"
     nvidia = config.PROVIDERS["nvidia"]
     assert nvidia.base_url == "https://integrate.api.nvidia.com/v1"
-    # NIM issues per-account keys — nothing is embedded for it, so a user
-    # without NVIDIA_API_KEY gets the clear "no API key configured" error
-    # instead of a request that silently fails upstream.
-    assert "nvidia" not in config._EMBEDDED_KEYS
+    # NVIDIA NIM ships a zero-config key too, so a fresh install works on
+    # the Mistral Large route without setting anything up.
+    assert nvidia.api_key.startswith("nvapi-"), nvidia.api_key
+    assert config._EMBEDDED_KEYS["nvidia"].startswith("nvapi-")
 
 
 def test_kios_ships_embedded_api_key():

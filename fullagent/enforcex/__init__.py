@@ -72,7 +72,7 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "4.1.1"
+__version__ = "4.1.2"
 
 _LAZY_MODULES = (
     "ruleextract", "rulestore", "telemetry", "dashboard",

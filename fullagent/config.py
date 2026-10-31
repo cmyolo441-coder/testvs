@@ -221,6 +221,10 @@ _EMBEDDED_KEYS: dict[str, str] = {
     "kios": "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
     "gwarden": "GWAR-OM8VK0HO-94OFDH0DIE3T-U1B3V-WPPPNO-MF8VSR0U",
     "sambanova": "d3445159-3dc0-4bf9-99d3-085aa1ef81b2",
+    # NVIDIA NIM: ships zero-config so a fresh install works on the
+    # Mistral Large route with no setup. Override with NVIDIA_API_KEY or
+    # ~/.fullagent/nvidia_api_key (or /key nvidia <KEY> inside the TUI).
+    "nvidia": "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",
 }
 # Build-time keys win over the shipped defaults (a CI-provided NVIDIA_API_KEY
 # must be the one inside the artifact).
